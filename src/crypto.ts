@@ -60,22 +60,50 @@ export function readIdentity(filePath: string): string {
 }
 
 /**
+ * Encrypt a UTF-8 string to a single X25519 recipient.
+ * Returns the age ciphertext as a Uint8Array.
+ *
+ * Used by the v0.2 "encrypt current note" command: the bytes can be written
+ * to disk as a `.age` file, or passed back through decryptToString() to
+ * verify round-trip before deletion of the original plaintext.
+ */
+export async function encrypt(
+  recipient: string,
+  plaintext: string
+): Promise<Uint8Array> {
+  const enc = new Encrypter();
+  enc.addRecipient(recipient);
+  return enc.encrypt(plaintext);
+}
+
+/**
+ * Decrypt an age ciphertext (Uint8Array) to its UTF-8 string plaintext.
+ *
+ * Uses typage's "text" output mode, which is equivalent to
+ * `TextDecoder.decode(bytes)` over the decrypted bytes.
+ */
+export async function decryptToString(
+  identity: string,
+  ciphertext: Uint8Array
+): Promise<string> {
+  const dec = new Decrypter();
+  dec.addIdentity(identity);
+  return dec.decrypt(ciphertext, "text");
+}
+
+/**
  * Encrypt a UTF-8 string to a single X25519 recipient, then decrypt it back
  * with the matching identity. Returns the decrypted plaintext.
  *
  * Zero filesystem writes — the ciphertext lives in a Uint8Array in memory
- * and is dropped when this function returns.
+ * and is dropped when this function returns. Kept for the v0.1 "test
+ * round-trip" command; v0.2 uses encrypt() + decryptToString() separately.
  */
 export async function roundTrip(
   recipient: string,
   identity: string,
   plaintext: string
 ): Promise<string> {
-  const enc = new Encrypter();
-  enc.addRecipient(recipient);
-  const ciphertext = await enc.encrypt(plaintext);
-
-  const dec = new Decrypter();
-  dec.addIdentity(identity);
-  return await dec.decrypt(ciphertext, "text");
+  const ciphertext = await encrypt(recipient, plaintext);
+  return decryptToString(identity, ciphertext);
 }

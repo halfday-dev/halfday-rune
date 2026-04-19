@@ -13,6 +13,8 @@ import {
   identityToRecipient,
 } from "age-encryption";
 import {
+  decryptToString,
+  encrypt,
   expandHome,
   readIdentity,
   readRecipient,
@@ -69,6 +71,46 @@ describe("roundTrip (X25519)", () => {
     await expect(
       roundTrip(recipient1, id2, "secret")
     ).rejects.toThrow();
+  });
+});
+
+describe("encrypt + decryptToString (v0.2 primitives)", () => {
+  it("round-trips a short ASCII string through split primitives", async () => {
+    const identity = await generateIdentity();
+    const recipient = await identityToRecipient(identity);
+    const plaintext = "v0.2 split primitives ok";
+    const ct = await encrypt(recipient, plaintext);
+    expect(ct).toBeInstanceOf(Uint8Array);
+    expect(ct.byteLength).toBeGreaterThan(0);
+    const decoded = await decryptToString(identity, ct);
+    expect(decoded).toBe(plaintext);
+  });
+
+  it("produces a non-trivial ciphertext (larger than plaintext UTF-8 bytes)", async () => {
+    const identity = await generateIdentity();
+    const recipient = await identityToRecipient(identity);
+    const plaintext = "tiny";
+    const ct = await encrypt(recipient, plaintext);
+    // age header + HMAC + framing overhead is always > a few bytes
+    expect(ct.byteLength).toBeGreaterThan(plaintext.length);
+  });
+
+  it("round-trips unicode + large buffer via split primitives", async () => {
+    const identity = await generateIdentity();
+    const recipient = await identityToRecipient(identity);
+    const plaintext =
+      "# journal entry\n\nhello — ñ 日本 🧿\n" + "line of text.\n".repeat(1000);
+    const ct = await encrypt(recipient, plaintext);
+    const decoded = await decryptToString(identity, ct);
+    expect(decoded).toBe(plaintext);
+  });
+
+  it("decryptToString with wrong identity throws", async () => {
+    const id1 = await generateIdentity();
+    const recipient1 = await identityToRecipient(id1);
+    const id2 = await generateIdentity();
+    const ct = await encrypt(recipient1, "secret");
+    await expect(decryptToString(id2, ct)).rejects.toThrow();
   });
 });
 
