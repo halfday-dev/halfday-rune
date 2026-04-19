@@ -132,9 +132,29 @@ sanity sequence on a dev vault:
 ```
 1. seal a throwaway note (see v0.2 sequence above) so you have a foo.md.age
 2. click foo.md.age in the file pane
-3. expect: lock-icon tab titled "foo.md.age", status line "decrypted · N chars from M bytes · read-only (v0.3.0)", plaintext below
+3. expect: lock-icon tab titled "foo.md.age", status line "decrypted · N chars from M bytes · read-only (v0.3.x)", plaintext below
 4. close the tab, reopen — should decrypt again fresh
 5. change identityPath in settings to a wrong identity, reopen the file — status should show "decrypt failed — …" (plaintext cleared, no crash)
+```
+
+## what v0.3.1 adds
+
+still read-only, but the plaintext now lives inside a CodeMirror 6 editor with markdown syntax highlighting and line numbers instead of a plain `<pre>`. if it works:
+
+1. CM6 (state/view/language/lang-markdown) bundles cleanly through obsidian-plugin-cli's esbuild config — no externals needed for v0.3.1
+2. CM6 mounts inside an Obsidian `FileView`'s `contentEl` and sizes correctly inside our flex column
+3. read-only is enforced by `EditorView.editable.of(false)` + `EditorState.readOnly.of(true)` — keystrokes are inert, but selection/copy still work
+
+CM6 packages are added as runtime `dependencies` (not externals) so we don't depend on Obsidian's bundled CM6 ABI. Bundle size goes up ~150 KB gzipped.
+
+after pulling these changes, **`npm install` is required** before `npm run build` to fetch the new CM6 deps.
+
+```
+1. npm install   # fetches @codemirror/{state,view,language,lang-markdown}
+2. npm run build
+3. reopen a foo.md.age — expect: line numbers in a gutter, headings rendered larger, fenced code monospace, links styled
+4. try to type — nothing happens (read-only). selection + cmd-c still work.
+5. status line should now read "... read-only (v0.3.1)"
 ```
 
 if step 2 gives you the binary fallback (hex dump / "cannot display"), `registerExtensions` didn't take — check for conflicting plugins and try reloading Obsidian.
@@ -195,6 +215,5 @@ Obsidian-side integration (active-file selection, vault.createBinary / create / 
 
 ## next milestones
 
-- **v0.3.1** — swap `AgeFileView`'s `<pre>` body for a CodeMirror 6 editor with markdown syntax highlighting (still read-only). needs an esbuild config with `@codemirror/*` + `@lezer/*` as externals so we reuse Obsidian's bundled CM6 at runtime rather than duplicating it.
 - **v0.3.2** — make the CM6 editor editable, wire cmd-S + 30s encrypted autosave, dirty-state tab title, re-encrypt + round-trip verify on every save. sidecar shape stats update on save.
 - **v0.4+** — see [vault_plugin_v0_plan.md](../knowledge/projects/vault_plugin_v0_plan.md) for classified tier, multi-recipient management, and mobile story.

@@ -1,13 +1,14 @@
 /**
- * Halfday Obsidian Rune — v0.3.0
+ * Halfday Obsidian Rune — v0.3.1
  *
  * Commands:
  *   - "Test round-trip (X25519)"  — v0.1, proves typage works in Electron
  *   - "Encrypt current note → .age" — v0.2, seals an existing .md to .md.age
  *
  * Views:
- *   - AgeFileView (`.age` extension) — v0.3.0, decrypt-to-memory read-only
- *     preview. CM6 editor lands in v0.3.1; editing + save in v0.3.2.
+ *   - AgeFileView (`.age` extension) — v0.3.1, decrypt-to-memory read-only
+ *     preview with a CodeMirror 6 editor + markdown syntax highlighting.
+ *     Editing + cmd-S + 30s encrypted autosave land in v0.3.2.
  *
  * The encrypt command mirrors _agent/seal.sh's behavior: encrypt, round-trip
  * verify in memory, write ciphertext + sidecar, then (and only then) delete
