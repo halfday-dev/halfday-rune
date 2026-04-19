@@ -76,14 +76,15 @@ production build for shipping:
 npm run build        # minified main.js at the plugin root (same command, just no watcher)
 ```
 
-then in Obsidian: open the command palette (cmd-p), search "Halfday Rune". the plugin ships two commands:
+then in Obsidian: open the command palette (cmd-p), search "Halfday Rune". the plugin ships three commands:
 
 - **Test round-trip (X25519)** — v0.1. encrypts and decrypts a hardcoded string. no files touched. on success: `Halfday Rune: round-trip ok (12ms)`.
-- **Encrypt current note → .age** — v0.2. active `.md` only. refuses if the file is already `.age`, if frontmatter has `privacy: open`, or if a sibling `.md.age` / `.meta.md` already exists. on success: `Halfday Rune: sealed foo.md → foo.md.age (34ms)` and the original disappears.
+- **Encrypt current note → .age** — v0.2 / updated in v0.4. active `.md` only. refuses if the file is already `.age`, if frontmatter has `privacy: open`, or if a sibling `.md.age` already exists. on success: `Halfday Rune: sealed foo.md → foo.md.age (34ms)` and the original disappears. **v0.4: no sidecar is written anymore** — sealed notes are opaque single files.
+- **New private note** — v0.4. born-encrypted note: creates an `.age` file directly (plaintext never on disk), opens it in the AgeFileView. filename prompt defaults to `untitled.age` in the current folder and auto-appends `.age` if you omit it.
 
 and one custom view:
 
-- **AgeFileView** (`.age` extension) — v0.3.2. opening any `.age` file in the vault routes it through our view instead of Obsidian's binary fallback. the plugin decrypts the file to memory, mounts an editable CodeMirror 6 editor with markdown syntax highlighting, and re-encrypts on cmd-S or 30s after the last edit. status line at top reports the current state (dirty/clean, last save time, ciphertext bytes); the tab title gets a `●` bullet when dirty.
+- **AgeFileView** (`.age` extension) — v0.3.2 / v0.4. opening any `.age` file in the vault routes it through our view instead of Obsidian's binary fallback. the plugin decrypts the file to memory, mounts an editable CodeMirror 6 editor with markdown syntax highlighting, and re-encrypts on cmd-S or 30s after the last edit. status line at top reports the current state (dirty/clean, last save time, ciphertext bytes); the tab title gets a `●` bullet when dirty.
 
 failures surface as Notices with a one-line error; full stack traces go to devtools (`cmd-opt-i`).
 
@@ -101,25 +102,25 @@ if "Test round-trip (X25519)" returns ok inside Obsidian, three risks are retire
 
 if any of these fail, see "troubleshooting" below.
 
-## what v0.2 proves
+## what v0.2 proves (updated for v0.4)
 
 if "Encrypt current note → .age" runs cleanly on a throwaway `.md`, these risks are retired:
 
-1. the file-write path works — `.md.age` (binary) and `.meta.md` (text) both land via the Obsidian vault API
+1. the file-write path works — `.md.age` (binary) lands via the Obsidian vault API
 2. round-trip byte-verify-then-delete matches seal.sh's safety property — on any failure, the plaintext survives
-3. the sidecar is byte-compatible with what `seal.sh` produces for the same input (frontmatter shape, `## shape` stats line, sorted+deduped wikilinks)
+
+**v0.4 change:** the sidecar (`.meta.md`) is no longer written — sealed notes are opaque single files. seal.sh dropped sidecars at the same time, so the two are still byte-equivalent for the `.age` payload.
 
 sanity sequence on a dev vault (don't do this on your real vault):
 
 ```
 1. create a throwaway note with some [[wikilinks]]
 2. cmd-p → "Halfday Rune: Encrypt current note → .age"
-3. expect: foo.md disappears, foo.md.age and foo.meta.md appear
-4. inspect foo.meta.md — should have `type: meta-sidecar`, `privacy: open`, etc.
-5. CLI verify: age -d -i ~/.age/vault.identity /path/to/foo.md.age
+3. expect: foo.md disappears, only foo.md.age appears (no .meta.md sidecar)
+4. CLI verify: age -d -i ~/.age/vault.identity /path/to/foo.md.age
 ```
 
-point 5 is how you prove v0.2 output is CLI-compatible. if that decrypt round-trips, the plugin and seal.sh are interchangeable for non-classified sealing.
+point 4 is how you prove v0.2 output is CLI-compatible. if that decrypt round-trips, the plugin and seal.sh are interchangeable for sealing.
 
 ## what v0.3.0 proves
 
@@ -161,14 +162,15 @@ after pulling these changes, **`npm install` is required** before `npm run build
 
 if step 2 gives you the binary fallback (hex dump / "cannot display"), `registerExtensions` didn't take — check for conflicting plugins and try reloading Obsidian.
 
-## what v0.3.2 adds
+## what v0.3.2 adds (updated for v0.4)
 
 the CM6 editor is now editable. cmd-S (or ctrl-S) re-encrypts the buffer and writes a fresh `.age` file back to disk; otherwise a 30-second debounced autosave does it for you after the last edit. if it works:
 
 1. edits actually reach the vault — `vault.modifyBinary` on the `.age` target accepts the re-encrypted bytes and Obsidian doesn't complain
 2. the save path preserves seal.sh's safety property: encrypt, decrypt back in memory, byte-compare; only then overwrite the `.age` file. a round-trip mismatch surfaces as a `Notice` and the on-disk ciphertext is left alone
-3. the sidecar (`.meta.md`) — if one exists next to the `.age` file — gets its shape stats and outbound links refreshed on every save. sealed_at updates to the time of the latest save (this is "last encrypted"; if you want the historical first-seal time, git history has it)
-4. the tab title shows a leading `●` bullet when the buffer has unsaved edits; the status line shows `dirty ●` / `clean`, the last save timestamp, and the resulting ciphertext size
+3. the tab title shows a leading `●` bullet when the buffer has unsaved edits; the status line shows `dirty ●` / `clean`, the last save timestamp, and the resulting ciphertext size
+
+**v0.4 change:** the sidecar refresh that used to happen on every save is gone. saves write only the `.age` file.
 
 sanity sequence on a dev vault:
 
@@ -179,7 +181,6 @@ sanity sequence on a dev vault:
 4. edit again and wait 30s — autosave fires (reason: autosave) without any keystroke
 5. close and reopen the file — plaintext should reflect the saved edits
 6. CLI verify: age -d -i ~/.age/vault.identity /path/to/foo.md.age → see the new plaintext
-7. sidecar: cat foo.meta.md → sealed_at should be the latest save time; shape stats should reflect the current word/paragraph count
 ```
 
 unsaved edits at unload-time get flushed — if you navigate away with a dirty buffer, `onUnloadFile` awaits a final save before tearing down the editor. That's best-effort: if the save throws, the console logs it and the view unloads anyway (the view can't block Obsidian's workspace transitions).
@@ -191,6 +192,30 @@ autosave is debounced (not periodic). if you want to confirm it's running withou
 ### known gap (to revisit)
 
 cmd-C in the editor works now that CM6 is editable (contenteditable is back). the v0.3.1 read-only copy workaround is no longer needed.
+
+## what v0.4 adds
+
+two design simplifications and one new command:
+
+1. **sidecars are gone.** seal.sh, the v0.2 encrypt-current-note command, and the v0.3.2 in-view save path all stop writing `.meta.md` files. each sealed note is now a single opaque `.age` file. the audit trail moves to `~/halfday/logs/seal.log` (CLI side) and the JS console + Notice UI (plugin side).
+2. **the `classified` privacy tier is gone.** seal.sh now recognises only `open`, `private`, and `ephemeral`. born-encrypted content (the old "classified" use case) is handled by the new "New private note" command instead.
+3. **"New private note" command.** prompts for a filename, writes a born-encrypted empty `.age` directly via `vault.createBinary`, and opens it in the AgeFileView. plaintext never touches disk — the encrypt-empty + round-trip-verify happens in memory before the create call, so failure modes leave nothing behind.
+
+### migration notes for an existing vault
+
+- if you have stale `.meta.md` sidecars next to sealed notes, they're harmless — neither side reads them anymore. you can delete them on your own schedule.
+- if you have any notes still tagged `privacy: classified` from an earlier draft, seal.sh now treats that as `skip-unknown-privacy:classified` (logs a WARN, doesn't seal). re-tag those as `private` and run a born-encrypted version, or just leave the WARN until you migrate.
+
+sanity sequence for "New private note" on a dev vault:
+
+```
+1. cmd-p → "Halfday Rune: New private note"
+2. accept "untitled.age" or type a filename — expect: new tab opens with empty editor
+3. type some text, hit cmd-S — status line: "saving…" → "saved in Nms (manual)"
+4. CLI verify: age -d -i ~/.age/vault.identity /path/to/untitled.age
+```
+
+at no point during that sequence should a plaintext copy of the note exist on disk.
 
 ## troubleshooting
 
@@ -235,12 +260,7 @@ if the plugin throws during `Encrypter.encrypt` with something WASM-related, thi
 - end-to-end round-trip with a generated keypair
 - v0.2 split primitives (`encrypt` + `decryptToString`) including byte-exact large-buffer round-trips and wrong-identity rejection
 
-`tests/sidecar.test.ts` covers the pure sidecar generator:
-
-- frontmatter parsing (quoted/unquoted, CRLF, missing keys, no-frontmatter files)
-- `stripFrontmatter` / `shapeStats` / `formatShape` — the structural-stats line that replaced the old themes-heuristic (intentionally content-free so sidecars don't leak a preview of sealed text)
-- wikilink extraction (dedupe + sort, aliased forms, empty case)
-- full sidecar shape — matches seal.sh's generate_meta output
+**v0.4: `tests/sidecar.test.ts` was deleted along with `src/sidecar.ts`** — sidecars are gone, no module to test.
 
 tests run in pure node — they don't need Obsidian to execute. that means CI is straightforward later.
 
@@ -248,4 +268,4 @@ Obsidian-side integration (active-file selection, vault.createBinary / create / 
 
 ## next milestones
 
-- **v0.4+** — see [vault_plugin_v0_plan.md](../knowledge/projects/vault_plugin_v0_plan.md) for classified tier, multi-recipient management, and mobile story.
+- **v0.5+** — see [vault_plugin_v0_plan.md](../knowledge/projects/vault_plugin_v0_plan.md) for multi-recipient management, key rotation UX, and the mobile story. (the classified tier is no longer planned — born-encrypted notes via "New private note" replaced it in v0.4.)

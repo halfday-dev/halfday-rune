@@ -6,12 +6,13 @@
  * 30s of inactivity. Round-trip-verifies every save before overwriting
  * the `.age` file — same safety property as v0.2's encryptCurrentNote.
  *
+ * v0.4: sidecars are gone. Save path writes only the `.age` file.
+ *
  * Save path:
  *   1. read current doc out of CM6
  *   2. encrypt(recipient, plaintext) → Uint8Array
  *   3. decryptToString(identity, ciphertext) — must byte-match plaintext
  *   4. vault.modifyBinary(<.age>, ciphertext)
- *   5. regenerate sidecar (if one exists) via vault.modify(<.meta.md>)
  *
  * If step 3 fails (round-trip mismatch), we surface a Notice and leave
  * the on-disk `.age` untouched. The user keeps their in-memory edits.
@@ -23,14 +24,7 @@
  * CM6 packages bundled (not external) — same trade-off as v0.3.1.
  */
 
-import {
-  FileSystemAdapter,
-  FileView,
-  Notice,
-  Scope,
-  TFile,
-  WorkspaceLeaf,
-} from "obsidian";
+import { FileView, Notice, Scope, TFile, WorkspaceLeaf } from "obsidian";
 import { EditorState } from "@codemirror/state";
 import {
   EditorView,
@@ -45,14 +39,12 @@ import {
 } from "@codemirror/language";
 import { markdown } from "@codemirror/lang-markdown";
 import { tags } from "@lezer/highlight";
-import * as path from "path";
 import {
   decryptToString,
   encrypt,
   readIdentity,
   readRecipient,
 } from "./crypto";
-import { generateSidecar } from "./sidecar";
 
 export const VIEW_TYPE_AGE = "halfday-age-view";
 
@@ -400,32 +392,6 @@ export class AgeFileView extends FileView {
       ) as ArrayBuffer;
       await this.app.vault.modifyBinary(file, buffer);
 
-      // sidecar: refresh the shape stats + outbound links so the sidecar
-      // stays an accurate structural summary. Only if a sidecar already
-      // exists — we don't CREATE one here (that's seal.sh / v0.2's job).
-      const sidecarPath = this.computeSidecarPath(file.path);
-      if (sidecarPath) {
-        const sidecarFile = this.app.vault.getAbstractFileByPath(sidecarPath);
-        if (sidecarFile instanceof TFile) {
-          const adapter = this.app.vault.adapter;
-          if (adapter instanceof FileSystemAdapter) {
-            const vaultRoot = adapter.getBasePath();
-            const originalRelativePath = file.path.replace(/\.age$/, "");
-            const absolutePath = path.join(vaultRoot, originalRelativePath);
-            const sealedAt = new Date()
-              .toISOString()
-              .replace(/\.\d{3}Z$/, "Z");
-            const sidecar = generateSidecar({
-              originalContent: plaintext,
-              originalBasename: path.basename(originalRelativePath),
-              absolutePath,
-              sealedAt,
-            });
-            await this.app.vault.modify(sidecarFile, sidecar);
-          }
-        }
-      }
-
       this.plaintext = plaintext;
       this.dirty = false;
       this.lastSavedAt = new Date();
@@ -450,23 +416,6 @@ export class AgeFileView extends FileView {
     }
   }
 
-  /**
-   * Map a `.age` (or `.md.age`) path to its sibling sidecar `.meta.md`.
-   * Returns null if the basename doesn't match a pattern we recognize.
-   *
-   *   foo.md.age → foo.meta.md
-   *   foo.age    → foo.meta.md (fallback)
-   */
-  private computeSidecarPath(agePath: string): string | null {
-    if (agePath.endsWith(".md.age")) {
-      return agePath.replace(/\.md\.age$/, ".meta.md");
-    }
-    if (agePath.endsWith(".age")) {
-      return agePath.replace(/\.age$/, ".meta.md");
-    }
-    return null;
-  }
-
   private refreshStatus(extra?: string, isError = false): void {
     if (!this.statusEl) return;
     const file = this.file;
@@ -484,7 +433,7 @@ export class AgeFileView extends FileView {
       : "";
     const tail = extra ? ` · ${extra}` : "";
     this.statusEl.setText(
-      `${file.name} · ${dirtyMark}${lastSaved}${bytes}${tail} · v0.3.2`
+      `${file.name} · ${dirtyMark}${lastSaved}${bytes}${tail} · v0.4.0`
     );
     if (isError) {
       this.statusEl.addClass("halfday-age-error");

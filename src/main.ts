@@ -1,34 +1,42 @@
 /**
- * Halfday Obsidian Rune — v0.3.2
+ * Halfday Obsidian Rune — v0.4.0
  *
  * Commands:
- *   - "Test round-trip (X25519)"  — v0.1, proves typage works in Electron
- *   - "Encrypt current note → .age" — v0.2, seals an existing .md to .md.age
+ *   - "Test round-trip (X25519)"     — v0.1, proves typage works in Electron
+ *   - "Encrypt current note → .age"  — v0.2, seals an existing .md to .md.age
+ *   - "New private note"             — v0.4, born-encrypted .age (plaintext
+ *                                      never hits disk)
  *
  * Views:
- *   - AgeFileView (`.age` extension) — v0.3.2, decrypt-to-memory editable
+ *   - AgeFileView (`.age` extension) — v0.3.2/0.4, decrypt-to-memory editable
  *     CodeMirror 6 editor with markdown syntax highlighting. cmd-S saves
- *     (re-encrypt + round-trip verify → overwrite .age + sidecar) and a
- *     30s debounced autosave kicks in after the last edit. Dirty state is
- *     reflected both in the status line and in the tab title bullet.
+ *     (re-encrypt + round-trip verify → overwrite .age) and a 30s debounced
+ *     autosave kicks in after the last edit. Dirty state is reflected both in
+ *     the status line and in the tab title bullet.
+ *
+ * v0.4 design notes:
+ *   - "classified" tier dropped — born-encrypted notes via "New private note"
+ *     give the same guarantee without a separate tier.
+ *   - Sidecars dropped — sealed notes are opaque (single .age file, no .meta.md).
+ *     `~/halfday/logs/seal.log` is the audit trail for CLI seals; in-plugin
+ *     activity goes through the JS console + Notice UI.
  *
  * The encrypt command mirrors _agent/seal.sh's behavior: encrypt, round-trip
- * verify in memory, write ciphertext + sidecar, then (and only then) delete
- * the plaintext original. Any failure at any stage preserves the plaintext.
+ * verify in memory, write ciphertext, then (and only then) delete the plaintext
+ * original. Any failure at any stage preserves the plaintext.
  *
  * See knowledge/projects/vault_plugin_v0_plan.md for the full milestone map.
  */
 
 import {
   App,
-  FileSystemAdapter,
+  Modal,
   Notice,
   Plugin,
   PluginSettingTab,
   Setting,
   TFile,
 } from "obsidian";
-import * as path from "path";
 import { AgeFileView, VIEW_TYPE_AGE } from "./age-view";
 import {
   decryptToString,
@@ -37,7 +45,6 @@ import {
   readRecipient,
   roundTrip,
 } from "./crypto";
-import { generateSidecar } from "./sidecar";
 
 interface HalfdayObsidianRuneSettings {
   recipientPath: string;
@@ -70,6 +77,16 @@ export default class HalfdayObsidianRune extends Plugin {
         if (!checking) this.encryptCurrentNote(file);
         return true;
       },
+    });
+
+    // v0.4: born-encrypted note. Prompts for a filename, creates a .age
+    // file directly via vault.createBinary, and opens it in the AgeFileView.
+    // No plaintext ever hits disk — this is the replacement for the old
+    // "classified" tier.
+    this.addCommand({
+      id: "halfday-rune-new-private-note",
+      name: "New private note",
+      callback: () => this.newPrivateNote(),
     });
 
     // v0.3.0: custom view + .age extension routing
@@ -137,9 +154,11 @@ export default class HalfdayObsidianRune extends Plugin {
   }
 
   /**
-   * v0.2: Encrypt the active note to a sibling .age file, write a sidecar,
+   * v0.2 / updated in v0.4: Encrypt the active note to a sibling .age file
    * and delete the plaintext. Mirrors seal.sh's safety property — if any
-   * step fails, the plaintext is preserved and we clean up partial state.
+   * step fails, the plaintext is preserved.
+   *
+   * v0.4 change: no sidecar is written anymore. Sealed notes are opaque.
    *
    * Refuses:
    *   - files that are already .age
@@ -167,17 +186,10 @@ export default class HalfdayObsidianRune extends Plugin {
       }
 
       const sealedPath = `${file.path}.age`;
-      const sidecarPath = file.path.replace(/\.md$/, ".meta.md");
 
       if (this.app.vault.getAbstractFileByPath(sealedPath)) {
         new Notice(
           `Halfday Rune: refusing to overwrite existing ${sealedPath}`
-        );
-        return;
-      }
-      if (this.app.vault.getAbstractFileByPath(sidecarPath)) {
-        new Notice(
-          `Halfday Rune: refusing — sidecar already exists at ${sidecarPath}`
         );
         return;
       }
@@ -203,25 +215,6 @@ export default class HalfdayObsidianRune extends Plugin {
         return;
       }
 
-      // ---- compute absolute path for sidecar (desktop-only) ----
-      const adapter = this.app.vault.adapter;
-      if (!(adapter instanceof FileSystemAdapter)) {
-        new Notice(
-          "Halfday Rune: desktop-only for v0.2 (no mobile support yet)"
-        );
-        return;
-      }
-      const vaultRoot = adapter.getBasePath();
-      const absolutePath = path.join(vaultRoot, file.path);
-
-      const sealedAt = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
-      const sidecar = generateSidecar({
-        originalContent: plaintext,
-        originalBasename: file.name,
-        absolutePath,
-        sealedAt,
-      });
-
       // ---- write .age ----
       // Uint8Array → ArrayBuffer slice that Obsidian accepts
       const buffer = ciphertext.buffer.slice(
@@ -230,26 +223,10 @@ export default class HalfdayObsidianRune extends Plugin {
       ) as ArrayBuffer;
       await this.app.vault.createBinary(sealedPath, buffer);
 
-      // ---- write sidecar; if this fails, clean up the .age ----
-      try {
-        await this.app.vault.create(sidecarPath, sidecar);
-      } catch (err) {
-        // best-effort cleanup so we don't leave an .age without a sidecar
-        const orphan = this.app.vault.getAbstractFileByPath(sealedPath);
-        if (orphan instanceof TFile) {
-          try {
-            await this.app.vault.delete(orphan);
-          } catch (cleanupErr) {
-            console.error(
-              "[halfday-rune] failed to clean up orphan .age after sidecar write failed",
-              cleanupErr
-            );
-          }
-        }
-        throw err;
-      }
-
       // ---- delete original plaintext ----
+      // ciphertext + round-trip verify are durable before this point, so a
+      // failure here leaves an .age on disk but the user still has the .md —
+      // preferable to the inverse.
       await this.app.vault.delete(file);
 
       const dt = Date.now() - started;
@@ -259,7 +236,6 @@ export default class HalfdayObsidianRune extends Plugin {
       console.log("[halfday-rune] sealed", {
         file: file.path,
         sealedPath,
-        sidecarPath,
         dt,
       });
     } catch (err) {
@@ -268,6 +244,196 @@ export default class HalfdayObsidianRune extends Plugin {
       console.error("[halfday-rune] encrypt failed", err);
     }
   }
+
+  /**
+   * v0.4: Create a born-encrypted note. Plaintext never touches disk.
+   *
+   * Flow:
+   *   1. Prompt for a filename (no extension needed; we append `.age`).
+   *   2. Encrypt an empty string with the configured recipient.
+   *   3. Round-trip verify in memory — bail if mismatch.
+   *   4. vault.createBinary(name.age, ciphertext).
+   *   5. Open it in AgeFileView so the user can start typing straight away.
+   *
+   * Refuses to clobber an existing file at the target path.
+   */
+  async newPrivateNote(): Promise<void> {
+    const folder =
+      this.app.workspace.getActiveFile()?.parent?.path ?? "";
+    const suggested = this.suggestPrivateNoteName(folder);
+
+    const filename = await promptForFilename(this.app, {
+      title: "New private note",
+      description:
+        "Creates a born-encrypted .age file. Plaintext never hits disk. " +
+        '".age" will be appended automatically if you leave it off.',
+      defaultValue: suggested,
+    });
+    if (filename === null) return; // user cancelled
+
+    const trimmed = filename.trim();
+    if (!trimmed) {
+      new Notice("Halfday Rune: filename required");
+      return;
+    }
+
+    // normalize to a .age path, always rooted in folder (if any)
+    const withExt = trimmed.endsWith(".age") ? trimmed : `${trimmed}.age`;
+    const targetPath = folder ? `${folder}/${withExt}` : withExt;
+
+    if (this.app.vault.getAbstractFileByPath(targetPath)) {
+      new Notice(`Halfday Rune: already exists: ${targetPath}`);
+      return;
+    }
+
+    try {
+      const recipient = readRecipient(this.settings.recipientPath);
+      const identity = readIdentity(this.settings.identityPath);
+
+      const emptyPlaintext = "";
+      const ciphertext = await encrypt(recipient, emptyPlaintext);
+
+      // round-trip verify in memory before touching disk
+      const decoded = await decryptToString(identity, ciphertext);
+      if (decoded !== emptyPlaintext) {
+        new Notice(
+          "Halfday Rune: round-trip MISMATCH on new note — aborting, nothing written"
+        );
+        console.error("[halfday-rune] new-private-note round-trip mismatch");
+        return;
+      }
+
+      const buffer = ciphertext.buffer.slice(
+        ciphertext.byteOffset,
+        ciphertext.byteOffset + ciphertext.byteLength
+      ) as ArrayBuffer;
+      const created = await this.app.vault.createBinary(targetPath, buffer);
+
+      // open in our view so the user can start typing; AgeFileView handles
+      // the empty-doc decrypt path fine because we just verified it.
+      const leaf = this.app.workspace.getLeaf(false);
+      await leaf.openFile(created);
+
+      new Notice(`Halfday Rune: created ${targetPath}`);
+      console.log("[halfday-rune] new private note", {
+        path: targetPath,
+        bytes: ciphertext.byteLength,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      new Notice(`Halfday Rune: new private note failed — ${msg}`);
+      console.error("[halfday-rune] new private note failed", err);
+    }
+  }
+
+  /**
+   * Suggest `untitled.age`, `untitled-2.age`, … that doesn't already exist
+   * in the chosen folder. The user can overwrite this in the prompt.
+   */
+  private suggestPrivateNoteName(folder: string): string {
+    const base = "untitled";
+    const candidate = (n: number) =>
+      n === 1 ? `${base}.age` : `${base}-${n}.age`;
+    for (let i = 1; i < 1000; i++) {
+      const name = candidate(i);
+      const full = folder ? `${folder}/${name}` : name;
+      if (!this.app.vault.getAbstractFileByPath(full)) return name;
+    }
+    return `${base}-${Date.now()}.age`;
+  }
+}
+
+/**
+ * Tiny modal that asks for a single text value and resolves with the string
+ * (null on cancel). Kept inline — not worth a second file.
+ */
+class FilenamePromptModal extends Modal {
+  private value: string;
+  private resolved = false;
+  private readonly opts: {
+    title: string;
+    description: string;
+    defaultValue: string;
+  };
+  private readonly resolver: (value: string | null) => void;
+
+  constructor(
+    app: App,
+    opts: { title: string; description: string; defaultValue: string },
+    resolver: (value: string | null) => void
+  ) {
+    super(app);
+    this.opts = opts;
+    this.resolver = resolver;
+    this.value = opts.defaultValue;
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: this.opts.title });
+    contentEl.createEl("p", { text: this.opts.description });
+
+    const input = contentEl.createEl("input", { type: "text" });
+    input.value = this.opts.defaultValue;
+    input.style.width = "100%";
+    input.style.marginTop = "0.5rem";
+    input.addEventListener("input", () => {
+      this.value = input.value;
+    });
+    input.addEventListener("keydown", (e: KeyboardEvent) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        this.resolve(this.value);
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        this.resolve(null);
+      }
+    });
+
+    const buttons = contentEl.createDiv();
+    buttons.style.display = "flex";
+    buttons.style.gap = "0.5rem";
+    buttons.style.justifyContent = "flex-end";
+    buttons.style.marginTop = "1rem";
+
+    const cancelBtn = buttons.createEl("button", { text: "Cancel" });
+    cancelBtn.addEventListener("click", () => this.resolve(null));
+
+    const okBtn = buttons.createEl("button", { text: "Create", cls: "mod-cta" });
+    okBtn.addEventListener("click", () => this.resolve(this.value));
+
+    // select the "untitled" portion so the user can overwrite in place
+    setTimeout(() => {
+      input.focus();
+      const dotAge = input.value.lastIndexOf(".age");
+      if (dotAge > 0) input.setSelectionRange(0, dotAge);
+      else input.select();
+    }, 0);
+  }
+
+  onClose(): void {
+    // user closed without choosing (e.g. clicked outside)
+    this.resolve(null);
+    this.contentEl.empty();
+  }
+
+  private resolve(value: string | null): void {
+    if (this.resolved) return;
+    this.resolved = true;
+    this.resolver(value);
+    this.close();
+  }
+}
+
+async function promptForFilename(
+  app: App,
+  opts: { title: string; description: string; defaultValue: string }
+): Promise<string | null> {
+  return new Promise((resolve) => {
+    const modal = new FilenamePromptModal(app, opts, resolve);
+    modal.open();
+  });
 }
 
 class HalfdayRuneSettingTab extends PluginSettingTab {
