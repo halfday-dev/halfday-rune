@@ -1,0 +1,23 @@
+{
+  "name": "halfday-obsidian-rune",
+  "version": "0.0.1",
+  "description": "X25519 age encryption for Obsidian notes (halfday build)",
+  "main": "lib/main.js",
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "obsidian-plugin build --with-stylesheet src/styles.css src/main.ts",
+    "dev": "obsidian-plugin dev --with-stylesheet src/styles.css src/main.ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "age-encryption": "^0.3.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "obsidian-plugin-cli": "^0.4.3",
+    "obsidian": "obsidianmd/obsidian-api",
+    "vitest": "^2.1.0",
+    "@types/node": "^20.14.0"
+  }
+}
