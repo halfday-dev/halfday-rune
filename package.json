@@ -5,8 +5,8 @@
   "main": "lib/main.js",
   "license": "Apache-2.0",
   "scripts": {
-    "build": "obsidian-plugin build --with-stylesheet src/styles.css src/main.ts",
-    "dev": "obsidian-plugin dev --with-stylesheet src/styles.css src/main.ts",
+    "build": "obsidian-plugin build src/main.ts -o .",
+    "dev": "obsidian-plugin dev src/main.ts",
     "test": "vitest run",
     "test:watch": "vitest"
   },
@@ -14,10 +14,10 @@
     "age-encryption": "^0.3.0"
   },
   "devDependencies": {
-    "typescript": "^5.5.0",
-    "obsidian-plugin-cli": "^0.4.3",
+    "@types/node": "^20.14.0",
     "obsidian": "obsidianmd/obsidian-api",
-    "vitest": "^2.1.0",
-    "@types/node": "^20.14.0"
+    "obsidian-plugin-cli": "^0.4.5",
+    "typescript": "^5.5.0",
+    "vitest": "^2.1.0"
   }
 }
