@@ -83,11 +83,13 @@ then in Obsidian: open the command palette (cmd-p), search "Halfday Rune". the p
 
 and one custom view:
 
-- **AgeFileView** (`.age` extension) — v0.3.0. opening any `.age` file in the vault routes it through our view instead of Obsidian's binary fallback. the plugin decrypts the file to memory and shows the plaintext in a read-only preformatted block. status line at top reports decrypt outcome. no editing yet (v0.3.1 swaps in CM6; v0.3.2 enables edit + save).
+- **AgeFileView** (`.age` extension) — v0.3.2. opening any `.age` file in the vault routes it through our view instead of Obsidian's binary fallback. the plugin decrypts the file to memory, mounts an editable CodeMirror 6 editor with markdown syntax highlighting, and re-encrypts on cmd-S or 30s after the last edit. status line at top reports the current state (dirty/clean, last save time, ciphertext bytes); the tab title gets a `●` bullet when dirty.
 
 failures surface as Notices with a one-line error; full stack traces go to devtools (`cmd-opt-i`).
 
 > **v0.3 dev tip:** prefer **option B (symlink)** during v0.3 work so `styles.css` stays in sync alongside `main.js` / `manifest.json`. `obsidian-plugin dev` only copies `main.js` + `manifest.json` into the vault — it does not copy `styles.css`, and the AgeFileView reads nicer with its styles applied.
+
+> **v0.3.2 dev tip:** when testing autosave, bear in mind the debounce is **30s after the last edit**, not 30s on a fixed schedule. If you keep typing, the timer keeps getting reset. For faster iteration, hit **cmd-S** to force a save, or temporarily lower `AUTOSAVE_DELAY_MS` at the top of `src/age-view.ts`.
 
 ## what v0.1 proves
 
@@ -159,6 +161,37 @@ after pulling these changes, **`npm install` is required** before `npm run build
 
 if step 2 gives you the binary fallback (hex dump / "cannot display"), `registerExtensions` didn't take — check for conflicting plugins and try reloading Obsidian.
 
+## what v0.3.2 adds
+
+the CM6 editor is now editable. cmd-S (or ctrl-S) re-encrypts the buffer and writes a fresh `.age` file back to disk; otherwise a 30-second debounced autosave does it for you after the last edit. if it works:
+
+1. edits actually reach the vault — `vault.modifyBinary` on the `.age` target accepts the re-encrypted bytes and Obsidian doesn't complain
+2. the save path preserves seal.sh's safety property: encrypt, decrypt back in memory, byte-compare; only then overwrite the `.age` file. a round-trip mismatch surfaces as a `Notice` and the on-disk ciphertext is left alone
+3. the sidecar (`.meta.md`) — if one exists next to the `.age` file — gets its shape stats and outbound links refreshed on every save. sealed_at updates to the time of the latest save (this is "last encrypted"; if you want the historical first-seal time, git history has it)
+4. the tab title shows a leading `●` bullet when the buffer has unsaved edits; the status line shows `dirty ●` / `clean`, the last save timestamp, and the resulting ciphertext size
+
+sanity sequence on a dev vault:
+
+```
+1. open a previously sealed foo.md.age (seal one via v0.2 if you don't have one)
+2. type some text — expect: tab title gains `●`, status line flips to `dirty ●`
+3. hit cmd-S — expect: status line shows `saving…`, then `saved in Nms (manual)`, tab title loses `●`
+4. edit again and wait 30s — autosave fires (reason: autosave) without any keystroke
+5. close and reopen the file — plaintext should reflect the saved edits
+6. CLI verify: age -d -i ~/.age/vault.identity /path/to/foo.md.age → see the new plaintext
+7. sidecar: cat foo.meta.md → sealed_at should be the latest save time; shape stats should reflect the current word/paragraph count
+```
+
+unsaved edits at unload-time get flushed — if you navigate away with a dirty buffer, `onUnloadFile` awaits a final save before tearing down the editor. That's best-effort: if the save throws, the console logs it and the view unloads anyway (the view can't block Obsidian's workspace transitions).
+
+### autosave debug tip
+
+autosave is debounced (not periodic). if you want to confirm it's running without waiting 30s, temporarily lower `AUTOSAVE_DELAY_MS` at the top of `src/age-view.ts` to e.g. `3_000`, rebuild, and edit — you'll see `saved in Nms (autosave)` in the status line ~3s after the last keystroke.
+
+### known gap (to revisit)
+
+cmd-C in the editor works now that CM6 is editable (contenteditable is back). the v0.3.1 read-only copy workaround is no longer needed.
+
 ## troubleshooting
 
 ### plugin doesn't appear in obsidian / "failed to load"
@@ -215,5 +248,4 @@ Obsidian-side integration (active-file selection, vault.createBinary / create / 
 
 ## next milestones
 
-- **v0.3.2** — make the CM6 editor editable, wire cmd-S + 30s encrypted autosave, dirty-state tab title, re-encrypt + round-trip verify on every save. sidecar shape stats update on save.
 - **v0.4+** — see [vault_plugin_v0_plan.md](../knowledge/projects/vault_plugin_v0_plan.md) for classified tier, multi-recipient management, and mobile story.

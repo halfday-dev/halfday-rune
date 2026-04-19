@@ -1,34 +1,60 @@
 /**
  * AgeFileView — custom Obsidian FileView for `.age` files.
  *
- * v0.3.1 (read-only, CM6): decrypts the file to memory on open and mounts a
- * CodeMirror 6 editor with markdown syntax highlighting over the plaintext.
- * No editing, no writes. Editing + cmd-S + 30s encrypted autosave land in
- * v0.3.2.
+ * v0.3.2 (editable + autosave): decrypts on open into a CM6 markdown
+ * editor, accepts edits, and re-encrypts back to disk on cmd-S or after
+ * 30s of inactivity. Round-trip-verifies every save before overwriting
+ * the `.age` file — same safety property as v0.2's encryptCurrentNote.
  *
- * CM6 packages are bundled into main.js rather than marked external so we
- * don't depend on Obsidian's bundled version staying ABI-compatible with us.
- * The size hit is ~150 KB gzipped — acceptable for now.
+ * Save path:
+ *   1. read current doc out of CM6
+ *   2. encrypt(recipient, plaintext) → Uint8Array
+ *   3. decryptToString(identity, ciphertext) — must byte-match plaintext
+ *   4. vault.modifyBinary(<.age>, ciphertext)
+ *   5. regenerate sidecar (if one exists) via vault.modify(<.meta.md>)
  *
- * Threat model reminder: the plaintext lives in JS memory (both in our
- * `plaintext` field and inside the CM6 EditorState's document) while the view
- * is open. That is intentional — the whole point of the plugin is an
- * editable surface that never spills plaintext to disk. On view close / file
- * unload we destroy the EditorView (which drops its state) and null out our
- * reference so the strings can be GC'd.
+ * If step 3 fails (round-trip mismatch), we surface a Notice and leave
+ * the on-disk `.age` untouched. The user keeps their in-memory edits.
+ *
+ * Threat model reminder: plaintext lives in JS memory (this.plaintext +
+ * the CM6 doc) while the view is open. On close / file unload we destroy
+ * the EditorView and null out references so the strings can be GC'd.
+ *
+ * CM6 packages bundled (not external) — same trade-off as v0.3.1.
  */
 
-import { FileView, TFile, WorkspaceLeaf } from "obsidian";
+import {
+  FileSystemAdapter,
+  FileView,
+  Notice,
+  TFile,
+  WorkspaceLeaf,
+} from "obsidian";
 import { EditorState } from "@codemirror/state";
-import { EditorView, lineNumbers, highlightActiveLine } from "@codemirror/view";
+import {
+  EditorView,
+  highlightActiveLine,
+  keymap,
+  lineNumbers,
+} from "@codemirror/view";
 import {
   defaultHighlightStyle,
   syntaxHighlighting,
 } from "@codemirror/language";
 import { markdown } from "@codemirror/lang-markdown";
-import { decryptToString, readIdentity } from "./crypto";
+import * as path from "path";
+import {
+  decryptToString,
+  encrypt,
+  readIdentity,
+  readRecipient,
+} from "./crypto";
+import { generateSidecar } from "./sidecar";
 
 export const VIEW_TYPE_AGE = "halfday-age-view";
+
+/** Debounce window for autosave after the last edit. */
+const AUTOSAVE_DELAY_MS = 30_000;
 
 /**
  * A plugin handle the view needs at runtime. Passing the whole plugin
@@ -36,7 +62,10 @@ export const VIEW_TYPE_AGE = "halfday-age-view";
  */
 export interface AgeFileViewDeps {
   getIdentityPath: () => string;
+  getRecipientPath: () => string;
 }
+
+type SaveReason = "manual" | "autosave" | "unload";
 
 export class AgeFileView extends FileView {
   private deps: AgeFileViewDeps;
@@ -44,6 +73,14 @@ export class AgeFileView extends FileView {
   private editor: EditorView | null = null;
   private editorHost: HTMLDivElement | null = null;
   private statusEl: HTMLDivElement | null = null;
+
+  // dirty / autosave bookkeeping — reset on every onLoadFile
+  private dirty = false;
+  private autosaveTimer: ReturnType<typeof setTimeout> | null = null;
+  private inFlightSave: Promise<void> | null = null;
+  private lastSavedAt: Date | null = null;
+  /** Byte-length of the ciphertext we last successfully wrote — shown for debugging. */
+  private lastSavedBytes: number | null = null;
 
   constructor(leaf: WorkspaceLeaf, deps: AgeFileViewDeps) {
     super(leaf);
@@ -61,7 +98,10 @@ export class AgeFileView extends FileView {
   }
 
   getDisplayText(): string {
-    return this.file?.name ?? "(encrypted)";
+    const name = this.file?.name ?? "(encrypted)";
+    // the bullet is a lightweight "dirty" marker that shows up in the tab
+    // title — Obsidian re-reads getDisplayText when we call updateHeader().
+    return this.dirty ? `● ${name}` : name;
   }
 
   /** Build the static chrome once. File-specific content lands in onLoadFile. */
@@ -76,7 +116,11 @@ export class AgeFileView extends FileView {
 
   async onLoadFile(file: TFile): Promise<void> {
     if (!this.statusEl || !this.editorHost) return;
+    this.cancelAutosave();
     this.teardownEditor();
+    this.dirty = false;
+    this.lastSavedAt = null;
+    this.lastSavedBytes = null;
     this.statusEl.removeClass("halfday-age-error");
     this.statusEl.setText(`decrypting ${file.name}…`);
 
@@ -88,16 +132,16 @@ export class AgeFileView extends FileView {
       const plaintext = await decryptToString(identity, ciphertext);
 
       this.plaintext = plaintext;
+      this.lastSavedBytes = ciphertext.byteLength;
       this.mountEditor(plaintext);
-
-      const byteLen = ciphertext.byteLength;
-      this.statusEl.setText(
-        `decrypted · ${plaintext.length.toLocaleString()} chars from ${byteLen.toLocaleString()} bytes · read-only (v0.3.1)`
+      this.refreshStatus(
+        `decrypted · ${plaintext.length.toLocaleString()} chars from ${ciphertext.byteLength.toLocaleString()} bytes`
       );
+      this.updateTabHeader();
       console.log("[halfday-rune] age view decrypted", {
         path: file.path,
         plaintextLen: plaintext.length,
-        ciphertextLen: byteLen,
+        ciphertextLen: ciphertext.byteLength,
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -110,11 +154,24 @@ export class AgeFileView extends FileView {
   }
 
   async onUnloadFile(_file: TFile): Promise<void> {
-    // drop the plaintext reference and destroy the CM6 state so the string
-    // can be GC'd. CM6 holds the doc in its EditorState — destroying the view
-    // is what actually releases it.
+    // flush unsaved edits before dropping plaintext. we await rather than
+    // fire-and-forget so the encrypted bytes land before the plugin or
+    // workspace unwinds further. If save throws, we surface it via Notice
+    // (save() already does that) and still complete the unload — keeping
+    // the view open would block Obsidian's own state transitions.
+    if (this.dirty) {
+      try {
+        await this.save("unload");
+      } catch (err) {
+        console.error("[halfday-rune] flush-on-unload failed", err);
+      }
+    }
+    this.cancelAutosave();
     this.teardownEditor();
     this.plaintext = null;
+    this.dirty = false;
+    this.lastSavedAt = null;
+    this.lastSavedBytes = null;
     if (this.statusEl) {
       this.statusEl.removeClass("halfday-age-error");
       this.statusEl.setText("");
@@ -122,6 +179,7 @@ export class AgeFileView extends FileView {
   }
 
   async onClose(): Promise<void> {
+    this.cancelAutosave();
     this.teardownEditor();
     this.plaintext = null;
     this.editorHost = null;
@@ -141,13 +199,30 @@ export class AgeFileView extends FileView {
     const state = EditorState.create({
       doc,
       extensions: [
-        EditorView.editable.of(false),
-        EditorState.readOnly.of(true),
         EditorView.lineWrapping,
         lineNumbers(),
         highlightActiveLine(),
         markdown(),
         syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
+        // cmd-S (or ctrl-S) triggers an explicit save. We return true so
+        // the keypress doesn't bubble up to the browser's save dialog.
+        keymap.of([
+          {
+            key: "Mod-s",
+            preventDefault: true,
+            run: () => {
+              void this.save("manual");
+              return true;
+            },
+          },
+        ]),
+        // track dirty state — every docChanged flips us dirty and (re)arms
+        // the 30s autosave timer.
+        EditorView.updateListener.of((update) => {
+          if (update.docChanged) {
+            this.markDirty();
+          }
+        }),
         // lean on Obsidian's CSS variables so the editor blends in visually
         EditorView.theme({
           "&": {
@@ -188,5 +263,193 @@ export class AgeFileView extends FileView {
       this.editor = null;
     }
     if (this.editorHost) this.editorHost.empty();
+  }
+
+  private markDirty(): void {
+    const wasDirty = this.dirty;
+    this.dirty = true;
+    this.scheduleAutosave();
+    this.refreshStatus();
+    if (!wasDirty) this.updateTabHeader();
+  }
+
+  private scheduleAutosave(): void {
+    this.cancelAutosave();
+    this.autosaveTimer = setTimeout(() => {
+      this.autosaveTimer = null;
+      void this.save("autosave");
+    }, AUTOSAVE_DELAY_MS);
+  }
+
+  private cancelAutosave(): void {
+    if (this.autosaveTimer !== null) {
+      clearTimeout(this.autosaveTimer);
+      this.autosaveTimer = null;
+    }
+  }
+
+  /**
+   * Serialize saves so two concurrent triggers (autosave + cmd-S, or rapid
+   * cmd-S) don't race the vault writes. Each call ends up writing whatever
+   * the doc looks like at its moment — no queue depth beyond one.
+   */
+  private async save(reason: SaveReason): Promise<void> {
+    if (!this.editor || !this.file) return;
+    if (this.inFlightSave) {
+      try {
+        await this.inFlightSave;
+      } catch {
+        /* swallow; the new save will surface its own error */
+      }
+    }
+    this.inFlightSave = this._doSave(reason);
+    try {
+      await this.inFlightSave;
+    } finally {
+      this.inFlightSave = null;
+    }
+  }
+
+  private async _doSave(reason: SaveReason): Promise<void> {
+    if (!this.editor || !this.file) return;
+    const file = this.file;
+    const startedAt = Date.now();
+    const plaintext = this.editor.state.doc.toString();
+    this.cancelAutosave();
+    this.refreshStatus("saving…");
+
+    try {
+      const recipientPath = this.deps.getRecipientPath();
+      const identityPath = this.deps.getIdentityPath();
+      const recipient = readRecipient(recipientPath);
+      const identity = readIdentity(identityPath);
+
+      // encrypt
+      const ciphertext = await encrypt(recipient, plaintext);
+
+      // round-trip verify before committing to disk — mirrors v0.2's
+      // safety property: if we can't read back what we just wrote,
+      // don't touch the on-disk copy.
+      const decoded = await decryptToString(identity, ciphertext);
+      if (decoded !== plaintext) {
+        throw new Error(
+          `round-trip MISMATCH (plaintext ${plaintext.length} chars, decoded ${decoded.length}) — on-disk ciphertext left untouched`
+        );
+      }
+
+      // Uint8Array → ArrayBuffer slice that vault.modifyBinary accepts
+      const buffer = ciphertext.buffer.slice(
+        ciphertext.byteOffset,
+        ciphertext.byteOffset + ciphertext.byteLength
+      ) as ArrayBuffer;
+      await this.app.vault.modifyBinary(file, buffer);
+
+      // sidecar: refresh the shape stats + outbound links so the sidecar
+      // stays an accurate structural summary. Only if a sidecar already
+      // exists — we don't CREATE one here (that's seal.sh / v0.2's job).
+      const sidecarPath = this.computeSidecarPath(file.path);
+      if (sidecarPath) {
+        const sidecarFile = this.app.vault.getAbstractFileByPath(sidecarPath);
+        if (sidecarFile instanceof TFile) {
+          const adapter = this.app.vault.adapter;
+          if (adapter instanceof FileSystemAdapter) {
+            const vaultRoot = adapter.getBasePath();
+            const originalRelativePath = file.path.replace(/\.age$/, "");
+            const absolutePath = path.join(vaultRoot, originalRelativePath);
+            const sealedAt = new Date()
+              .toISOString()
+              .replace(/\.\d{3}Z$/, "Z");
+            const sidecar = generateSidecar({
+              originalContent: plaintext,
+              originalBasename: path.basename(originalRelativePath),
+              absolutePath,
+              sealedAt,
+            });
+            await this.app.vault.modify(sidecarFile, sidecar);
+          }
+        }
+      }
+
+      this.plaintext = plaintext;
+      this.dirty = false;
+      this.lastSavedAt = new Date();
+      this.lastSavedBytes = ciphertext.byteLength;
+      const dt = Date.now() - startedAt;
+      this.refreshStatus(`saved in ${dt}ms (${reason})`);
+      this.updateTabHeader();
+      console.log("[halfday-rune] age view saved", {
+        path: file.path,
+        plaintextLen: plaintext.length,
+        ciphertextLen: ciphertext.byteLength,
+        dt,
+        reason,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      new Notice(`Halfday Rune: save failed — ${msg}`);
+      this.refreshStatus(`save failed — ${msg}`, /*isError*/ true);
+      console.error("[halfday-rune] age view save failed", err);
+      // still dirty — let the user retry or try cmd-S
+      throw err;
+    }
+  }
+
+  /**
+   * Map a `.age` (or `.md.age`) path to its sibling sidecar `.meta.md`.
+   * Returns null if the basename doesn't match a pattern we recognize.
+   *
+   *   foo.md.age → foo.meta.md
+   *   foo.age    → foo.meta.md (fallback)
+   */
+  private computeSidecarPath(agePath: string): string | null {
+    if (agePath.endsWith(".md.age")) {
+      return agePath.replace(/\.md\.age$/, ".meta.md");
+    }
+    if (agePath.endsWith(".age")) {
+      return agePath.replace(/\.age$/, ".meta.md");
+    }
+    return null;
+  }
+
+  private refreshStatus(extra?: string, isError = false): void {
+    if (!this.statusEl) return;
+    const file = this.file;
+    if (!file) {
+      this.statusEl.setText("");
+      this.statusEl.removeClass("halfday-age-error");
+      return;
+    }
+    const dirtyMark = this.dirty ? "dirty ●" : "clean";
+    const lastSaved = this.lastSavedAt
+      ? ` · last saved ${this.lastSavedAt.toLocaleTimeString()}`
+      : "";
+    const bytes = this.lastSavedBytes !== null
+      ? ` · ${this.lastSavedBytes.toLocaleString()} bytes on disk`
+      : "";
+    const tail = extra ? ` · ${extra}` : "";
+    this.statusEl.setText(
+      `${file.name} · ${dirtyMark}${lastSaved}${bytes}${tail} · v0.3.2`
+    );
+    if (isError) {
+      this.statusEl.addClass("halfday-age-error");
+    } else {
+      this.statusEl.removeClass("halfday-age-error");
+    }
+  }
+
+  /**
+   * Nudge Obsidian to re-read getDisplayText so the tab title reflects the
+   * current dirty state. `updateHeader` exists on WorkspaceLeaf in current
+   * Obsidian builds but isn't in the public types — guard the call so a
+   * future rename doesn't crash the plugin.
+   */
+  private updateTabHeader(): void {
+    const leaf = this.leaf as WorkspaceLeaf & { updateHeader?: () => void };
+    try {
+      leaf.updateHeader?.();
+    } catch (err) {
+      // best-effort only; the in-view status line is the source of truth
+      console.debug("[halfday-rune] updateHeader unavailable", err);
+    }
   }
 }

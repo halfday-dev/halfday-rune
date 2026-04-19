@@ -1,14 +1,16 @@
 /**
- * Halfday Obsidian Rune — v0.3.1
+ * Halfday Obsidian Rune — v0.3.2
  *
  * Commands:
  *   - "Test round-trip (X25519)"  — v0.1, proves typage works in Electron
  *   - "Encrypt current note → .age" — v0.2, seals an existing .md to .md.age
  *
  * Views:
- *   - AgeFileView (`.age` extension) — v0.3.1, decrypt-to-memory read-only
- *     preview with a CodeMirror 6 editor + markdown syntax highlighting.
- *     Editing + cmd-S + 30s encrypted autosave land in v0.3.2.
+ *   - AgeFileView (`.age` extension) — v0.3.2, decrypt-to-memory editable
+ *     CodeMirror 6 editor with markdown syntax highlighting. cmd-S saves
+ *     (re-encrypt + round-trip verify → overwrite .age + sidecar) and a
+ *     30s debounced autosave kicks in after the last edit. Dirty state is
+ *     reflected both in the status line and in the tab title bullet.
  *
  * The encrypt command mirrors _agent/seal.sh's behavior: encrypt, round-trip
  * verify in memory, write ciphertext + sidecar, then (and only then) delete
@@ -71,11 +73,13 @@ export default class HalfdayObsidianRune extends Plugin {
     });
 
     // v0.3.0: custom view + .age extension routing
+    // v0.3.2: view also needs the recipient path so it can re-encrypt on save
     this.registerView(
       VIEW_TYPE_AGE,
       (leaf) =>
         new AgeFileView(leaf, {
           getIdentityPath: () => this.settings.identityPath,
+          getRecipientPath: () => this.settings.recipientPath,
         })
     );
     this.registerExtensions(["age"], VIEW_TYPE_AGE);
