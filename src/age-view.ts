@@ -27,6 +27,7 @@ import {
   FileSystemAdapter,
   FileView,
   Notice,
+  Scope,
   TFile,
   WorkspaceLeaf,
 } from "obsidian";
@@ -39,9 +40,11 @@ import {
 } from "@codemirror/view";
 import {
   defaultHighlightStyle,
+  HighlightStyle,
   syntaxHighlighting,
 } from "@codemirror/language";
 import { markdown } from "@codemirror/lang-markdown";
+import { tags } from "@lezer/highlight";
 import * as path from "path";
 import {
   decryptToString,
@@ -55,6 +58,41 @@ export const VIEW_TYPE_AGE = "halfday-age-view";
 
 /** Debounce window for autosave after the last edit. */
 const AUTOSAVE_DELAY_MS = 30_000;
+
+/**
+ * Custom highlight style that actually sizes headings (the default
+ * @codemirror/language highlight style only assigns *colors*, not
+ * font sizes — so without this, `## hello` shows up colored but the
+ * same size as body text, which is not what people expect from a
+ * markdown editor).
+ *
+ * Tag set comes from @lezer/highlight; it's the same vocabulary
+ * @codemirror/lang-markdown emits.
+ */
+const halfdayMarkdownHighlight = HighlightStyle.define([
+  { tag: tags.heading1, fontSize: "1.7em", fontWeight: "700" },
+  { tag: tags.heading2, fontSize: "1.45em", fontWeight: "700" },
+  { tag: tags.heading3, fontSize: "1.25em", fontWeight: "700" },
+  { tag: tags.heading4, fontSize: "1.1em", fontWeight: "700" },
+  { tag: tags.heading5, fontSize: "1.05em", fontWeight: "700" },
+  { tag: tags.heading6, fontWeight: "700" },
+  { tag: tags.strong, fontWeight: "700" },
+  { tag: tags.emphasis, fontStyle: "italic" },
+  { tag: tags.strikethrough, textDecoration: "line-through" },
+  {
+    tag: tags.link,
+    color: "var(--text-accent)",
+    textDecoration: "underline",
+  },
+  { tag: tags.url, color: "var(--text-accent)" },
+  {
+    tag: tags.monospace,
+    fontFamily: "var(--font-monospace, monospace)",
+    color: "var(--text-accent)",
+  },
+  { tag: tags.quote, color: "var(--text-muted)", fontStyle: "italic" },
+  { tag: tags.list, color: "var(--text-accent)" },
+]);
 
 /**
  * A plugin handle the view needs at runtime. Passing the whole plugin
@@ -112,6 +150,18 @@ export class AgeFileView extends FileView {
 
     this.statusEl = contentEl.createDiv({ cls: "halfday-age-status" });
     this.editorHost = contentEl.createDiv({ cls: "halfday-age-editor" });
+
+    // cmd-S (manual save). Obsidian's global hotkey manager eats Mod-S
+    // before CM6's keymap can see it, so we register on the view's own
+    // Scope (which takes precedence when the view has focus) rather than
+    // relying solely on the CM6 binding in mountEditor(). Parent is the
+    // app scope so other shortcuts still fall through.
+    this.scope = new Scope(this.app.scope);
+    this.scope.register(["Mod"], "s", (evt) => {
+      evt.preventDefault();
+      void this.save("manual");
+      return false;
+    });
   }
 
   async onLoadFile(file: TFile): Promise<void> {
@@ -203,9 +253,15 @@ export class AgeFileView extends FileView {
         lineNumbers(),
         highlightActiveLine(),
         markdown(),
+        // order matters: our custom style first (heading sizes), then the
+        // default as a fallback so non-heading tokens still get default colors
+        syntaxHighlighting(halfdayMarkdownHighlight),
         syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
-        // cmd-S (or ctrl-S) triggers an explicit save. We return true so
-        // the keypress doesn't bubble up to the browser's save dialog.
+        // cmd-S handler is *also* registered at the CM6 layer as a backup;
+        // the authoritative one lives on this.scope (onOpen) because
+        // Obsidian's global hotkey manager intercepts cmd-S before CM6
+        // gets a look-in. Returning true stops browser save dialog if we
+        // ever do catch it here.
         keymap.of([
           {
             key: "Mod-s",
