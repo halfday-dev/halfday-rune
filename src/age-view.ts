@@ -43,7 +43,7 @@ import {
   decryptToString,
   encrypt,
   readIdentity,
-  readRecipient,
+  readRecipients,
 } from "./crypto";
 
 export const VIEW_TYPE_AGE = "halfday-age-view";
@@ -92,7 +92,7 @@ const halfdayMarkdownHighlight = HighlightStyle.define([
  */
 export interface AgeFileViewDeps {
   getIdentityPath: () => string;
-  getRecipientPath: () => string;
+  getRecipientsPath: () => string;
 }
 
 type SaveReason = "manual" | "autosave" | "unload";
@@ -367,13 +367,13 @@ export class AgeFileView extends FileView {
     this.refreshStatus("saving…");
 
     try {
-      const recipientPath = this.deps.getRecipientPath();
+      const recipientsPath = this.deps.getRecipientsPath();
       const identityPath = this.deps.getIdentityPath();
-      const recipient = readRecipient(recipientPath);
+      const recipients = readRecipients(recipientsPath);
       const identity = readIdentity(identityPath);
 
-      // encrypt
-      const ciphertext = await encrypt(recipient, plaintext);
+      // encrypt — multi-recipient capable; single-recipient is identical to v0.4
+      const ciphertext = await encrypt(recipients, plaintext);
 
       // round-trip verify before committing to disk — mirrors v0.2's
       // safety property: if we can't read back what we just wrote,
@@ -433,7 +433,7 @@ export class AgeFileView extends FileView {
       : "";
     const tail = extra ? ` · ${extra}` : "";
     this.statusEl.setText(
-      `${file.name} · ${dirtyMark}${lastSaved}${bytes}${tail} · v0.4.0`
+      `${file.name} · ${dirtyMark}${lastSaved}${bytes}${tail} · v0.5.0`
     );
     if (isError) {
       this.statusEl.addClass("halfday-age-error");

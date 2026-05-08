@@ -4,6 +4,12 @@
  * Split from main.ts so these functions can be unit-tested without Obsidian.
  * All functions are synchronous or async-but-free-of-Obsidian — the plugin
  * shell in main.ts is responsible for surfacing errors via Notice.
+ *
+ * v0.5.0: multi-recipient. The recipient input is now `~/.age/recipients.txt`
+ * (one age1... pubkey per line, `#` lines = comments). Encrypt accepts a
+ * non-empty array of recipients; the resulting age ciphertext is decryptable
+ * by any of the matching identities. Single-recipient case (length-1 array)
+ * is byte-compatible with v0.4.
  */
 
 import * as fs from "fs";
@@ -19,24 +25,83 @@ export function expandHome(p: string): string {
 }
 
 /**
- * Read an age recipient (public key) from a file.
- * Returns the first line that looks like `age1...`. Throws on none-found.
+ * v0.5.0: Parse a recipients.txt file into a list of age1... recipient
+ * strings.
  *
- * Accepts files with leading comments (lines starting with `#`) so it works
- * with raw `age-keygen` output (which is an identity file but also has a
- * `# public key: age1...` line — we don't read that form here; the recipient
- * should be in its own file, extracted via `grep '^# public key:'`).
+ * Format:
+ *   - one recipient per line, lines starting with `age1...`
+ *   - `#` lines are comments (typically a preceding-line label, e.g.
+ *     `# main mac\nage1...`); ignored
+ *   - blank lines ignored
+ *   - duplicates silently deduped (preserving first-occurrence order)
+ *
+ * Throws (with a clear message naming the offending line) on:
+ *   - empty file / file with no valid recipients
+ *   - any non-comment, non-blank line that doesn't look like an age1 recipient
+ *   - line exceeding 200 chars (defensive cap; real age1 keys are 62 chars)
+ *
+ * The fail-loud contract is the v0.5 plan's "no implicit fallback" decision.
+ * Caller must catch and surface via Notice.
  */
-export function readRecipient(filePath: string): string {
-  const content = fs.readFileSync(expandHome(filePath), "utf8");
-  const line = content
-    .split("\n")
-    .map((l) => l.trim())
-    .find((l) => l.startsWith("age1"));
-  if (!line) {
-    throw new Error(`no age1... recipient found in ${filePath}`);
+export function parseRecipientsFile(content: string): string[] {
+  const MAX_LINE = 200;
+  const lines = content.split("\n");
+  const seen = new Set<string>();
+  const recipients: string[] = [];
+
+  lines.forEach((rawLine, idx) => {
+    const line = rawLine.trim();
+    if (!line) return;             // blank
+    if (line.startsWith("#")) return; // comment
+
+    if (line.length > MAX_LINE) {
+      throw new Error(
+        `recipients.txt line ${idx + 1}: line too long (${line.length} chars; max ${MAX_LINE})`
+      );
+    }
+    if (!line.startsWith("age1")) {
+      throw new Error(
+        `recipients.txt line ${idx + 1}: expected age1... recipient, got ${truncate(line, 40)}`
+      );
+    }
+    // age1 keys are 62 chars total (4 prefix + 58 bech32). Be lenient on length
+    // for forward compat with future age recipient encodings (age-plugin-yubikey
+    // emits longer recipients, for instance).
+    if (line.length < 32) {
+      throw new Error(
+        `recipients.txt line ${idx + 1}: recipient looks too short (${line.length} chars; expected ≥ 32)`
+      );
+    }
+    if (seen.has(line)) return;     // dedup silently
+    seen.add(line);
+    recipients.push(line);
+  });
+
+  if (recipients.length === 0) {
+    throw new Error(
+      "recipients.txt has no valid age1 recipients (file empty or only comments)"
+    );
   }
-  return line;
+  return recipients;
+}
+
+function truncate(s: string, n: number): string {
+  return s.length <= n ? s : s.slice(0, n) + "…";
+}
+
+/**
+ * v0.5.0: Read a recipients.txt file from disk and return the list of
+ * age1... pubkeys it contains. Throws on missing file or any parser error.
+ */
+export function readRecipients(filePath: string): string[] {
+  let content: string;
+  try {
+    content = fs.readFileSync(expandHome(filePath), "utf8");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`recipients.txt not readable at ${filePath}: ${msg}`);
+  }
+  return parseRecipientsFile(content);
 }
 
 /**
@@ -60,19 +125,27 @@ export function readIdentity(filePath: string): string {
 }
 
 /**
- * Encrypt a UTF-8 string to a single X25519 recipient.
+ * v0.5.0: Encrypt a UTF-8 string to one or more X25519 recipients.
  * Returns the age ciphertext as a Uint8Array.
  *
- * Used by the v0.2 "encrypt current note" command: the bytes can be written
- * to disk as a `.age` file, or passed back through decryptToString() to
- * verify round-trip before deletion of the original plaintext.
+ * The resulting ciphertext can be decrypted by any of the matching
+ * identities. Single-recipient case (length-1 array) is byte-compatible
+ * with v0.4's single-recipient encrypt.
+ *
+ * Throws if recipients is empty (caller responsibility — readRecipients
+ * already guarantees non-empty, but defensive here).
  */
 export async function encrypt(
-  recipient: string,
+  recipients: string[],
   plaintext: string
 ): Promise<Uint8Array> {
+  if (recipients.length === 0) {
+    throw new Error("encrypt: at least one recipient required");
+  }
   const enc = new Encrypter();
-  enc.addRecipient(recipient);
+  for (const r of recipients) {
+    enc.addRecipient(r);
+  }
   return enc.encrypt(plaintext);
 }
 
@@ -81,6 +154,9 @@ export async function encrypt(
  *
  * Uses typage's "text" output mode, which is equivalent to
  * `TextDecoder.decode(bytes)` over the decrypted bytes.
+ *
+ * Unchanged in v0.5.0: age decrypts natively against any matching identity
+ * regardless of how many recipients are in the ciphertext header.
  */
 export async function decryptToString(
   identity: string,
@@ -92,18 +168,17 @@ export async function decryptToString(
 }
 
 /**
- * Encrypt a UTF-8 string to a single X25519 recipient, then decrypt it back
- * with the matching identity. Returns the decrypted plaintext.
+ * v0.5.0: Encrypt to recipients[], then decrypt back with one identity.
+ * Used by the v0.1 "test round-trip" command.
  *
  * Zero filesystem writes — the ciphertext lives in a Uint8Array in memory
- * and is dropped when this function returns. Kept for the v0.1 "test
- * round-trip" command; v0.2 uses encrypt() + decryptToString() separately.
+ * and is dropped when this function returns.
  */
 export async function roundTrip(
-  recipient: string,
+  recipients: string[],
   identity: string,
   plaintext: string
 ): Promise<string> {
-  const ciphertext = await encrypt(recipient, plaintext);
+  const ciphertext = await encrypt(recipients, plaintext);
   return decryptToString(identity, ciphertext);
 }

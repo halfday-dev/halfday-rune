@@ -1,5 +1,5 @@
 /**
- * Halfday Obsidian Rune — v0.4.0
+ * Halfday Obsidian Rune — v0.5.0
  *
  * Commands:
  *   - "Test round-trip (X25519)"     — v0.1, proves typage works in Electron
@@ -14,7 +14,16 @@
  *     autosave kicks in after the last edit. Dirty state is reflected both in
  *     the status line and in the tab title bullet.
  *
- * v0.4 design notes:
+ * v0.5.0 design notes:
+ *   - Multi-recipient: encrypt path now reads `~/.age/recipients.txt` (one
+ *     age1... pubkey per line, `#` lines = comments) and produces ciphertext
+ *     decryptable by ANY of the matching identities. Backup recipient (e.g.
+ *     a 1Password-stored second X25519 keypair) hedges against losing the
+ *     primary identity.
+ *   - Single-recipient case (1 line in recipients.txt) is byte-identical to
+ *     v0.4 — existing `.age` files decrypt unchanged.
+ *
+ * v0.4 design notes (carried):
  *   - "classified" tier dropped — born-encrypted notes via "New private note"
  *     give the same guarantee without a separate tier.
  *   - Sidecars dropped — sealed notes are opaque (single .age file, no .meta.md).
@@ -42,17 +51,17 @@ import {
   decryptToString,
   encrypt,
   readIdentity,
-  readRecipient,
+  readRecipients,
   roundTrip,
 } from "./crypto";
 
 interface HalfdayObsidianRuneSettings {
-  recipientPath: string;
+  recipientsPath: string;
   identityPath: string;
 }
 
 const DEFAULT_SETTINGS: HalfdayObsidianRuneSettings = {
-  recipientPath: "~/.age/vault.recipient",
+  recipientsPath: "~/.age/recipients.txt",
   identityPath: "~/.age/vault.identity",
 };
 
@@ -96,7 +105,7 @@ export default class HalfdayObsidianRune extends Plugin {
       (leaf) =>
         new AgeFileView(leaf, {
           getIdentityPath: () => this.settings.identityPath,
-          getRecipientPath: () => this.settings.recipientPath,
+          getRecipientsPath: () => this.settings.recipientsPath,
         })
     );
     this.registerExtensions(["age"], VIEW_TYPE_AGE);
@@ -132,9 +141,9 @@ export default class HalfdayObsidianRune extends Plugin {
     const started = Date.now();
     const plaintext = `halfday-rune round-trip ${new Date().toISOString()}`;
     try {
-      const recipient = readRecipient(this.settings.recipientPath);
+      const recipients = readRecipients(this.settings.recipientsPath);
       const identity = readIdentity(this.settings.identityPath);
-      const decoded = await roundTrip(recipient, identity, plaintext);
+      const decoded = await roundTrip(recipients, identity, plaintext);
       const dt = Date.now() - started;
       if (decoded === plaintext) {
         new Notice(`Halfday Rune: round-trip ok (${dt}ms)`);
@@ -194,12 +203,12 @@ export default class HalfdayObsidianRune extends Plugin {
         return;
       }
 
-      const recipient = readRecipient(this.settings.recipientPath);
+      const recipients = readRecipients(this.settings.recipientsPath);
       const identity = readIdentity(this.settings.identityPath);
 
       // ---- encrypt ----
       const plaintext = await this.app.vault.read(file);
-      const ciphertext = await encrypt(recipient, plaintext);
+      const ciphertext = await encrypt(recipients, plaintext);
 
       // ---- round-trip verify in memory ----
       const decoded = await decryptToString(identity, ciphertext);
@@ -287,11 +296,11 @@ export default class HalfdayObsidianRune extends Plugin {
     }
 
     try {
-      const recipient = readRecipient(this.settings.recipientPath);
+      const recipients = readRecipients(this.settings.recipientsPath);
       const identity = readIdentity(this.settings.identityPath);
 
       const emptyPlaintext = "";
-      const ciphertext = await encrypt(recipient, emptyPlaintext);
+      const ciphertext = await encrypt(recipients, emptyPlaintext);
 
       // round-trip verify in memory before touching disk
       const decoded = await decryptToString(identity, ciphertext);
@@ -451,23 +460,26 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
     containerEl.createEl("h2", { text: "Halfday Obsidian Rune" });
     containerEl.createEl("p", {
       text:
-        "Encrypts and decrypts notes using a dedicated X25519 age identity. " +
-        "Configure paths to your recipient (public) and identity (private) files below. " +
-        "Generate a keypair with `age-keygen -o ~/.age/vault.identity` and extract the " +
-        "public key into `~/.age/vault.recipient`.",
+        "Encrypts and decrypts notes using one or more X25519 age recipients. " +
+        "Configure paths to your recipients file (public keys) and identity (private key) below. " +
+        "Generate a keypair with `age-keygen -o ~/.age/vault.identity` and put each recipient " +
+        "(public key) line in `~/.age/recipients.txt`. Lines starting with `#` are treated as " +
+        "comments — useful for labeling each recipient (e.g. `# main mac` on the line above its key).",
     });
 
     new Setting(containerEl)
-      .setName("Recipient path")
+      .setName("Recipients file path")
       .setDesc(
-        'File containing your age recipient (a line starting with "age1..."). Tilde expands to your home directory.'
+        'File containing one or more age recipient lines (each starting with "age1..."). ' +
+          'Lines starting with "#" are comments. Tilde expands to your home directory. ' +
+          "If the file is missing or malformed, encrypt-related commands will fail loudly."
       )
       .addText((text) =>
         text
-          .setPlaceholder("~/.age/vault.recipient")
-          .setValue(this.plugin.settings.recipientPath)
+          .setPlaceholder("~/.age/recipients.txt")
+          .setValue(this.plugin.settings.recipientsPath)
           .onChange(async (value) => {
-            this.plugin.settings.recipientPath = value.trim();
+            this.plugin.settings.recipientsPath = value.trim();
             await this.plugin.saveSettings();
           })
       );
