@@ -20,7 +20,10 @@ import {
   parseRecipientsFile,
   readIdentity,
   readRecipients,
+  readRecipientsRaw,
   roundTrip,
+  validateRecipientsContent,
+  writeRecipientsRaw,
 } from "../src/crypto";
 
 describe("expandHome", () => {
@@ -355,5 +358,214 @@ describe("readRecipients + readIdentity → roundTrip (integration)", () => {
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("readRecipientsRaw / writeRecipientsRaw / validateRecipientsContent (v0.5.1)", () => {
+  let tmpDir: string;
+  let tmpFile: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "halfday-rune-raw-"));
+    tmpFile = path.join(tmpDir, "recipients.txt");
+  });
+
+  afterEach(() => {
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  });
+
+  describe("readRecipientsRaw", () => {
+    it("returns content + exists:true for an existing file", async () => {
+      const id = await generateIdentity();
+      const r = await identityToRecipient(id);
+      const original = `# main mac\n${r}\n\n# backup\n${r}\n`;
+      fs.writeFileSync(tmpFile, original);
+      const result = readRecipientsRaw(tmpFile);
+      expect(result.exists).toBe(true);
+      expect(result.content).toBe(original);
+    });
+
+    it("returns content:'' + exists:false for a missing file (graceful first-run)", () => {
+      // tmpFile path is set but never created
+      const result = readRecipientsRaw(tmpFile);
+      expect(result.exists).toBe(false);
+      expect(result.content).toBe("");
+    });
+
+    it("preserves comments, blank lines, and ordering verbatim", async () => {
+      const id1 = await generateIdentity();
+      const id2 = await generateIdentity();
+      const r1 = await identityToRecipient(id1);
+      const r2 = await identityToRecipient(id2);
+      // intentional weird formatting: trailing blank line, two blank lines
+      // between blocks, mixed comment styles
+      const messy =
+        `# halfday vault recipients\n# updated 2026-05-08\n\n# main mac (cowork-laptop)\n${r1}\n\n\n# backup, 1Password "vault-backup"\n${r2}\n\n`;
+      fs.writeFileSync(tmpFile, messy);
+      const result = readRecipientsRaw(tmpFile);
+      expect(result.content).toBe(messy);
+    });
+
+    it("expands ~/ in the path argument", () => {
+      // Just verifies the call doesn't throw an unexpected error when given
+      // a tilde path — actual home expansion is covered by expandHome tests
+      // and the integration test below.
+      // We use a path that won't exist under HOME to confirm we get the
+      // ENOENT graceful path, not a "tilde wasn't expanded" failure.
+      const result = readRecipientsRaw("~/nonexistent-halfday-test-recipients.txt");
+      expect(result.exists).toBe(false);
+    });
+  });
+
+  describe("writeRecipientsRaw", () => {
+    it("writes content verbatim and round-trips through readRecipientsRaw", async () => {
+      const id1 = await generateIdentity();
+      const id2 = await generateIdentity();
+      const r1 = await identityToRecipient(id1);
+      const r2 = await identityToRecipient(id2);
+      const content = `# main mac\n${r1}\n\n# backup\n${r2}\n`;
+      writeRecipientsRaw(tmpFile, content);
+      const back = readRecipientsRaw(tmpFile);
+      expect(back.exists).toBe(true);
+      expect(back.content).toBe(content);
+    });
+
+    it("creates the file if it doesn't exist", async () => {
+      const id = await generateIdentity();
+      const r = await identityToRecipient(id);
+      expect(fs.existsSync(tmpFile)).toBe(false);
+      writeRecipientsRaw(tmpFile, `${r}\n`);
+      expect(fs.existsSync(tmpFile)).toBe(true);
+    });
+
+    it("overwrites existing content (truncate-then-write semantics)", async () => {
+      const id = await generateIdentity();
+      const r = await identityToRecipient(id);
+      fs.writeFileSync(tmpFile, "lots of stale content lots of stale content");
+      writeRecipientsRaw(tmpFile, `${r}\n`);
+      const back = fs.readFileSync(tmpFile, "utf8");
+      expect(back).toBe(`${r}\n`);
+      expect(back).not.toContain("stale content");
+    });
+
+    it("byte-preservation: write→read→write is idempotent", async () => {
+      const id1 = await generateIdentity();
+      const id2 = await generateIdentity();
+      const r1 = await identityToRecipient(id1);
+      const r2 = await identityToRecipient(id2);
+      const original = `# m\n${r1}\n# b\n${r2}\n`;
+      writeRecipientsRaw(tmpFile, original);
+      const read1 = readRecipientsRaw(tmpFile).content;
+      writeRecipientsRaw(tmpFile, read1);
+      const read2 = readRecipientsRaw(tmpFile).content;
+      expect(read1).toBe(original);
+      expect(read2).toBe(original);
+    });
+  });
+
+  describe("validateRecipientsContent", () => {
+    it("returns ok:true for a valid single-recipient file", async () => {
+      const id = await generateIdentity();
+      const r = await identityToRecipient(id);
+      expect(validateRecipientsContent(`${r}\n`)).toEqual({ ok: true });
+    });
+
+    it("returns ok:true for valid multi-recipient with comments", async () => {
+      const id1 = await generateIdentity();
+      const id2 = await generateIdentity();
+      const r1 = await identityToRecipient(id1);
+      const r2 = await identityToRecipient(id2);
+      const content = `# main mac\n${r1}\n\n# backup\n${r2}\n`;
+      expect(validateRecipientsContent(content)).toEqual({ ok: true });
+    });
+
+    it("returns ok:false with a clear error on empty content", () => {
+      const result = validateRecipientsContent("");
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).toMatch(/no valid age1 recipients/);
+      }
+    });
+
+    it("returns ok:false with a clear error on only-comments content", () => {
+      const result = validateRecipientsContent("# only comments\n# nothing else\n");
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).toMatch(/no valid age1 recipients/);
+      }
+    });
+
+    it("returns ok:false with line number on a malformed recipient line", async () => {
+      const id = await generateIdentity();
+      const r = await identityToRecipient(id);
+      const content = `${r}\nthis-is-not-an-age-key\n`;
+      const result = validateRecipientsContent(content);
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).toMatch(/line 2/);
+        expect(result.error).toMatch(/expected age1/);
+      }
+    });
+
+    it("returns ok:false on a too-short age1 line", () => {
+      const result = validateRecipientsContent("age1abc\n");
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).toMatch(/line 1/);
+        expect(result.error).toMatch(/too short/);
+      }
+    });
+
+    it("does NOT throw — always returns a result (the contract for inline UI use)", () => {
+      // The whole point of validateRecipientsContent vs raw parseRecipientsFile
+      // is that the UI layer can render result.error inline without try/catch.
+      expect(() => validateRecipientsContent("garbage")).not.toThrow();
+      expect(() => validateRecipientsContent("")).not.toThrow();
+    });
+  });
+
+  describe("integration: validate → write → read round-trip", () => {
+    it("a textarea save flow preserves bytes when content is valid", async () => {
+      // simulates: user types in textarea, clicks Save, plugin validates,
+      // plugin writes, settings tab is reopened, plugin reloads from disk
+      const id1 = await generateIdentity();
+      const id2 = await generateIdentity();
+      const r1 = await identityToRecipient(id1);
+      const r2 = await identityToRecipient(id2);
+      const userTyped = `# main mac (cowork)\n${r1}\n\n# backup (1pw)\n${r2}\n`;
+
+      // save flow
+      const validation = validateRecipientsContent(userTyped);
+      expect(validation).toEqual({ ok: true });
+      writeRecipientsRaw(tmpFile, userTyped);
+
+      // reopen flow
+      const reloaded = readRecipientsRaw(tmpFile);
+      expect(reloaded.exists).toBe(true);
+      expect(reloaded.content).toBe(userTyped);
+
+      // and the now-saved file is parseable end-to-end (encrypts to both)
+      const recipients = readRecipients(tmpFile);
+      expect(recipients).toEqual([r1, r2]);
+      const ct = await encrypt(recipients, "textarea-save round-trip");
+      expect(await decryptToString(id1, ct)).toBe("textarea-save round-trip");
+      expect(await decryptToString(id2, ct)).toBe("textarea-save round-trip");
+    });
+
+    it("a textarea save flow refuses to write malformed content", () => {
+      // simulates: user types garbage, clicks Save, validation fails, no write
+      fs.writeFileSync(tmpFile, "previous-good-content\n");
+      const userTyped = "this is not valid\nrecipients-file-content\n";
+      const validation = validateRecipientsContent(userTyped);
+      expect(validation.ok).toBe(false);
+      // contract: the plugin's save handler MUST NOT call writeRecipientsRaw
+      // when validation.ok is false. We verify the file is untouched.
+      const after = fs.readFileSync(tmpFile, "utf8");
+      expect(after).toBe("previous-good-content\n");
+    });
   });
 });

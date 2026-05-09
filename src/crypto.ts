@@ -105,6 +105,72 @@ export function readRecipients(filePath: string): string[] {
 }
 
 /**
+ * v0.5.1: Read recipients.txt as raw bytes (preserving comments, blank
+ * lines, and ordering verbatim). Used by the settings-tab textarea so the
+ * user can edit the file in-place without losing formatting.
+ *
+ * Returns `{ content: "", exists: false }` if the file is missing, so the
+ * settings UI can show an empty textarea and treat first-save as a
+ * create-the-file action. Throws on other read errors (permissions, IO).
+ */
+export function readRecipientsRaw(
+  filePath: string
+): { content: string; exists: boolean } {
+  const expanded = expandHome(filePath);
+  try {
+    const content = fs.readFileSync(expanded, "utf8");
+    return { content, exists: true };
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "ENOENT") {
+      return { content: "", exists: false };
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`recipients.txt not readable at ${filePath}: ${msg}`);
+  }
+}
+
+/**
+ * v0.5.1: Write recipients.txt content verbatim. Truncate+write (no atomic
+ * rename — same iCloud-safe pattern as `_scripts/migrate_privacy_tier.py`).
+ * Creates the file if missing.
+ *
+ * Caller is responsible for validating content with
+ * `validateRecipientsContent()` BEFORE calling this — this helper trusts
+ * its input and writes whatever bytes it's given. Keeps each helper
+ * single-purpose.
+ *
+ * Does NOT create parent directories. `~/.age/` is expected to exist
+ * already (it's a v1 CLI prerequisite).
+ */
+export function writeRecipientsRaw(filePath: string, content: string): void {
+  const expanded = expandHome(filePath);
+  fs.writeFileSync(expanded, content, "utf8");
+}
+
+/**
+ * v0.5.1: Validate recipients.txt content (raw string from the settings
+ * textarea). Returns `{ ok: true }` if every non-comment, non-blank line
+ * is a valid age1... recipient and at least one recipient is present;
+ * `{ ok: false, error }` otherwise — error message names the offending
+ * line so it can render inline below the textarea.
+ *
+ * Wraps `parseRecipientsFile()` so the validation rules stay in one place
+ * (DRY across "load → use" path and "save UI → write" path).
+ */
+export function validateRecipientsContent(
+  content: string
+): { ok: true } | { ok: false; error: string } {
+  try {
+    parseRecipientsFile(content);
+    return { ok: true };
+  } catch (err: unknown) {
+    const error = err instanceof Error ? err.message : String(err);
+    return { ok: false, error };
+  }
+}
+
+/**
  * Read an age identity (secret key) from a file.
  * Returns the first line that looks like `AGE-SECRET-KEY-1...`.
  * Throws on none-found.

@@ -1,1 +1,8 @@
-/* Halfday Obsidian Rune — no custom styles in v0.1. */
+/* Halfday Obsidian Rune — placeholder.
+ *
+ * The plugin's RUNTIME styles live at the project root (`./styles.css`),
+ * which is what Obsidian loads. obsidian-plugin-cli does NOT copy this
+ * src/styles.css into the build output.
+ *
+ * Edit `<plugin-root>/styles.css` for any visible style changes.
+ */

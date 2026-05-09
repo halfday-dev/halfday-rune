@@ -43,3 +43,10 @@
 .halfday-age-editor .cm-editor.cm-focused {
   outline: none;
 }
+
+/* v0.5.1: settings-tab recipients editor — error state for the inline
+ * status line under the Save / Reload buttons. Uses Obsidian's
+ * --text-error so it tracks the current theme. */
+.halfday-rune-recipients-status.halfday-rune-error {
+  color: var(--text-error);
+}

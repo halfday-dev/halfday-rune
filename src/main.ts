@@ -1,5 +1,5 @@
 /**
- * Halfday Obsidian Rune — v0.5.0
+ * Halfday Obsidian Rune — v0.5.1
  *
  * Commands:
  *   - "Test round-trip (X25519)"     — v0.1, proves typage works in Electron
@@ -13,6 +13,15 @@
  *     (re-encrypt + round-trip verify → overwrite .age) and a 30s debounced
  *     autosave kicks in after the last edit. Dirty state is reflected both in
  *     the status line and in the tab title bullet.
+ *
+ * v0.5.1 design notes:
+ *   - Settings tab now has an in-place "Recipients (file content)" editor:
+ *     reads recipients.txt on tab open, lets the user edit raw content
+ *     (preserving comments + ordering), validates+writes on Save, refuses
+ *     to save malformed input with the offending line called out inline.
+ *   - The "rotate keys" notice deliberately deferred — that command lands
+ *     in v0.5.2, and showing copy that points at a missing command would
+ *     create a dead end. v0.5.2 adds rotate AND the on-save notice.
  *
  * v0.5.0 design notes:
  *   - Multi-recipient: encrypt path now reads `~/.age/recipients.txt` (one
@@ -52,7 +61,10 @@ import {
   encrypt,
   readIdentity,
   readRecipients,
+  readRecipientsRaw,
   roundTrip,
+  validateRecipientsContent,
+  writeRecipientsRaw,
 } from "./crypto";
 
 interface HalfdayObsidianRuneSettings {
@@ -498,5 +510,129 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           })
       );
+
+    // v0.5.1: in-place editor for recipients.txt content. The path field
+    // above controls WHICH file this textarea operates on. We use raw
+    // containerEl primitives rather than a Setting row because Obsidian's
+    // standard Setting layout cramps a multi-line textarea.
+    this.renderRecipientsEditor(containerEl);
+  }
+
+  /**
+   * v0.5.1: Render the "Recipients (file content)" section. Reads
+   * recipients.txt from disk on tab open, lets the user edit it inline,
+   * validates on save, writes verbatim (preserving comments + blank
+   * lines + ordering).
+   *
+   * Status messages render inline below the buttons. Validation errors
+   * keep the textarea contents intact so the user can fix and retry.
+   *
+   * Notice copy that points at "Rotate vault keys" is intentionally
+   * deferred to v0.5.2 — that command doesn't exist yet.
+   */
+  private renderRecipientsEditor(containerEl: HTMLElement): void {
+    containerEl.createEl("h3", { text: "Recipients (file content)" });
+    containerEl.createEl("p", {
+      text:
+        "Edit your recipients file directly. One age1... recipient per line; lines starting with # are preserved as comments. Save validates the entire file before writing — malformed input refuses to save with the offending line called out below.",
+    });
+
+    const textareaEl = containerEl.createEl("textarea", {
+      cls: "halfday-rune-recipients-textarea",
+    });
+    textareaEl.rows = 10;
+    textareaEl.spellcheck = false;
+    textareaEl.style.width = "100%";
+    textareaEl.style.fontFamily = "var(--font-monospace, monospace)";
+    textareaEl.style.fontSize = "var(--font-ui-small, 13px)";
+    textareaEl.style.padding = "0.5em";
+
+    // status / error line. Emptied + cleared on every successful action.
+    const statusEl = containerEl.createEl("div", {
+      cls: "halfday-rune-recipients-status",
+    });
+    statusEl.style.marginTop = "0.5em";
+    statusEl.style.fontSize = "var(--font-ui-small, 13px)";
+    statusEl.style.minHeight = "1.5em";
+
+    const setStatus = (msg: string, isError = false): void => {
+      statusEl.setText(msg);
+      if (isError) {
+        statusEl.addClass("halfday-rune-error");
+      } else {
+        statusEl.removeClass("halfday-rune-error");
+      }
+    };
+
+    // initial load from disk
+    const loadFromDisk = (announce: boolean = false): void => {
+      try {
+        const result = readRecipientsRaw(
+          this.plugin.settings.recipientsPath
+        );
+        textareaEl.value = result.content;
+        if (!result.exists) {
+          setStatus(
+            `recipients.txt does not exist yet at ${this.plugin.settings.recipientsPath} — paste your age1... recipients above and click Save to create it.`
+          );
+        } else if (announce) {
+          setStatus(
+            `loaded ${result.content.length.toLocaleString()} bytes from ${this.plugin.settings.recipientsPath}`
+          );
+        } else {
+          setStatus("");
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        textareaEl.value = "";
+        setStatus(`read failed: ${msg}`, /*isError*/ true);
+        console.error("[halfday-rune] recipients read failed", err);
+      }
+    };
+    loadFromDisk(/*announce*/ false);
+
+    // buttons row
+    const buttonsEl = containerEl.createDiv();
+    buttonsEl.style.display = "flex";
+    buttonsEl.style.gap = "0.5rem";
+    buttonsEl.style.marginTop = "0.5rem";
+
+    const saveBtn = buttonsEl.createEl("button", {
+      text: "Save recipients",
+      cls: "mod-cta",
+    });
+    saveBtn.addEventListener("click", () => {
+      const content = textareaEl.value;
+      const validation = validateRecipientsContent(content);
+      if (!validation.ok) {
+        setStatus(`✗ ${validation.error}`, /*isError*/ true);
+        return;
+      }
+      try {
+        writeRecipientsRaw(
+          this.plugin.settings.recipientsPath,
+          content
+        );
+        setStatus(
+          `✓ saved ${content.length.toLocaleString()} bytes to ${this.plugin.settings.recipientsPath}`
+        );
+        new Notice("Halfday Rune: recipients saved");
+        console.log("[halfday-rune] recipients saved", {
+          path: this.plugin.settings.recipientsPath,
+          bytes: content.length,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        setStatus(`✗ write failed: ${msg}`, /*isError*/ true);
+        console.error("[halfday-rune] recipients write failed", err);
+      }
+    });
+
+    const reloadBtn = buttonsEl.createEl("button", {
+      text: "Reload from disk",
+    });
+    reloadBtn.addEventListener("click", () => {
+      loadFromDisk(/*announce*/ true);
+    });
   }
 }
