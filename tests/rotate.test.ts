@@ -9,7 +9,7 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
-import { rotateVault, recipientsAdded } from "../src/rotate";
+import { rotateVault, recipientsChanged } from "../src/rotate";
 import type {
   RotateCryptoDeps,
   RotateDeps,
@@ -290,7 +290,11 @@ describe("rotateVault — partial failure", () => {
     expect(result.rotated).toEqual([]);
     expect(result.skipped).toHaveLength(1);
     expect(result.skipped[0].reason).toBe("round-trip-mismatch");
-    expect(result.skipped[0].error).toMatch(/plaintext|decoded/);
+    // M1: the error string MUST NOT include plaintext/decoded lengths —
+    // those leak a side channel. We check the user-facing message and
+    // also assert lengths are absent.
+    expect(result.skipped[0].error).toMatch(/decoded ciphertext did not match/);
+    expect(result.skipped[0].error).not.toMatch(/\d+/);
 
     // CRITICAL: file on disk must be untouched after a round-trip-mismatch.
     // This is the safety property that justifies the verify pass.
@@ -416,33 +420,79 @@ describe("rotateVault — logger DI", () => {
   });
 });
 
-describe("recipientsAdded", () => {
-  it("returns empty when recipient sets match", () => {
-    expect(recipientsAdded([REC_PRIMARY], [REC_PRIMARY])).toEqual([]);
+describe("recipientsChanged", () => {
+  it("returns empty added + empty removed when recipient sets match", () => {
+    expect(recipientsChanged([REC_PRIMARY], [REC_PRIMARY])).toEqual({
+      added: [],
+      removed: [],
+    });
   });
 
-  it("returns the new recipient when one was added", () => {
-    expect(recipientsAdded([REC_PRIMARY], [REC_PRIMARY, REC_BACKUP])).toEqual([
-      REC_BACKUP,
-    ]);
+  it("returns the new recipient in `added` when one was added", () => {
+    expect(
+      recipientsChanged([REC_PRIMARY], [REC_PRIMARY, REC_BACKUP])
+    ).toEqual({ added: [REC_BACKUP], removed: [] });
   });
 
-  it("returns an empty array when a recipient was REMOVED (only tracks adds)", () => {
-    // removal is its own UX concern — the on-save Notice is specifically for
-    // "you added one; existing files lack it." Removal needs rotate too,
-    // but the Notice copy + caller-side detection is different.
-    expect(recipientsAdded([REC_PRIMARY, REC_BACKUP], [REC_PRIMARY])).toEqual([]);
+  it("returns the dropped recipient in `removed` when one was removed", () => {
+    // L1: removal is security-relevant. Existing .age headers still encode
+    // the removed pubkey, so this is the case where the user MUST rotate.
+    expect(
+      recipientsChanged([REC_PRIMARY, REC_BACKUP], [REC_PRIMARY])
+    ).toEqual({ added: [], removed: [REC_BACKUP] });
   });
 
-  it("preserves order from `next`", () => {
+  it("returns BOTH added and removed when the list was rewritten", () => {
+    const newKey = "age1newrotation";
+    expect(
+      recipientsChanged([REC_PRIMARY, REC_BACKUP], [REC_PRIMARY, newKey])
+    ).toEqual({ added: [newKey], removed: [REC_BACKUP] });
+  });
+
+  it("preserves order: added from `next`, removed from `prev`", () => {
     const a = "age1aaa";
     const b = "age1bbb";
     const c = "age1ccc";
-    expect(recipientsAdded([a], [a, b, c])).toEqual([b, c]);
-    expect(recipientsAdded([a], [c, b, a])).toEqual([c, b]);
+    const d = "age1ddd";
+    // prev = [a, b], next = [c, d, a] → added = [c, d] (next-order),
+    // removed = [b] (prev-order, b is dropped)
+    expect(recipientsChanged([a, b], [c, d, a])).toEqual({
+      added: [c, d],
+      removed: [b],
+    });
   });
 
   it("handles empty `prev` (first-time setup)", () => {
-    expect(recipientsAdded([], [REC_PRIMARY])).toEqual([REC_PRIMARY]);
+    expect(recipientsChanged([], [REC_PRIMARY])).toEqual({
+      added: [REC_PRIMARY],
+      removed: [],
+    });
+  });
+
+  it("handles empty `next` (recipients fully cleared)", () => {
+    expect(recipientsChanged([REC_PRIMARY, REC_BACKUP], [])).toEqual({
+      added: [],
+      removed: [REC_PRIMARY, REC_BACKUP],
+    });
+  });
+
+  it("treats already-normalized input as the contract requires (F7)", () => {
+    // CONTRACT: callers must pass parseRecipientsFile output, not raw
+    // textarea lines. This test demonstrates that the function does NOT
+    // strip comments or trim whitespace itself — duplicates and
+    // empty strings would leak through if the caller skipped
+    // parseRecipientsFile. Mirrors how main.ts feeds it.
+    const prev = ["age1foo", "age1bar"];
+    const next = ["age1foo", "age1bar"];
+    expect(recipientsChanged(prev, next)).toEqual({
+      added: [],
+      removed: [],
+    });
+    // and a second run with a clean addition
+    const next2 = ["age1foo", "age1bar", "age1baz"];
+    expect(recipientsChanged(prev, next2)).toEqual({
+      added: ["age1baz"],
+      removed: [],
+    });
   });
 });

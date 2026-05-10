@@ -152,10 +152,14 @@ export async function rotateVault(
     try {
       const decoded = await deps.crypto.decryptToString(opts.identity, ciphertextOut);
       if (decoded !== plaintext) {
+        // M1: don't put plaintext/decoded LENGTHS in the user-facing
+        // `error` string — it ends up in the summary modal, which is
+        // screenshot-able. Even a length is a side channel for
+        // known-format files. Lengths still go to logErr (console-only).
         skipped.push({
           file,
           reason: "round-trip-mismatch",
-          error: `plaintext ${plaintext.length} chars, decoded ${decoded.length}`,
+          error: "decoded ciphertext did not match input plaintext",
         });
         logErr("[rotate] round-trip mismatch", {
           path: file.path,
@@ -196,16 +200,34 @@ export async function rotateVault(
 }
 
 /**
- * Diff two recipients arrays and return the lines newly added in `next`
- * (preserving `next`'s order). Used by the on-save Notice in the settings
- * tab — when the user adds a recipient via the textarea, we want to show
- * "you added these; existing files don't include them yet."
+ * Diff two recipients arrays and return the lines added/removed in `next`
+ * vs `prev`. Used by the on-save Notice in the settings tab — when the
+ * user changes recipients via the textarea, we want to surface BOTH
+ * directions: an addition means existing .age files don't include the
+ * new pubkey yet; a removal means existing .age files still encode the
+ * old pubkey in their headers (security-relevant when rotating away
+ * from a leaked recipient).
+ *
+ * Order is preserved from `next` (for `added`) and `prev` (for `removed`).
  *
  * Pure / deterministic / no I/O — safe to unit-test alongside the rest of
  * crypto.ts but lives here because it's rotation-adjacent UX glue, not
  * crypto.
+ *
+ * CONTRACT: inputs MUST be the output of `parseRecipientsFile` (already
+ * trimmed/deduped/comment-stripped). Do NOT call this with raw textarea
+ * lines — comments and blank lines will read as "removed" when the file
+ * is re-validated through parseRecipientsFile, producing noisy false
+ * positives in the Notice.
  */
-export function recipientsAdded(prev: string[], next: string[]): string[] {
+export function recipientsChanged(
+  prev: string[],
+  next: string[]
+): { added: string[]; removed: string[] } {
   const prevSet = new Set(prev);
-  return next.filter((r) => !prevSet.has(r));
+  const nextSet = new Set(next);
+  return {
+    added: next.filter((r) => !prevSet.has(r)),
+    removed: prev.filter((r) => !nextSet.has(r)),
+  };
 }

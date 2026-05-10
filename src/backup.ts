@@ -73,16 +73,30 @@ export async function backupAgeFiles(
   // and bloat the archive. (BSD tar on macOS supports the flag; GNU tar
   // on Linux ignores unknown flags after a warning, but we're targeting
   // macOS via Electron.)
-  const args = ["-czf", archivePath, "-C", vaultBase, ...relPaths];
+  //
+  // L2: `--` separator before the file list prevents any future filename
+  // starting with `-` from being parsed as a flag. (Obsidian itself
+  // doesn't allow leading-`-` filenames, but defense-in-depth — if a
+  // weird vault import ever sneaks one in, tar must treat it as a path.)
+  const args = ["-czf", archivePath, "-C", vaultBase, "--", ...relPaths];
   await runTar(args);
 
   const stat = fs.statSync(archivePath);
   return { path: archivePath, bytes: stat.size, timestamp };
 }
 
+/**
+ * L2: pin the tar binary to `/usr/bin/tar` instead of resolving via PATH.
+ * Eliminates a hijack vector if a user-writable directory (e.g. /usr/local/bin
+ * or a Homebrew prefix on Apple Silicon) ever appears earlier in PATH and
+ * shadows system tar. macOS guarantees /usr/bin/tar is BSD tar; that's the
+ * version we tested -czf + -C against.
+ */
+const TAR_BIN = "/usr/bin/tar";
+
 function runTar(args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
-    execFile("tar", args, { maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
+    execFile(TAR_BIN, args, { maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) {
         const code = (err as NodeJS.ErrnoException).code ?? "unknown";
         reject(

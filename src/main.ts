@@ -87,7 +87,7 @@ import {
 } from "./crypto";
 import {
   rotateVault,
-  recipientsAdded,
+  recipientsChanged,
   type RotateResult,
 } from "./rotate";
 import { backupAgeFiles, DEFAULT_BACKUP_DIR } from "./backup";
@@ -640,7 +640,7 @@ interface RotatePlan {
 }
 
 class RotateConfirmModal extends Modal {
-  private resolved = false;
+  private result: boolean = false;
   private readonly plan: RotatePlan;
   private readonly resolver: (proceed: boolean) => void;
 
@@ -674,12 +674,16 @@ class RotateConfirmModal extends Modal {
       p.createEl("code", { text: this.plan.backupDir });
       p.createSpan({ text: "/age-backup-{ISO}.tar.gz before any file is touched." });
     } else {
+      // M3: when auto-backup is OFF the modal needs to look and read
+      // differently. Sharper copy + de-emphasized proceed button so the
+      // user can't Enter-key past it without noticing.
       const p = contentEl.createEl("p", {
         cls: "halfday-rune-warning",
       });
       p.setText(
-        "⚠ auto-backup is OFF. No tar.gz will be created before rotation. " +
-          "Re-enable in settings if you want a safety net."
+        "Backup is OFF. Existing .age files will be re-encrypted with no " +
+          "safety net. A failure mid-rotation could leave you with " +
+          "partially-rotated files and no recovery archive."
       );
     }
 
@@ -689,35 +693,64 @@ class RotateConfirmModal extends Modal {
         "will be skipped with a logged reason — they remain readable by whichever identity matches.",
     });
 
+    // F9: re-run safety. The rotate operation is idempotent at the
+    // ciphertext-content level (re-encrypting twice produces the same
+    // recipient list); telling the user this up front lowers the
+    // psychological cost of cancelling halfway and starting over.
+    contentEl.createEl("p", {
+      text:
+        "Safe to re-run on a partially-rotated vault — already-rotated files will just rotate again.",
+    });
+
     const buttons = contentEl.createDiv();
     buttons.style.display = "flex";
     buttons.style.gap = "0.5rem";
     buttons.style.justifyContent = "flex-end";
     buttons.style.marginTop = "1rem";
 
+    // M2: Cancel comes first in the button row AND in tab order, and it's
+    // the auto-focused button. macOS HIG + Obsidian's own delete dialog
+    // do the same — "destructive defaults" is an anti-pattern.
     const cancelBtn = buttons.createEl("button", { text: "Cancel" });
-    cancelBtn.addEventListener("click", () => this.resolve(false));
+    cancelBtn.addEventListener("click", () => this.close());
 
+    // M3: when backup is off, drop `mod-cta` (so it's not the visually
+    // emphasized button) AND change the label to make the missing
+    // safety net legible from the button alone.
+    const proceedLabel = this.plan.autoBackup ? "Rotate" : "Rotate without backup";
+    const proceedCls = this.plan.autoBackup ? "mod-cta" : "";
     const okBtn = buttons.createEl("button", {
-      text: "Rotate",
-      cls: "mod-cta",
+      text: proceedLabel,
+      cls: proceedCls,
     });
-    okBtn.addEventListener("click", () => this.resolve(true));
+    okBtn.addEventListener("click", () => {
+      this.result = true;
+      this.close();
+    });
 
-    setTimeout(() => okBtn.focus(), 0);
+    // F10: explicit Escape handler. Click-outside already dismissed via
+    // onClose; this just makes the keyboard path symmetric with
+    // FilenamePromptModal and explicit for screen-readers / keyboard
+    // users who expect Esc to cancel.
+    contentEl.addEventListener("keydown", (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        this.close();
+      }
+    });
+
+    // M2: focus Cancel by default. Hitting Enter on the modal now triggers
+    // Cancel, which is the safe outcome for a destructive operation.
+    setTimeout(() => cancelBtn.focus(), 0);
   }
 
+  // F6: simplified resolution. Cancel + Esc + click-outside all flow
+  // through `close() → onClose()`, which is the single resolver. The
+  // proceed button sets `this.result = true` then closes; everything
+  // else leaves `result` at its default `false`.
   onClose(): void {
-    // dismissed without choosing — treat as cancel
-    this.resolve(false);
     this.contentEl.empty();
-  }
-
-  private resolve(proceed: boolean): void {
-    if (this.resolved) return;
-    this.resolved = true;
-    this.resolver(proceed);
-    this.close();
+    this.resolver(this.result);
   }
 }
 
@@ -1019,21 +1052,34 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
         // textarea now reflects what's on disk at the new path
         lastLoadedFromPath = this.plugin.settings.recipientsPath;
 
-        // v0.5.2: on-save Notice for new recipients. Compute the diff
-        // against the pre-write disk content (parseRecipientsFile already
-        // did dedup + comment stripping). If anything new was added,
-        // prompt the user to rotate so existing .age files pick up the
-        // new recipient.
+        // v0.5.2: on-save Notice for recipient list changes. Diff against
+        // the pre-write disk content (parseRecipientsFile already did
+        // dedup + comment stripping). Surfaces additions AND removals —
+        // a removed recipient is security-relevant (existing .age headers
+        // still encode it; rotation is the only way to drop it
+        // everywhere).
         let newRecipients: string[] = [];
         try {
           newRecipients = parseRecipientsFile(content);
         } catch {
           // shouldn't happen — validateRecipientsContent already passed.
         }
-        const added = recipientsAdded(prevRecipients, newRecipients);
-        if (added.length > 0) {
+        const diff = recipientsChanged(prevRecipients, newRecipients);
+        const addedAny = diff.added.length > 0;
+        const removedAny = diff.removed.length > 0;
+        if (addedAny && removedAny) {
+          new Notice(
+            "Halfday Rune: recipient list changed (added + removed). Existing sealed files reflect the OLD list — run 'Rotate vault keys' to sync.",
+            10_000
+          );
+        } else if (addedAny) {
           new Notice(
             "Halfday Rune: recipient added. Existing sealed files don't include it yet — run 'Rotate vault keys' to add it everywhere.",
+            10_000
+          );
+        } else if (removedAny) {
+          new Notice(
+            "Halfday Rune: recipient removed from list. Existing sealed files still contain it in their header — run 'Rotate vault keys' to drop it.",
             10_000
           );
         } else {
@@ -1042,7 +1088,8 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
         console.log("[halfday-rune] recipients saved", {
           path: this.plugin.settings.recipientsPath,
           bytes: content.length,
-          added,
+          added: diff.added,
+          removed: diff.removed,
           drifted,
         });
       } catch (err) {
