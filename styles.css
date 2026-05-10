@@ -1,29 +1,13 @@
 /* Halfday Obsidian Rune — styles */
 
-/* AgeFileView — v0.3.1: status line + CM6 editor host */
+/* AgeFileView — v0.6.0: pane is just the editor host. No banner, no
+ * padding around the host (CM6's `.cm-content` padding handles the
+ * inner gutter so it matches Obsidian's own editor spacing). */
 .halfday-age-view {
-  padding: 0.75rem 1rem;
   display: flex;
   flex-direction: column;
-  gap: 0.6rem;
   height: 100%;
   box-sizing: border-box;
-}
-
-.halfday-age-status {
-  font-family: var(--font-monospace);
-  font-size: 0.85em;
-  color: var(--text-muted);
-  padding: 0.35rem 0.6rem;
-  border-radius: 4px;
-  background: var(--background-secondary);
-  border: 1px solid var(--background-modifier-border);
-  flex-shrink: 0;
-}
-
-.halfday-age-status.halfday-age-error {
-  color: var(--text-error);
-  border-color: var(--text-error);
 }
 
 .halfday-age-editor {
@@ -31,8 +15,6 @@
   min-height: 0; /* let the CM6 scroller own overflow instead of the flex parent */
   overflow: hidden;
   background: var(--background-primary);
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 6px;
 }
 
 /* CM6 mounts its own DOM under .halfday-age-editor; give the root full height
@@ -42,6 +24,29 @@
 }
 .halfday-age-editor .cm-editor.cm-focused {
   outline: none;
+}
+
+/* v0.6.0: status-bar item shown when an AgeFileView leaf is active.
+ * Inline-flex so its spans sit on one row alongside Obsidian's own
+ * status items at the bottom-right of the workspace. */
+.halfday-rune-statusbar {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55em;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller, 12px);
+}
+
+.halfday-rune-statusbar-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.halfday-rune-statusbar-version {
+  color: var(--text-faint);
 }
 
 /* v0.5.1: settings-tab recipients editor — error state for the inline
