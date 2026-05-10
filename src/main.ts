@@ -85,11 +85,8 @@ import {
   validateRecipientsContent,
   writeRecipientsRaw,
 } from "./crypto";
-import {
-  rotateVault,
-  recipientsChanged,
-  type RotateResult,
-} from "./rotate";
+import { rotateVault, recipientsChanged } from "./rotate";
+import type { RotateResult } from "./rotate";
 import { backupAgeFiles, DEFAULT_BACKUP_DIR } from "./backup";
 import { makeRotateLogWriter } from "./rotate-log";
 
