@@ -150,10 +150,16 @@ function makeMismatchCrypto(): RotateCryptoDeps {
   };
 }
 
-const ID_PRIMARY = "AGE-SECRET-KEY-PRIMARY";
-const ID_OTHER = "AGE-SECRET-KEY-OTHER";
 const REC_PRIMARY = "age1primary";
 const REC_BACKUP = "age1backup";
+// Fake crypto's contract: identity matches when the identity string equals
+// one of the recipient strings (see makeFakeCrypto.decryptToString below).
+// Real age has a cryptographic identity → recipient pairing, but for the
+// rotate-control-flow tests we only need "can this identity open this
+// ciphertext?" — string equality on a single shared namespace is enough.
+// (lyra's original constants used distinct AGE-SECRET-KEY-… strings, which
+// no real fake-pairing existed to bridge, so every decrypt threw.)
+const ID_PRIMARY = REC_PRIMARY;
 
 describe("rotateVault — happy path", () => {
   it("rotates 3 files; all succeed; byte-equality preserved across a re-run", async () => {
