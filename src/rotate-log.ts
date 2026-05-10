@@ -84,7 +84,7 @@ export function makeRotateLogWriter(
 
   const iso = (): string => new Date().toISOString();
 
-  return {
+  const writer: RotateLogWriter = {
     path: logPath,
     start(meta) {
       append(
@@ -92,20 +92,38 @@ export function makeRotateLogWriter(
       );
     },
     backup(meta) {
+      // Cast each branch — discriminated-union narrowing on `meta.ok`
+      // doesn't work under this project's non-strict tsconfig (same
+      // root cause as the pre-existing v0.5.1 validateRecipientsContent
+      // TS error in main.ts).
       if (meta.ok) {
-        append(`ROTATE BACKUP ok  path=${meta.path} bytes=${meta.bytes}`);
+        const m = meta as { ok: true; path: string; bytes: number };
+        append(`ROTATE BACKUP ok  path=${m.path} bytes=${m.bytes}`);
       } else {
-        append(`ROTATE BACKUP fail  err=${oneLine(meta.err)}`);
+        const m = meta as { ok: false; err: string };
+        append(`ROTATE BACKUP fail  err=${oneLine(m.err)}`);
       }
     },
     file(meta) {
       if (meta.ok) {
+        const m = meta as {
+          ok: true;
+          path: string;
+          bytesBefore: number;
+          bytesAfter: number;
+        };
         append(
-          `ROTATE FILE ok  path=${meta.path} bytesBefore=${meta.bytesBefore} bytesAfter=${meta.bytesAfter}`
+          `ROTATE FILE ok  path=${m.path} bytesBefore=${m.bytesBefore} bytesAfter=${m.bytesAfter}`
         );
       } else {
+        const m = meta as {
+          ok: false;
+          path: string;
+          reason: string;
+          err: string;
+        };
         append(
-          `ROTATE FILE skip  path=${meta.path} reason=${meta.reason} err=${oneLine(meta.err)}`
+          `ROTATE FILE skip  path=${m.path} reason=${m.reason} err=${oneLine(m.err)}`
         );
       }
     },
@@ -115,6 +133,7 @@ export function makeRotateLogWriter(
       );
     },
   };
+  return writer;
 }
 
 /**
