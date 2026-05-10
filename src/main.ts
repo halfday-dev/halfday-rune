@@ -1,11 +1,16 @@
 /**
- * Halfday Obsidian Rune — v0.5.1
+ * Halfday Obsidian Rune — v0.5.2
  *
  * Commands:
  *   - "Test round-trip (X25519)"     — v0.1, proves typage works in Electron
  *   - "Encrypt current note → .age"  — v0.2, seals an existing .md to .md.age
  *   - "New private note"             — v0.4, born-encrypted .age (plaintext
  *                                      never hits disk)
+ *   - "Rotate vault keys"            — v0.5.2, re-encrypts every .age in the
+ *                                      vault to the current recipients list
+ *                                      (with optional pre-rotation tar.gz
+ *                                      backup). Run after adding a backup
+ *                                      recipient so existing files include it.
  *
  * Views:
  *   - AgeFileView (`.age` extension) — v0.3.2/0.4, decrypt-to-memory editable
@@ -14,14 +19,27 @@
  *     autosave kicks in after the last edit. Dirty state is reflected both in
  *     the status line and in the tab title bullet.
  *
+ * v0.5.2 design notes:
+ *   - Rotate command shells out to `tar` for the pre-rotation backup. The
+ *     archive lands at ~/halfday/logs/age-backups/age-backup-{ISO}.tar.gz —
+ *     out-of-vault so iCloud doesn't churn on it. Toggle via the new
+ *     `autoBackupBeforeRotate` setting (default ON).
+ *   - Per-file failures during rotate skip+continue rather than abort —
+ *     a bad sectoral file shouldn't lose the rest. Summary is a Notice on
+ *     all-success and a modal on partial failure.
+ *   - On-save Notice in the recipients editor now points at "Rotate vault
+ *     keys" when a new age1 recipient was added (deferred from v0.5.1).
+ *   - Path-drift warning: if `recipientsPath` was changed in the field above
+ *     while the textarea still holds content from the OLD path, Save
+ *     prepends a red warning to the status line — content is written to
+ *     the NEW path regardless (matches user intent of "this is where my
+ *     recipients live now") but the warning makes the swap explicit.
+ *
  * v0.5.1 design notes:
  *   - Settings tab now has an in-place "Recipients (file content)" editor:
  *     reads recipients.txt on tab open, lets the user edit raw content
  *     (preserving comments + ordering), validates+writes on Save, refuses
  *     to save malformed input with the offending line called out inline.
- *   - The "rotate keys" notice deliberately deferred — that command lands
- *     in v0.5.2, and showing copy that points at a missing command would
- *     create a dead end. v0.5.2 adds rotate AND the on-save notice.
  *
  * v0.5.0 design notes:
  *   - Multi-recipient: encrypt path now reads `~/.age/recipients.txt` (one
@@ -59,6 +77,7 @@ import { AgeFileView, VIEW_TYPE_AGE } from "./age-view";
 import {
   decryptToString,
   encrypt,
+  parseRecipientsFile,
   readIdentity,
   readRecipients,
   readRecipientsRaw,
@@ -66,15 +85,29 @@ import {
   validateRecipientsContent,
   writeRecipientsRaw,
 } from "./crypto";
+import {
+  rotateVault,
+  recipientsAdded,
+  type RotateResult,
+} from "./rotate";
+import { backupAgeFiles, DEFAULT_BACKUP_DIR } from "./backup";
 
 interface HalfdayObsidianRuneSettings {
   recipientsPath: string;
   identityPath: string;
+  /**
+   * v0.5.2: tar.gz every .age file before rotation. ON by default — rotation
+   * is the most destructive plugin operation and the backup is the recovery
+   * story. Toggle off only if you have your own backup discipline (Time
+   * Machine + offsite, etc.).
+   */
+  autoBackupBeforeRotate: boolean;
 }
 
 const DEFAULT_SETTINGS: HalfdayObsidianRuneSettings = {
   recipientsPath: "~/.age/recipients.txt",
   identityPath: "~/.age/vault.identity",
+  autoBackupBeforeRotate: true,
 };
 
 export default class HalfdayObsidianRune extends Plugin {
@@ -108,6 +141,16 @@ export default class HalfdayObsidianRune extends Plugin {
       id: "halfday-rune-new-private-note",
       name: "New private note",
       callback: () => this.newPrivateNote(),
+    });
+
+    // v0.5.2: rotate every .age file in the vault to the current
+    // recipients list. Pre-flight confirm dialog + optional pre-rotation
+    // tar.gz backup are intentional friction — this is the most destructive
+    // plugin operation we ship.
+    this.addCommand({
+      id: "halfday-rune-rotate-keys",
+      name: "Rotate vault keys",
+      callback: () => this.rotateKeys(),
     });
 
     // v0.3.0: custom view + .age extension routing
@@ -348,6 +391,131 @@ export default class HalfdayObsidianRune extends Plugin {
   }
 
   /**
+   * v0.5.2: Rotate every `.age` file in the vault to the current recipient
+   * list. Two-stage flow:
+   *
+   *   1. Walk the vault for `.age` files; resolve recipients + identity from
+   *      settings; if anything is missing or malformed, bail with a Notice
+   *      BEFORE showing the confirm dialog (no friction-then-error).
+   *   2. Show RotateConfirmModal with the file count + planned backup path.
+   *      On confirm: optional tar.gz backup → rotate loop → summary
+   *      (Notice on all-success, modal on partial failure).
+   *
+   * Per-file failures don't abort. The rotate logic itself lives in
+   * src/rotate.ts so the loop is unit-testable without Obsidian.
+   */
+  async rotateKeys(): Promise<void> {
+    // ---- preflight: collect inputs and fail loud if anything's broken ----
+    let recipients: string[];
+    let identity: string;
+    try {
+      recipients = readRecipients(this.settings.recipientsPath);
+      identity = readIdentity(this.settings.identityPath);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      new Notice(`Halfday Rune: rotate aborted — ${msg}`);
+      console.error("[halfday-rune] rotate preflight failed", err);
+      return;
+    }
+
+    const ageFiles = this.app.vault
+      .getFiles()
+      .filter((f) => f.extension === "age");
+
+    if (ageFiles.length === 0) {
+      new Notice("Halfday Rune: no .age files in vault — nothing to rotate");
+      return;
+    }
+
+    // We can't know the absolute vault path from a TFile alone. Adapter has it.
+    // This cast is the same one the Obsidian docs use for fs interop.
+    const adapter = this.app.vault.adapter as unknown as {
+      basePath?: string;
+      getBasePath?: () => string;
+    };
+    const vaultBase =
+      typeof adapter.getBasePath === "function"
+        ? adapter.getBasePath()
+        : adapter.basePath ?? "";
+
+    const planned = {
+      fileCount: ageFiles.length,
+      recipientCount: recipients.length,
+      autoBackup: this.settings.autoBackupBeforeRotate,
+      backupDir: DEFAULT_BACKUP_DIR,
+    };
+
+    const proceed = await confirmRotate(this.app, planned);
+    if (!proceed) {
+      console.log("[halfday-rune] rotate cancelled at confirm");
+      return;
+    }
+
+    // ---- backup ----
+    let backupNote = "";
+    if (planned.autoBackup) {
+      try {
+        const result = await backupAgeFiles(
+          vaultBase,
+          ageFiles.map((f) => f.path),
+          DEFAULT_BACKUP_DIR
+        );
+        backupNote = `backup: ${result.path} (${result.bytes.toLocaleString()} bytes)`;
+        console.log("[halfday-rune] rotate backup written", result);
+        new Notice(`Halfday Rune: backup written → ${result.path}`, 6_000);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        new Notice(
+          `Halfday Rune: rotate aborted — backup failed: ${msg}`,
+          10_000
+        );
+        console.error("[halfday-rune] rotate backup failed", err);
+        return;
+      }
+    } else {
+      backupNote = "backup skipped (autoBackupBeforeRotate=false)";
+      console.log("[halfday-rune] rotate backup skipped per setting");
+    }
+
+    // ---- rotate ----
+    const startedAt = Date.now();
+    const result = await rotateVault(
+      {
+        vault: this.app.vault,
+        crypto: { encrypt, decryptToString },
+        logger: {
+          log: (msg, ctx) => console.log(msg, ctx),
+          error: (msg, ctx) => console.error(msg, ctx),
+        },
+      },
+      { ageFiles, identity, recipients }
+    );
+    const dt = Date.now() - startedAt;
+
+    // ---- surface ----
+    console.log("[halfday-rune] rotate complete", {
+      rotated: result.rotated.length,
+      skipped: result.skipped.length,
+      bytesBefore: result.totalBytes.before,
+      bytesAfter: result.totalBytes.after,
+      dt,
+      backupNote,
+    });
+
+    if (result.skipped.length === 0) {
+      new Notice(
+        `Halfday Rune: rotated ${result.rotated.length} file${
+          result.rotated.length === 1 ? "" : "s"
+        } in ${dt}ms`,
+        6_000
+      );
+    } else {
+      // Modal so per-file failures stay visible without scrollback.
+      new RotateSummaryModal(this.app, result, { dt, backupNote }).open();
+    }
+  }
+
+  /**
    * Suggest `untitled.age`, `untitled-2.age`, … that doesn't already exist
    * in the chosen folder. The user can overwrite this in the prompt.
    */
@@ -457,6 +625,183 @@ async function promptForFilename(
   });
 }
 
+/**
+ * v0.5.2: Pre-flight confirmation for the rotate command. Friction is
+ * intentional — rotation re-encrypts every .age file and we want the user
+ * to see the file count + backup destination before they commit.
+ *
+ * Resolves true on "Rotate", false on Cancel / dismiss.
+ */
+interface RotatePlan {
+  fileCount: number;
+  recipientCount: number;
+  autoBackup: boolean;
+  backupDir: string;
+}
+
+class RotateConfirmModal extends Modal {
+  private resolved = false;
+  private readonly plan: RotatePlan;
+  private readonly resolver: (proceed: boolean) => void;
+
+  constructor(app: App, plan: RotatePlan, resolver: (p: boolean) => void) {
+    super(app);
+    this.plan = plan;
+    this.resolver = resolver;
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Rotate vault keys" });
+
+    const summary = contentEl.createEl("p");
+    summary.createSpan({
+      text: `About to re-encrypt `,
+    });
+    summary.createEl("strong", {
+      text: `${this.plan.fileCount} .age file${this.plan.fileCount === 1 ? "" : "s"}`,
+    });
+    summary.createSpan({
+      text: ` to your current ${this.plan.recipientCount} recipient${
+        this.plan.recipientCount === 1 ? "" : "s"
+      }.`,
+    });
+
+    if (this.plan.autoBackup) {
+      const p = contentEl.createEl("p");
+      p.createSpan({ text: "A tar.gz backup will be created first at " });
+      p.createEl("code", { text: this.plan.backupDir });
+      p.createSpan({ text: "/age-backup-{ISO}.tar.gz before any file is touched." });
+    } else {
+      const p = contentEl.createEl("p", {
+        cls: "halfday-rune-warning",
+      });
+      p.setText(
+        "⚠ auto-backup is OFF. No tar.gz will be created before rotation. " +
+          "Re-enable in settings if you want a safety net."
+      );
+    }
+
+    contentEl.createEl("p", {
+      text:
+        "Files the primary identity can't decrypt (e.g. sealed to a recipient you no longer hold) " +
+        "will be skipped with a logged reason — they remain readable by whichever identity matches.",
+    });
+
+    const buttons = contentEl.createDiv();
+    buttons.style.display = "flex";
+    buttons.style.gap = "0.5rem";
+    buttons.style.justifyContent = "flex-end";
+    buttons.style.marginTop = "1rem";
+
+    const cancelBtn = buttons.createEl("button", { text: "Cancel" });
+    cancelBtn.addEventListener("click", () => this.resolve(false));
+
+    const okBtn = buttons.createEl("button", {
+      text: "Rotate",
+      cls: "mod-cta",
+    });
+    okBtn.addEventListener("click", () => this.resolve(true));
+
+    setTimeout(() => okBtn.focus(), 0);
+  }
+
+  onClose(): void {
+    // dismissed without choosing — treat as cancel
+    this.resolve(false);
+    this.contentEl.empty();
+  }
+
+  private resolve(proceed: boolean): void {
+    if (this.resolved) return;
+    this.resolved = true;
+    this.resolver(proceed);
+    this.close();
+  }
+}
+
+async function confirmRotate(app: App, plan: RotatePlan): Promise<boolean> {
+  return new Promise((resolve) => {
+    const modal = new RotateConfirmModal(app, plan, resolve);
+    modal.open();
+  });
+}
+
+/**
+ * v0.5.2: Shown only on PARTIAL failure (the all-success path uses a Notice).
+ * Lists the rotated count + every skipped file with its failure reason.
+ * Verbose by design — the user needs paths to act on, and console scrollback
+ * is unreliable when Obsidian is busy.
+ */
+class RotateSummaryModal extends Modal {
+  private readonly result: RotateResult;
+  private readonly meta: { dt: number; backupNote: string };
+
+  constructor(
+    app: App,
+    result: RotateResult,
+    meta: { dt: number; backupNote: string }
+  ) {
+    super(app);
+    this.result = result;
+    this.meta = meta;
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+
+    contentEl.createEl("h2", { text: "Rotate vault keys — partial success" });
+
+    const stats = contentEl.createEl("p");
+    stats.createEl("strong", {
+      text: `${this.result.rotated.length} rotated, ${this.result.skipped.length} skipped`,
+    });
+    stats.createSpan({ text: ` in ${this.meta.dt}ms` });
+
+    contentEl.createEl("p", { text: this.meta.backupNote });
+
+    if (this.result.skipped.length > 0) {
+      contentEl.createEl("h3", { text: "Skipped files" });
+      const list = contentEl.createEl("ul");
+      list.style.maxHeight = "260px";
+      list.style.overflowY = "auto";
+      list.style.fontFamily = "var(--font-monospace, monospace)";
+      list.style.fontSize = "var(--font-ui-small, 13px)";
+      for (const s of this.result.skipped) {
+        const li = list.createEl("li");
+        li.createEl("strong", { text: s.file.path });
+        li.createSpan({ text: ` — ${s.reason}: ${s.error}` });
+      }
+    }
+
+    contentEl.createEl("p", {
+      text:
+        "Skipped files were left untouched on disk. Common cause: the file " +
+        "was sealed to a recipient your primary identity doesn't hold. " +
+        "Decrypt with the matching identity and re-seal, or remove the " +
+        "stale file before rotating again.",
+    });
+
+    const buttons = contentEl.createDiv();
+    buttons.style.display = "flex";
+    buttons.style.gap = "0.5rem";
+    buttons.style.justifyContent = "flex-end";
+    buttons.style.marginTop = "1rem";
+    const okBtn = buttons.createEl("button", {
+      text: "Close",
+      cls: "mod-cta",
+    });
+    okBtn.addEventListener("click", () => this.close());
+    setTimeout(() => okBtn.focus(), 0);
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
 class HalfdayRuneSettingTab extends PluginSettingTab {
   plugin: HalfdayObsidianRune;
 
@@ -511,6 +856,24 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
           })
       );
 
+    // v0.5.2: pre-rotation backup toggle. ON by default — see RotateConfirmModal
+    // copy. The backup lands at ~/halfday/logs/age-backups/, out-of-vault.
+    new Setting(containerEl)
+      .setName("Auto-backup before rotate")
+      .setDesc(
+        "When running 'Rotate vault keys', tar.gz every .age file to " +
+          "~/halfday/logs/age-backups/ before re-encrypting. Recommended ON. " +
+          "Turn off only if you have your own backup discipline."
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.autoBackupBeforeRotate)
+          .onChange(async (value) => {
+            this.plugin.settings.autoBackupBeforeRotate = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
     // v0.5.1: in-place editor for recipients.txt content. The path field
     // above controls WHICH file this textarea operates on. We use raw
     // containerEl primitives rather than a Setting row because Obsidian's
@@ -527,8 +890,12 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
    * Status messages render inline below the buttons. Validation errors
    * keep the textarea contents intact so the user can fix and retry.
    *
-   * Notice copy that points at "Rotate vault keys" is intentionally
-   * deferred to v0.5.2 — that command doesn't exist yet.
+   * v0.5.2 carryovers:
+   *   - on-save Notice when a new age1 recipient was added, pointing at
+   *     "Rotate vault keys" so existing files pick up the new key
+   *   - path-drift warning when `recipientsPath` was changed in the field
+   *     above while the textarea still holds content from the OLD path:
+   *     prepends a red warning to the status line on Save
    */
   private renderRecipientsEditor(containerEl: HTMLElement): void {
     containerEl.createEl("h3", { text: "Recipients (file content)" });
@@ -564,6 +931,10 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
       }
     };
 
+    // v0.5.2: track which path the textarea content was loaded from, so
+    // Save can warn if the path field has been edited since load.
+    let lastLoadedFromPath: string = this.plugin.settings.recipientsPath;
+
     // initial load from disk
     const loadFromDisk = (announce: boolean = false): void => {
       try {
@@ -571,6 +942,7 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
           this.plugin.settings.recipientsPath
         );
         textareaEl.value = result.content;
+        lastLoadedFromPath = this.plugin.settings.recipientsPath;
         if (!result.exists) {
           setStatus(
             `recipients.txt does not exist yet at ${this.plugin.settings.recipientsPath} — paste your age1... recipients above and click Save to create it.`
@@ -608,18 +980,70 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
         setStatus(`✗ ${validation.error}`, /*isError*/ true);
         return;
       }
+
+      // v0.5.2: capture the pre-write disk content for the on-save Notice's
+      // recipient-diff. Best-effort — if read fails (path changed to
+      // somewhere we can't read, file doesn't exist yet), we just skip the
+      // diff and surface a generic save Notice.
+      let prevRecipients: string[] = [];
+      try {
+        const prev = readRecipientsRaw(this.plugin.settings.recipientsPath);
+        if (prev.exists) {
+          prevRecipients = parseRecipientsFile(prev.content);
+        }
+      } catch {
+        // malformed prior content / unreadable — diff against empty,
+        // which means every recipient in the new content reads as "added"
+        // and we'll still surface the rotate-keys hint. Acceptable.
+      }
+
+      // v0.5.2: path-drift detection. Done BEFORE write because the write
+      // commits to the (possibly drifted) path regardless — this just
+      // makes the swap visible.
+      const drifted =
+        this.plugin.settings.recipientsPath !== lastLoadedFromPath;
+
       try {
         writeRecipientsRaw(
           this.plugin.settings.recipientsPath,
           content
         );
+
+        const driftPrefix = drifted
+          ? `⚠ recipients file path was changed since load (${lastLoadedFromPath} → ${this.plugin.settings.recipientsPath}) — saved to the NEW path with the editor's contents. `
+          : "";
         setStatus(
-          `✓ saved ${content.length.toLocaleString()} bytes to ${this.plugin.settings.recipientsPath}`
+          `${driftPrefix}✓ saved ${content.length.toLocaleString()} bytes to ${this.plugin.settings.recipientsPath}`,
+          /*isError*/ drifted
         );
-        new Notice("Halfday Rune: recipients saved");
+        // textarea now reflects what's on disk at the new path
+        lastLoadedFromPath = this.plugin.settings.recipientsPath;
+
+        // v0.5.2: on-save Notice for new recipients. Compute the diff
+        // against the pre-write disk content (parseRecipientsFile already
+        // did dedup + comment stripping). If anything new was added,
+        // prompt the user to rotate so existing .age files pick up the
+        // new recipient.
+        let newRecipients: string[] = [];
+        try {
+          newRecipients = parseRecipientsFile(content);
+        } catch {
+          // shouldn't happen — validateRecipientsContent already passed.
+        }
+        const added = recipientsAdded(prevRecipients, newRecipients);
+        if (added.length > 0) {
+          new Notice(
+            "Halfday Rune: recipient added. Existing sealed files don't include it yet — run 'Rotate vault keys' to add it everywhere.",
+            10_000
+          );
+        } else {
+          new Notice("Halfday Rune: recipients saved");
+        }
         console.log("[halfday-rune] recipients saved", {
           path: this.plugin.settings.recipientsPath,
           bytes: content.length,
+          added,
+          drifted,
         });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);

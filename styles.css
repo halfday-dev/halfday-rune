@@ -50,3 +50,9 @@
 .halfday-rune-recipients-status.halfday-rune-error {
   color: var(--text-error);
 }
+
+/* v0.5.2: rotate confirm modal — warning paragraph when auto-backup is OFF.
+ * Same theme-tracking pattern as the recipients-status error class. */
+.halfday-rune-warning {
+  color: var(--text-error);
+}

@@ -4,5 +4,5 @@
   "description": "X25519 age encryption for Obsidian notes (halfday build).",
   "author": "halfday-dev",
   "minAppVersion": "1.5.0",
-  "version": "0.0.1"
+  "version": "0.5.2"
 }

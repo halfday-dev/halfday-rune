@@ -433,7 +433,7 @@ export class AgeFileView extends FileView {
       : "";
     const tail = extra ? ` · ${extra}` : "";
     this.statusEl.setText(
-      `${file.name} · ${dirtyMark}${lastSaved}${bytes}${tail} · v0.5.1`
+      `${file.name} · ${dirtyMark}${lastSaved}${bytes}${tail} · v0.5.2`
     );
     if (isError) {
       this.statusEl.addClass("halfday-age-error");
