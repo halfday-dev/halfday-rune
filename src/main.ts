@@ -91,6 +91,7 @@ import {
   type RotateResult,
 } from "./rotate";
 import { backupAgeFiles, DEFAULT_BACKUP_DIR } from "./backup";
+import { makeRotateLogWriter } from "./rotate-log";
 
 interface HalfdayObsidianRuneSettings {
   recipientsPath: string;
@@ -438,6 +439,20 @@ export default class HalfdayObsidianRune extends Plugin {
         ? adapter.getBasePath()
         : adapter.basePath ?? "";
 
+    // F1: if neither getBasePath() nor .basePath resolved a non-empty path,
+    // we'd silently `tar -C ""` against Electron's cwd — wrong vault, possibly
+    // archiving Obsidian's app bundle. Bail BEFORE any user-visible friction.
+    if (!vaultBase) {
+      new Notice(
+        "Halfday Rune: cannot determine vault path — rotation aborted. Please file a bug.",
+        10_000
+      );
+      console.error("[halfday-rune] rotate aborted — vaultBase empty", {
+        adapterKind: this.app.vault.adapter?.constructor?.name,
+      });
+      return;
+    }
+
     const planned = {
       fileCount: ageFiles.length,
       recipientCount: recipients.length,
@@ -451,6 +466,16 @@ export default class HalfdayObsidianRune extends Plugin {
       return;
     }
 
+    // F2/F4: persistent breadcrumb for the run. Survives modal-close so the
+    // user can find skipped-file reasons hours later. Created lazily — first
+    // append() ensures the parent dir.
+    const rotateLog = makeRotateLogWriter();
+    rotateLog.start({
+      files: planned.fileCount,
+      recipients: planned.recipientCount,
+      autoBackup: planned.autoBackup,
+    });
+
     // ---- backup ----
     let backupNote = "";
     if (planned.autoBackup) {
@@ -462,14 +487,18 @@ export default class HalfdayObsidianRune extends Plugin {
         );
         backupNote = `backup: ${result.path} (${result.bytes.toLocaleString()} bytes)`;
         console.log("[halfday-rune] rotate backup written", result);
+        rotateLog.backup({ ok: true, path: result.path, bytes: result.bytes });
         new Notice(`Halfday Rune: backup written → ${result.path}`, 6_000);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         new Notice(
-          `Halfday Rune: rotate aborted — backup failed: ${msg}`,
+          `Halfday Rune: rotate aborted — backup failed: ${msg}\nLog: ${rotateLog.path}`,
           10_000
         );
         console.error("[halfday-rune] rotate backup failed", err);
+        rotateLog.backup({ ok: false, err: msg });
+        // close out the log so the file ends with a clean END line
+        rotateLog.end({ rotated: 0, skipped: 0 });
         return;
       }
     } else {
@@ -487,10 +516,19 @@ export default class HalfdayObsidianRune extends Plugin {
           log: (msg, ctx) => console.log(msg, ctx),
           error: (msg, ctx) => console.error(msg, ctx),
         },
+        fileLog: {
+          ok: (m) => rotateLog.file({ ok: true, ...m }),
+          skip: (m) => rotateLog.file({ ok: false, ...m }),
+        },
       },
       { ageFiles, identity, recipients }
     );
     const dt = Date.now() - startedAt;
+
+    rotateLog.end({
+      rotated: result.rotated.length,
+      skipped: result.skipped.length,
+    });
 
     // ---- surface ----
     console.log("[halfday-rune] rotate complete", {
@@ -500,18 +538,25 @@ export default class HalfdayObsidianRune extends Plugin {
       bytesAfter: result.totalBytes.after,
       dt,
       backupNote,
+      logPath: rotateLog.path,
     });
 
     if (result.skipped.length === 0) {
+      // F2/F4: surface the log path on success too — the user might want
+      // to verify which files were touched without diving into devtools.
       new Notice(
         `Halfday Rune: rotated ${result.rotated.length} file${
           result.rotated.length === 1 ? "" : "s"
-        } in ${dt}ms`,
-        6_000
+        } in ${dt}ms\nLog: ${rotateLog.path}`,
+        8_000
       );
     } else {
       // Modal so per-file failures stay visible without scrollback.
-      new RotateSummaryModal(this.app, result, { dt, backupNote }).open();
+      new RotateSummaryModal(this.app, result, {
+        dt,
+        backupNote,
+        logPath: rotateLog.path,
+      }).open();
     }
   }
 
@@ -769,12 +814,12 @@ async function confirmRotate(app: App, plan: RotatePlan): Promise<boolean> {
  */
 class RotateSummaryModal extends Modal {
   private readonly result: RotateResult;
-  private readonly meta: { dt: number; backupNote: string };
+  private readonly meta: { dt: number; backupNote: string; logPath: string };
 
   constructor(
     app: App,
     result: RotateResult,
-    meta: { dt: number; backupNote: string }
+    meta: { dt: number; backupNote: string; logPath: string }
   ) {
     super(app);
     this.result = result;
@@ -794,6 +839,11 @@ class RotateSummaryModal extends Modal {
     stats.createSpan({ text: ` in ${this.meta.dt}ms` });
 
     contentEl.createEl("p", { text: this.meta.backupNote });
+
+    // F2/F4: log path inline, prefixed and selectable.
+    const logLine = contentEl.createEl("p");
+    logLine.createSpan({ text: "Log: " });
+    logLine.createEl("code", { text: this.meta.logPath });
 
     if (this.result.skipped.length > 0) {
       contentEl.createEl("h3", { text: "Skipped files" });
@@ -822,6 +872,21 @@ class RotateSummaryModal extends Modal {
     buttons.style.gap = "0.5rem";
     buttons.style.justifyContent = "flex-end";
     buttons.style.marginTop = "1rem";
+
+    // F5: copy-log-path button. Lets the user paste the path into a
+    // terminal / Finder Go-to-folder. The button stays in this slot for
+    // any future copy-failure-list addition.
+    const copyBtn = buttons.createEl("button", { text: "Copy log path" });
+    copyBtn.addEventListener("click", () => {
+      navigator.clipboard
+        .writeText(this.meta.logPath)
+        .then(() => new Notice("Halfday Rune: log path copied"))
+        .catch((err) => {
+          console.error("[halfday-rune] clipboard write failed", err);
+          new Notice("Halfday Rune: copy failed — see console");
+        });
+    });
+
     const okBtn = buttons.createEl("button", {
       text: "Close",
       cls: "mod-cta",

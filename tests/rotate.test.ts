@@ -256,7 +256,10 @@ describe("rotateVault — partial failure", () => {
       }
     );
 
-    expect(result.rotated.map((f) => f.path)).toEqual(["ok.age", "also-ok.age"]);
+    expect(result.rotated.map((r) => r.file.path)).toEqual([
+      "ok.age",
+      "also-ok.age",
+    ]);
     expect(result.skipped).toHaveLength(1);
     expect(result.skipped[0].file.path).toBe("wrong.age");
     expect(result.skipped[0].reason).toBe("decrypt");
@@ -323,7 +326,125 @@ describe("rotateVault — partial failure", () => {
     expect(result.skipped).toHaveLength(1);
     expect(result.skipped[0].reason).toBe("encrypt");
     expect(result.rotated).toHaveLength(1);
-    expect(result.rotated[0].path).toBe("b.age");
+    expect(result.rotated[0].file.path).toBe("b.age");
+  });
+});
+
+describe("rotateVault — byte-delta exposure (F8)", () => {
+  it("rotated[].bytesAfter > bytesBefore when a recipient is added", async () => {
+    // Multi-recipient ciphertext header grows by ~50 bytes per recipient.
+    // Our fake crypto encodes the recipient list as JSON, so the same
+    // property holds: a longer recipients array produces a longer
+    // envelope. This guards against any future change that drops the
+    // per-file byte-delta exposure on RotatedFile.
+    const initialEnvelope = JSON.stringify({
+      recipients: [REC_PRIMARY],
+      plaintext: "hello world",
+    });
+    const { vault, store } = makeFakeVault({
+      "x.age": initialEnvelope,
+    });
+    const crypto = makeFakeCrypto();
+
+    // first rotation: single recipient -> bytesAfter == bytesBefore
+    const r1 = await rotateVault(
+      { vault, crypto },
+      {
+        ageFiles: [fakeFile("x.age")] as never,
+        identity: ID_PRIMARY,
+        recipients: [REC_PRIMARY],
+      }
+    );
+    expect(r1.rotated).toHaveLength(1);
+    const beforeBytes = r1.rotated[0].bytesBefore;
+    const afterFirstRotate = r1.rotated[0].bytesAfter;
+    expect(afterFirstRotate).toBe(beforeBytes); // same recipient list
+
+    // second rotation: add a recipient -> bytesAfter MUST grow
+    const r2 = await rotateVault(
+      { vault, crypto },
+      {
+        ageFiles: [fakeFile("x.age")] as never,
+        identity: ID_PRIMARY,
+        recipients: [REC_PRIMARY, REC_BACKUP],
+      }
+    );
+    expect(r2.rotated).toHaveLength(1);
+    expect(r2.rotated[0].bytesBefore).toBe(afterFirstRotate);
+    expect(r2.rotated[0].bytesAfter).toBeGreaterThan(r2.rotated[0].bytesBefore);
+    expect(r2.totalBytes.after).toBeGreaterThan(r2.totalBytes.before);
+
+    // sanity: stored envelope now lists both recipients
+    const env = JSON.parse(new TextDecoder().decode(store.get("x.age")!));
+    expect(env.recipients).toEqual([REC_PRIMARY, REC_BACKUP]);
+  });
+});
+
+describe("rotateVault — fileLog hook (F2/F4)", () => {
+  it("emits one ok line per rotated file with byte deltas", async () => {
+    const { vault } = makeFakeVault({
+      "a.age": JSON.stringify({ recipients: [REC_PRIMARY], plaintext: "a" }),
+      "b.age": JSON.stringify({ recipients: [REC_PRIMARY], plaintext: "bb" }),
+    });
+    const crypto = makeFakeCrypto();
+    const okCalls: { path: string; bytesBefore: number; bytesAfter: number }[] = [];
+    const skipCalls: { path: string; reason: string; err: string }[] = [];
+
+    await rotateVault(
+      {
+        vault,
+        crypto,
+        fileLog: {
+          ok: (m) => okCalls.push(m),
+          skip: (m) => skipCalls.push(m),
+        },
+      },
+      {
+        ageFiles: ["a.age", "b.age"].map(fakeFile) as never,
+        identity: ID_PRIMARY,
+        recipients: [REC_PRIMARY],
+      }
+    );
+
+    expect(okCalls).toHaveLength(2);
+    expect(skipCalls).toHaveLength(0);
+    expect(okCalls[0].path).toBe("a.age");
+    expect(okCalls[0].bytesBefore).toBeGreaterThan(0);
+    expect(okCalls[0].bytesAfter).toBeGreaterThan(0);
+  });
+
+  it("emits one skip line per skipped file with reason + err", async () => {
+    const { vault } = makeFakeVault({
+      "wrong.age": JSON.stringify({
+        recipients: ["age1someoneelse"],
+        plaintext: "x",
+      }),
+    });
+    const crypto = makeFakeCrypto();
+    const okCalls: unknown[] = [];
+    const skipCalls: { path: string; reason: string; err: string }[] = [];
+
+    await rotateVault(
+      {
+        vault,
+        crypto,
+        fileLog: {
+          ok: (m) => okCalls.push(m),
+          skip: (m) => skipCalls.push(m),
+        },
+      },
+      {
+        ageFiles: [fakeFile("wrong.age")] as never,
+        identity: ID_PRIMARY,
+        recipients: [REC_PRIMARY],
+      }
+    );
+
+    expect(okCalls).toHaveLength(0);
+    expect(skipCalls).toHaveLength(1);
+    expect(skipCalls[0].path).toBe("wrong.age");
+    expect(skipCalls[0].reason).toBe("decrypt");
+    expect(skipCalls[0].err).toMatch(/not in recipients/);
   });
 });
 

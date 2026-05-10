@@ -50,10 +50,25 @@ export interface RotateLogger {
   error: (msg: string, ctx?: unknown) => void;
 }
 
+/**
+ * v0.5.2 (F2/F4): structured per-file logging hook. Distinct from the
+ * unstructured RotateLogger above, which mirrors console.log/error.
+ * The fileLog hook emits one line per file outcome to the persistent
+ * rotate.log so the user has a breadcrumb after the modal closes.
+ *
+ * Both hooks are optional — tests that don't care about logging just
+ * leave them off.
+ */
+export interface RotateFileLog {
+  ok(meta: { path: string; bytesBefore: number; bytesAfter: number }): void;
+  skip(meta: { path: string; reason: RotateSkip["reason"]; err: string }): void;
+}
+
 export interface RotateDeps {
   vault: RotateVault;
   crypto: RotateCryptoDeps;
   logger?: RotateLogger;
+  fileLog?: RotateFileLog;
 }
 
 export interface RotateOpts {
@@ -71,8 +86,20 @@ export interface RotateSkip {
   error: string;
 }
 
+/**
+ * F8 (v0.5.2): per-file byte deltas. Useful as a regression guard —
+ * adding a recipient grows the age header by ~50 bytes, so a rotation
+ * that adds a recipient must produce bytesAfter > bytesBefore. The
+ * summary modal also uses these to spot suspicious shrinkage.
+ */
+export interface RotatedFile {
+  file: TFile;
+  bytesBefore: number;
+  bytesAfter: number;
+}
+
 export interface RotateResult {
-  rotated: TFile[];
+  rotated: RotatedFile[];
   skipped: RotateSkip[];
   totalBytes: { before: number; after: number };
 }
@@ -100,8 +127,9 @@ export async function rotateVault(
 
   const log = deps.logger?.log ?? (() => {});
   const logErr = deps.logger?.error ?? (() => {});
+  const fileLog = deps.fileLog;
 
-  const rotated: TFile[] = [];
+  const rotated: RotatedFile[] = [];
   const skipped: RotateSkip[] = [];
   let bytesBefore = 0;
   let bytesAfter = 0;
@@ -119,6 +147,7 @@ export async function rotateVault(
       const msg = err instanceof Error ? err.message : String(err);
       skipped.push({ file, reason: "decrypt", error: `read: ${msg}` });
       logErr("[rotate] read failed", { path: file.path, msg });
+      fileLog?.skip({ path: file.path, reason: "decrypt", err: `read: ${msg}` });
       continue;
     }
 
@@ -133,6 +162,7 @@ export async function rotateVault(
       const msg = err instanceof Error ? err.message : String(err);
       skipped.push({ file, reason: "decrypt", error: msg });
       logErr("[rotate] decrypt failed", { path: file.path, msg });
+      fileLog?.skip({ path: file.path, reason: "decrypt", err: msg });
       continue;
     }
 
@@ -143,6 +173,7 @@ export async function rotateVault(
       const msg = err instanceof Error ? err.message : String(err);
       skipped.push({ file, reason: "encrypt", error: msg });
       logErr("[rotate] encrypt failed", { path: file.path, msg });
+      fileLog?.skip({ path: file.path, reason: "encrypt", err: msg });
       continue;
     }
 
@@ -156,15 +187,21 @@ export async function rotateVault(
         // `error` string — it ends up in the summary modal, which is
         // screenshot-able. Even a length is a side channel for
         // known-format files. Lengths still go to logErr (console-only).
+        const safeMsg = "decoded ciphertext did not match input plaintext";
         skipped.push({
           file,
           reason: "round-trip-mismatch",
-          error: "decoded ciphertext did not match input plaintext",
+          error: safeMsg,
         });
         logErr("[rotate] round-trip mismatch", {
           path: file.path,
           plaintextLen: plaintext.length,
           decodedLen: decoded.length,
+        });
+        fileLog?.skip({
+          path: file.path,
+          reason: "round-trip-mismatch",
+          err: safeMsg,
         });
         continue;
       }
@@ -172,6 +209,7 @@ export async function rotateVault(
       const msg = err instanceof Error ? err.message : String(err);
       skipped.push({ file, reason: "round-trip-mismatch", error: msg });
       logErr("[rotate] round-trip verify threw", { path: file.path, msg });
+      fileLog?.skip({ path: file.path, reason: "round-trip-mismatch", err: msg });
       continue;
     }
 
@@ -181,17 +219,21 @@ export async function rotateVault(
         ciphertextOut.byteOffset + ciphertextOut.byteLength
       ) as ArrayBuffer;
       await deps.vault.modifyBinary(file, buffer);
-      rotated.push(file);
-      bytesAfter += ciphertextOut.byteLength;
+      const inLen = ciphertextIn.byteLength;
+      const outLen = ciphertextOut.byteLength;
+      rotated.push({ file, bytesBefore: inLen, bytesAfter: outLen });
+      bytesAfter += outLen;
       log("[rotate] rotated", {
         path: file.path,
-        before: ciphertextIn.byteLength,
-        after: ciphertextOut.byteLength,
+        before: inLen,
+        after: outLen,
       });
+      fileLog?.ok({ path: file.path, bytesBefore: inLen, bytesAfter: outLen });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       skipped.push({ file, reason: "write", error: msg });
       logErr("[rotate] write failed", { path: file.path, msg });
+      fileLog?.skip({ path: file.path, reason: "write", err: msg });
       continue;
     }
   }
