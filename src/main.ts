@@ -74,6 +74,7 @@ import {
   TFile,
 } from "obsidian";
 import { AgeFileView, VIEW_TYPE_AGE } from "./age-view";
+import type { AgeStatusBarState } from "./age-view";
 import {
   decryptToString,
   encrypt,
@@ -108,11 +109,28 @@ const DEFAULT_SETTINGS: HalfdayObsidianRuneSettings = {
   autoBackupBeforeRotate: true,
 };
 
+/** Plugin version surfaced in the status bar. Keep in sync with manifest.json. */
+const PLUGIN_VERSION = "0.6.0";
+
 export default class HalfdayObsidianRune extends Plugin {
   settings: HalfdayObsidianRuneSettings;
 
+  /**
+   * v0.6.0: bottom-of-workspace status-bar item. Hidden by default;
+   * AgeFileView pushes state into it via `updateStatusBar` and clears
+   * it via `clearStatusBar`. There's only ever one — Obsidian's status
+   * bar reflects whichever AgeFileView leaf is currently active.
+   */
+  private statusBarEl: HTMLElement | null = null;
+  /** Latest state the active AgeFileView has pushed. Held so leaf-changes can re-render. */
+  private latestStatusState: AgeStatusBarState | null = null;
+
   async onload(): Promise<void> {
     await this.loadSettings();
+
+    this.statusBarEl = this.addStatusBarItem();
+    this.statusBarEl.addClass("halfday-rune-statusbar");
+    this.statusBarEl.style.display = "none";
 
     this.addCommand({
       id: "halfday-rune-test-round-trip",
@@ -159,9 +177,30 @@ export default class HalfdayObsidianRune extends Plugin {
         new AgeFileView(leaf, {
           getIdentityPath: () => this.settings.identityPath,
           getRecipientsPath: () => this.settings.recipientsPath,
+          updateStatusBar: (state) => this.updateAgeStatusBar(state),
+          clearStatusBar: () => this.clearAgeStatusBar(),
         })
     );
     this.registerExtensions(["age"], VIEW_TYPE_AGE);
+
+    // v0.6.0: hide the status-bar item whenever the active leaf is NOT
+    // an AgeFileView. The view pushes fresh state on load/save/dirty so
+    // we don't need to poll — but if the user clicks away from an
+    // AgeFileView pane the bar should disappear.
+    this.registerEvent(
+      this.app.workspace.on("active-leaf-change", (leaf) => {
+        const isAgeView = leaf?.view instanceof AgeFileView;
+        if (!isAgeView) {
+          this.hideAgeStatusBar();
+        } else if (this.latestStatusState) {
+          // Same plugin instance, different leaf — re-render in case we
+          // were hidden. Each AgeFileView pushes state on focus via
+          // pushStatusBar() too, but this covers the gap before the
+          // view's own listeners fire.
+          this.renderStatusBar(this.latestStatusState);
+        }
+      })
+    );
 
     this.addSettingTab(new HalfdayRuneSettingTab(this.app, this));
 
@@ -171,7 +210,71 @@ export default class HalfdayObsidianRune extends Plugin {
   onunload(): void {
     // detach any open AgeFileView instances so their plaintext buffers go away
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_AGE);
+    this.statusBarEl = null;
+    this.latestStatusState = null;
     console.log("[halfday-rune] unloaded");
+  }
+
+  /**
+   * v0.6.0: AgeFileView pushes state changes here. Owns rendering of
+   * the dot, the bytes, the saved time, and the version. Kept simple —
+   * one row of muted text + a colored dot on the left.
+   */
+  private updateAgeStatusBar(state: AgeStatusBarState): void {
+    this.latestStatusState = state;
+    this.renderStatusBar(state);
+  }
+
+  private clearAgeStatusBar(): void {
+    this.latestStatusState = null;
+    this.hideAgeStatusBar();
+  }
+
+  private hideAgeStatusBar(): void {
+    if (!this.statusBarEl) return;
+    this.statusBarEl.empty();
+    this.statusBarEl.style.display = "none";
+  }
+
+  private renderStatusBar(state: AgeStatusBarState): void {
+    if (!this.statusBarEl) return;
+    this.statusBarEl.empty();
+    this.statusBarEl.style.display = "";
+
+    // dot: green when clean, amber when dirty. Inline styles for the
+    // colors keep theme-agnostic; structural styles live in styles.css.
+    const dot = this.statusBarEl.createSpan({
+      cls: "halfday-rune-statusbar-dot",
+    });
+    dot.style.backgroundColor = state.dirty ? "#f59e0b" : "#4ade80";
+
+    this.statusBarEl.createSpan({
+      cls: "halfday-rune-statusbar-state",
+      text: state.dirty ? "dirty" : "clean",
+    });
+
+    if (state.bytesOnDisk !== null) {
+      this.statusBarEl.createSpan({
+        cls: "halfday-rune-statusbar-bytes",
+        text: `${state.bytesOnDisk.toLocaleString()} bytes`,
+      });
+    }
+
+    if (state.lastSavedAt) {
+      const t = state.lastSavedAt.toLocaleTimeString([], {
+        hour: "numeric",
+        minute: "2-digit",
+      });
+      this.statusBarEl.createSpan({
+        cls: "halfday-rune-statusbar-saved",
+        text: `saved ${t}`,
+      });
+    }
+
+    this.statusBarEl.createSpan({
+      cls: "halfday-rune-statusbar-version",
+      text: `v${PLUGIN_VERSION}`,
+    });
   }
 
   async loadSettings(): Promise<void> {
