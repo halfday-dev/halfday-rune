@@ -1,6 +1,15 @@
 /**
  * AgeFileView — custom Obsidian FileView for `.age` files.
  *
+ * v0.6.0 (chrome pass): the inline status banner is gone. Line numbers
+ * are gone. The CM6 theme now inherits Obsidian CSS variables across
+ * the board (fonts, sizes, colors, line-height) so theme switching
+ * just works. Cursor is 2px and uses `--color-accent`. Tab title
+ * strips the `.md.age` / `.age` suffix; the lock icon comes from
+ * `getIcon()`. View-level state changes push dirty/clean + bytes +
+ * last-saved up to the plugin's status-bar item via the new
+ * `updateStatusBar` / `clearStatusBar` deps.
+ *
  * v0.3.2 (editable + autosave): decrypts on open into a CM6 markdown
  * editor, accepts edits, and re-encrypts back to disk on cmd-S or after
  * 30s of inactivity. Round-trip-verifies every save before overwriting
@@ -30,7 +39,6 @@ import {
   EditorView,
   highlightActiveLine,
   keymap,
-  lineNumbers,
 } from "@codemirror/view";
 import {
   defaultHighlightStyle,
@@ -52,47 +60,95 @@ export const VIEW_TYPE_AGE = "halfday-age-view";
 const AUTOSAVE_DELAY_MS = 30_000;
 
 /**
- * Custom highlight style that actually sizes headings (the default
- * @codemirror/language highlight style only assigns *colors*, not
- * font sizes — so without this, `## hello` shows up colored but the
- * same size as body text, which is not what people expect from a
- * markdown editor).
+ * Custom highlight style that actually sizes headings. The default
+ * @codemirror/language highlight style only assigns colors, not font
+ * sizes — so without this `## hello` shows up colored but the same
+ * size as body text.
  *
- * Tag set comes from @lezer/highlight; it's the same vocabulary
+ * v0.6.0: heading sizes now ride Obsidian's `--h1-size`..`--h6-size`
+ * variables so community themes get a vote. Weights follow
+ * `--h1-weight`..`--h6-weight`. CM6 swallows undefined CSS values
+ * gracefully — if the active theme doesn't define one, we fall back
+ * to a reasonable em-based size.
+ *
+ * Tag set comes from @lezer/highlight; same vocabulary
  * @codemirror/lang-markdown emits.
  */
 const halfdayMarkdownHighlight = HighlightStyle.define([
-  { tag: tags.heading1, fontSize: "1.7em", fontWeight: "700" },
-  { tag: tags.heading2, fontSize: "1.45em", fontWeight: "700" },
-  { tag: tags.heading3, fontSize: "1.25em", fontWeight: "700" },
-  { tag: tags.heading4, fontSize: "1.1em", fontWeight: "700" },
-  { tag: tags.heading5, fontSize: "1.05em", fontWeight: "700" },
-  { tag: tags.heading6, fontWeight: "700" },
+  {
+    tag: tags.heading1,
+    fontSize: "var(--h1-size, 1.7em)",
+    fontWeight: "var(--h1-weight, 700)",
+  },
+  {
+    tag: tags.heading2,
+    fontSize: "var(--h2-size, 1.45em)",
+    fontWeight: "var(--h2-weight, 700)",
+  },
+  {
+    tag: tags.heading3,
+    fontSize: "var(--h3-size, 1.25em)",
+    fontWeight: "var(--h3-weight, 700)",
+  },
+  {
+    tag: tags.heading4,
+    fontSize: "var(--h4-size, 1.1em)",
+    fontWeight: "var(--h4-weight, 700)",
+  },
+  {
+    tag: tags.heading5,
+    fontSize: "var(--h5-size, 1.05em)",
+    fontWeight: "var(--h5-weight, 700)",
+  },
+  {
+    tag: tags.heading6,
+    fontWeight: "var(--h6-weight, 700)",
+  },
   { tag: tags.strong, fontWeight: "700" },
   { tag: tags.emphasis, fontStyle: "italic" },
   { tag: tags.strikethrough, textDecoration: "line-through" },
   {
     tag: tags.link,
-    color: "var(--text-accent)",
+    color: "var(--color-accent)",
     textDecoration: "underline",
   },
-  { tag: tags.url, color: "var(--text-accent)" },
+  { tag: tags.url, color: "var(--color-accent)" },
   {
     tag: tags.monospace,
     fontFamily: "var(--font-monospace, monospace)",
-    color: "var(--text-accent)",
+    color: "var(--color-accent)",
   },
   { tag: tags.quote, color: "var(--text-muted)", fontStyle: "italic" },
-  { tag: tags.list, color: "var(--text-accent)" },
+  { tag: tags.list, color: "var(--color-accent)" },
 ]);
+
+/**
+ * Snapshot the view pushes up to the plugin's status-bar item. The
+ * plugin owns the actual HTMLElement (Obsidian's status bar belongs to
+ * the workspace, not any individual view), so the view just describes
+ * its state and the plugin renders it.
+ */
+export interface AgeStatusBarState {
+  filename: string;
+  dirty: boolean;
+  bytesOnDisk: number | null;
+  lastSavedAt: Date | null;
+}
 
 /**
  * A plugin handle the view needs at runtime. Passing the whole plugin
  * would create a cycle; this narrow interface is enough.
+ *
+ * v0.6.0 additions: updateStatusBar / clearStatusBar replace the
+ * inline `.halfday-age-status` banner that used to live inside the
+ * pane. The plugin owns the bottom-of-workspace status item and the
+ * view feeds it on every state change.
  */
 export interface AgeFileViewDeps {
   getIdentityPath: () => string;
   getRecipientsPath: () => string;
+  updateStatusBar: (state: AgeStatusBarState) => void;
+  clearStatusBar: () => void;
 }
 
 type SaveReason = "manual" | "autosave" | "unload";
@@ -102,14 +158,13 @@ export class AgeFileView extends FileView {
   private plaintext: string | null = null;
   private editor: EditorView | null = null;
   private editorHost: HTMLDivElement | null = null;
-  private statusEl: HTMLDivElement | null = null;
 
   // dirty / autosave bookkeeping — reset on every onLoadFile
   private dirty = false;
   private autosaveTimer: ReturnType<typeof setTimeout> | null = null;
   private inFlightSave: Promise<void> | null = null;
   private lastSavedAt: Date | null = null;
-  /** Byte-length of the ciphertext we last successfully wrote — shown for debugging. */
+  /** Byte-length of the ciphertext we last successfully wrote — surfaced via the status bar. */
   private lastSavedBytes: number | null = null;
 
   constructor(leaf: WorkspaceLeaf, deps: AgeFileViewDeps) {
@@ -124,14 +179,29 @@ export class AgeFileView extends FileView {
   }
 
   getIcon(): string {
+    // v0.6.0: Obsidian renders this as the tab's leading glyph via its
+    // lucide icon set. If a future Obsidian build stops resolving
+    // "lock", `getDisplayText` is the fallback affordance — see below.
     return "lock";
   }
 
   getDisplayText(): string {
-    const name = this.file?.name ?? "(encrypted)";
-    // the bullet is a lightweight "dirty" marker that shows up in the tab
-    // title — Obsidian re-reads getDisplayText when we call updateHeader().
-    return this.dirty ? `● ${name}` : name;
+    const raw = this.file?.name ?? "(encrypted)";
+    // v0.6.0: strip the encrypted suffixes for tab readability.
+    // ".md.age" → ".md"-less display, ".age" → bare base name.
+    // Order matters: ".md.age" must be tested before ".age".
+    let name = raw;
+    if (name.endsWith(".md.age")) {
+      name = name.slice(0, -".md.age".length);
+    } else if (name.endsWith(".age")) {
+      name = name.slice(0, -".age".length);
+    }
+    // Decision (v0.6.0): rely on getIcon() for the lock glyph rather
+    // than prefixing an emoji here. Obsidian's icon API is the
+    // first-class affordance; emoji prefix is the fallback if it
+    // ever stops rendering. To switch, prepend `🔒 ` to `name`.
+    const dirtyMark = this.dirty ? "● " : "";
+    return `${dirtyMark}${name}`;
   }
 
   /** Build the static chrome once. File-specific content lands in onLoadFile. */
@@ -140,7 +210,8 @@ export class AgeFileView extends FileView {
     contentEl.empty();
     contentEl.addClass("halfday-age-view");
 
-    this.statusEl = contentEl.createDiv({ cls: "halfday-age-status" });
+    // v0.6.0: no more inline status banner. The editor host fills the
+    // whole content area; metadata lives in the bottom status bar.
     this.editorHost = contentEl.createDiv({ cls: "halfday-age-editor" });
 
     // cmd-S (manual save). Obsidian's global hotkey manager eats Mod-S
@@ -157,14 +228,12 @@ export class AgeFileView extends FileView {
   }
 
   async onLoadFile(file: TFile): Promise<void> {
-    if (!this.statusEl || !this.editorHost) return;
+    if (!this.editorHost) return;
     this.cancelAutosave();
     this.teardownEditor();
     this.dirty = false;
     this.lastSavedAt = null;
     this.lastSavedBytes = null;
-    this.statusEl.removeClass("halfday-age-error");
-    this.statusEl.setText(`decrypting ${file.name}…`);
 
     try {
       const identityPath = this.deps.getIdentityPath();
@@ -176,10 +245,8 @@ export class AgeFileView extends FileView {
       this.plaintext = plaintext;
       this.lastSavedBytes = ciphertext.byteLength;
       this.mountEditor(plaintext);
-      this.refreshStatus(
-        `decrypted · ${plaintext.length.toLocaleString()} chars from ${ciphertext.byteLength.toLocaleString()} bytes`
-      );
       this.updateTabHeader();
+      this.pushStatusBar();
       console.log("[halfday-rune] age view decrypted", {
         path: file.path,
         plaintextLen: plaintext.length,
@@ -187,10 +254,12 @@ export class AgeFileView extends FileView {
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.statusEl.setText(`decrypt failed — ${msg}`);
-      this.statusEl.addClass("halfday-age-error");
+      new Notice(`Halfday Rune: decrypt failed — ${msg}`);
       this.teardownEditor();
       this.plaintext = null;
+      // status bar shows nothing useful when the decrypt itself failed —
+      // there's no byte count, no dirty state to report.
+      this.deps.clearStatusBar();
       console.error("[halfday-rune] age view decrypt failed", err);
     }
   }
@@ -214,10 +283,7 @@ export class AgeFileView extends FileView {
     this.dirty = false;
     this.lastSavedAt = null;
     this.lastSavedBytes = null;
-    if (this.statusEl) {
-      this.statusEl.removeClass("halfday-age-error");
-      this.statusEl.setText("");
-    }
+    this.deps.clearStatusBar();
   }
 
   async onClose(): Promise<void> {
@@ -225,7 +291,7 @@ export class AgeFileView extends FileView {
     this.teardownEditor();
     this.plaintext = null;
     this.editorHost = null;
-    this.statusEl = null;
+    this.deps.clearStatusBar();
     this.contentEl.empty();
   }
 
@@ -242,7 +308,8 @@ export class AgeFileView extends FileView {
       doc,
       extensions: [
         EditorView.lineWrapping,
-        lineNumbers(),
+        // v0.6.0: lineNumbers() removed. Obsidian's markdown views don't
+        // show them; ours shouldn't either.
         highlightActiveLine(),
         markdown(),
         // order matters: our custom style first (heading sizes), then the
@@ -271,32 +338,44 @@ export class AgeFileView extends FileView {
             this.markDirty();
           }
         }),
-        // lean on Obsidian's CSS variables so the editor blends in visually
+        // v0.6.0: full theme inheritance from Obsidian CSS vars. Nothing
+        // hardcoded — light/dark + community themes adapt without a
+        // plugin reload. Heading scale + line-height are picked up by
+        // halfdayMarkdownHighlight (above) using the same vars.
         EditorView.theme({
           "&": {
             height: "100%",
-            fontSize: "var(--font-text-size, 16px)",
-            fontFamily: "var(--font-text, inherit)",
+            fontFamily: "var(--font-text)",
+            fontSize: "var(--font-text-size)",
             backgroundColor: "var(--background-primary)",
             color: "var(--text-normal)",
+            lineHeight: "var(--line-height-normal)",
           },
           ".cm-scroller": {
-            fontFamily: "var(--font-text, inherit)",
-            lineHeight: "1.6",
+            fontFamily: "inherit",
+            lineHeight: "inherit",
           },
           ".cm-content": {
-            padding: "0.75rem 0.25rem",
+            // Obsidian's editor uses generous horizontal padding on wide
+            // screens; we lean on the same spacing tokens so we inherit
+            // any theme tweaks rather than baking pixel values in.
+            padding: "var(--size-4-8, 2rem) var(--size-4-12, 4rem)",
+            // caret-color tracks the cursor color so native browser
+            // fallback (where CM6's overlay isn't visible yet) matches.
+            caretColor: "var(--color-accent)",
           },
-          ".cm-gutters": {
-            backgroundColor: "var(--background-secondary)",
-            color: "var(--text-muted)",
-            border: "none",
+          // v0.6.0: cursor — 2px and tinted with the theme accent so it's
+          // legible against both light and dark backgrounds. CM6's default
+          // blink (~1.2s) is fine; we don't override it.
+          ".cm-cursor, .cm-dropCursor": {
+            borderLeftColor: "var(--color-accent)",
+            borderLeftWidth: "2px",
           },
           ".cm-activeLine": {
             backgroundColor: "var(--background-modifier-hover)",
           },
-          ".cm-activeLineGutter": {
-            backgroundColor: "var(--background-modifier-hover)",
+          "&.cm-focused .cm-selectionBackground, ::selection": {
+            backgroundColor: "var(--text-selection)",
           },
         }),
       ],
@@ -317,7 +396,7 @@ export class AgeFileView extends FileView {
     const wasDirty = this.dirty;
     this.dirty = true;
     this.scheduleAutosave();
-    this.refreshStatus();
+    this.pushStatusBar();
     if (!wasDirty) this.updateTabHeader();
   }
 
@@ -364,7 +443,6 @@ export class AgeFileView extends FileView {
     const startedAt = Date.now();
     const plaintext = this.editor.state.doc.toString();
     this.cancelAutosave();
-    this.refreshStatus("saving…");
 
     try {
       const recipientsPath = this.deps.getRecipientsPath();
@@ -397,8 +475,8 @@ export class AgeFileView extends FileView {
       this.lastSavedAt = new Date();
       this.lastSavedBytes = ciphertext.byteLength;
       const dt = Date.now() - startedAt;
-      this.refreshStatus(`saved in ${dt}ms (${reason})`);
       this.updateTabHeader();
+      this.pushStatusBar();
       console.log("[halfday-rune] age view saved", {
         path: file.path,
         plaintextLen: plaintext.length,
@@ -409,37 +487,31 @@ export class AgeFileView extends FileView {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       new Notice(`Halfday Rune: save failed — ${msg}`);
-      this.refreshStatus(`save failed — ${msg}`, /*isError*/ true);
       console.error("[halfday-rune] age view save failed", err);
-      // still dirty — let the user retry or try cmd-S
+      // still dirty — let the user retry or try cmd-S. Push state so
+      // the status bar reflects the lingering dirtiness.
+      this.pushStatusBar();
       throw err;
     }
   }
 
-  private refreshStatus(extra?: string, isError = false): void {
-    if (!this.statusEl) return;
+  /**
+   * v0.6.0: push the current view state to the plugin's status-bar
+   * item. The plugin renders the dot, the bytes, the saved time, and
+   * the version string — view just describes its state.
+   */
+  private pushStatusBar(): void {
     const file = this.file;
     if (!file) {
-      this.statusEl.setText("");
-      this.statusEl.removeClass("halfday-age-error");
+      this.deps.clearStatusBar();
       return;
     }
-    const dirtyMark = this.dirty ? "dirty ●" : "clean";
-    const lastSaved = this.lastSavedAt
-      ? ` · last saved ${this.lastSavedAt.toLocaleTimeString()}`
-      : "";
-    const bytes = this.lastSavedBytes !== null
-      ? ` · ${this.lastSavedBytes.toLocaleString()} bytes on disk`
-      : "";
-    const tail = extra ? ` · ${extra}` : "";
-    this.statusEl.setText(
-      `${file.name} · ${dirtyMark}${lastSaved}${bytes}${tail} · v0.5.2`
-    );
-    if (isError) {
-      this.statusEl.addClass("halfday-age-error");
-    } else {
-      this.statusEl.removeClass("halfday-age-error");
-    }
+    this.deps.updateStatusBar({
+      filename: file.name,
+      dirty: this.dirty,
+      bytesOnDisk: this.lastSavedBytes,
+      lastSavedAt: this.lastSavedAt,
+    });
   }
 
   /**
@@ -453,7 +525,8 @@ export class AgeFileView extends FileView {
     try {
       leaf.updateHeader?.();
     } catch (err) {
-      // best-effort only; the in-view status line is the source of truth
+      // best-effort only; the tab title is cosmetic, save state is the
+      // source of truth.
       console.debug("[halfday-rune] updateHeader unavailable", err);
     }
   }
