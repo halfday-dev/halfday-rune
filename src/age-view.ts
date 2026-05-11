@@ -90,6 +90,14 @@ const halfdayMarkdownHighlight = HighlightStyle.define([
   { tag: tags.url, color: "var(--color-accent)" },
   { tag: tags.quote, color: "var(--text-muted)", fontStyle: "italic" },
   { tag: tags.list, color: "var(--color-accent)" },
+  // v0.6.1 monospace fallback: `tags.monospace` in @codemirror/lang-markdown
+  // covers BOTH InlineCode (handled by halfdayInlineDecorations) AND
+  // FencedCode (NOT yet handled — v0.6.2 will add a proper chip-style
+  // code-block decoration). Re-add a minimal monospace rule so fenced
+  // blocks at least look like code in v0.6.1. No color or background —
+  // those would step on the inline-code decoration's chip styling.
+  // Removed entirely once v0.6.2's code-block decoration ships.
+  { tag: tags.monospace, fontFamily: "var(--font-monospace, monospace)" },
 ]);
 
 /**
@@ -334,7 +342,13 @@ export class AgeFileView extends FileView {
             fontSize: "var(--font-text-size)",
             backgroundColor: "var(--background-primary, #1e1e1e)",
             color: "var(--text-normal, #dcddde)",
-            lineHeight: "var(--line-height-normal)",
+            // v0.6.1 paragraph-breathing bump: Obsidian's --line-height-normal
+            // is typically 1.6; that renders dense in our pane. Scale by 1.15
+            // so blank lines (paragraph separators) take up more vertical
+            // space. Calc keeps theme-awareness — if a community theme sets
+            // --line-height-normal to 1.8, we end up at 2.07 which still
+            // reads as "obsidian-y" rather than off-brand.
+            lineHeight: "calc(var(--line-height-normal, 1.6) * 1.15)",
           },
           ".cm-scroller": {
             fontFamily: "inherit",
