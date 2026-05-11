@@ -27,6 +27,14 @@ const HIDE_BACKTICK = Decoration.replace({});
 interface PendingMark {
   from: number;
   to: number;
+  /**
+   * CM6's RangeSetBuilder requires non-decreasing (from, startSide).
+   * Decoration.mark defaults to startSide=1, Decoration.replace to -1, so
+   * at the same `from` the replace MUST come before the mark. We track
+   * this explicitly because we can't read startSide off a Decoration
+   * object via the public API.
+   */
+  startSide: number;
   deco: Decoration;
 }
 
@@ -56,6 +64,7 @@ export function buildInlineCodeDecorationsFromState(
         pending.push({
           from: spanFrom,
           to: spanTo,
+          startSide: 1, // Decoration.mark default
           deco: Decoration.mark({ class: INLINE_CODE_CLASS }),
         });
 
@@ -67,6 +76,7 @@ export function buildInlineCodeDecorationsFromState(
               pending.push({
                 from: child.from,
                 to: child.to,
+                startSide: -1, // Decoration.replace default
                 deco: HIDE_BACKTICK,
               });
             }
@@ -77,7 +87,13 @@ export function buildInlineCodeDecorationsFromState(
     });
   }
 
-  pending.sort((a, b) => a.from - b.from || b.to - a.to);
+  // Sort by (from asc, startSide asc, to desc). RangeSetBuilder requires
+  // non-decreasing (from, startSide) — at the same `from`, replace
+  // (startSide=-1) MUST precede mark (startSide=1).
+  pending.sort(
+    (a, b) =>
+      a.from - b.from || a.startSide - b.startSide || b.to - a.to
+  );
   const builder = new RangeSetBuilder<Decoration>();
   for (const p of pending) {
     builder.add(p.from, p.to, p.deco);
