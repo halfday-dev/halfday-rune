@@ -53,6 +53,7 @@ import {
   readIdentity,
   readRecipients,
 } from "./crypto";
+import { halfdayInlineDecorations } from "./decorations";
 
 export const VIEW_TYPE_AGE = "halfday-age-view";
 
@@ -60,52 +61,26 @@ export const VIEW_TYPE_AGE = "halfday-age-view";
 const AUTOSAVE_DELAY_MS = 30_000;
 
 /**
- * Custom highlight style that actually sizes headings. The default
- * @codemirror/language highlight style only assigns colors, not font
- * sizes — so without this `## hello` shows up colored but the same
- * size as body text.
+ * Custom highlight style for constructs we haven't replaced with proper
+ * decorations yet.
  *
- * v0.6.0: heading sizes now ride Obsidian's `--h1-size`..`--h6-size`
- * variables so community themes get a vote. Weights follow
- * `--h1-weight`..`--h6-weight`. CM6 swallows undefined CSS values
- * gracefully — if the active theme doesn't define one, we fall back
- * to a reasonable em-based size.
+ * v0.6.1 (this pass): headings, strong, emphasis, and monospace rules were
+ * REMOVED from here. They're now handled by halfdayInlineDecorations in
+ * src/decorations/ — which gives them live-preview semantics (size +
+ * weight on the line, and hide-syntax-on-cursor-leave) instead of just
+ * applying token colors. The rules below stay because v0.6.1 only
+ * decorates headings + emphasis + inline-code; strikethrough, links,
+ * urls, quotes, and lists keep their highlight-style treatment until the
+ * v0.6.2 block-decoration pass replaces them.
+ *
+ * v0.6.0: heading sizes used to ride Obsidian's `--h1-size`..`--h6-size`
+ * variables here; that's now done in styles.css via the
+ * .halfday-md-h1..h6 classes the headings decoration applies.
  *
  * Tag set comes from @lezer/highlight; same vocabulary
  * @codemirror/lang-markdown emits.
  */
 const halfdayMarkdownHighlight = HighlightStyle.define([
-  {
-    tag: tags.heading1,
-    fontSize: "var(--h1-size, 1.7em)",
-    fontWeight: "var(--h1-weight, 700)",
-  },
-  {
-    tag: tags.heading2,
-    fontSize: "var(--h2-size, 1.45em)",
-    fontWeight: "var(--h2-weight, 700)",
-  },
-  {
-    tag: tags.heading3,
-    fontSize: "var(--h3-size, 1.25em)",
-    fontWeight: "var(--h3-weight, 700)",
-  },
-  {
-    tag: tags.heading4,
-    fontSize: "var(--h4-size, 1.1em)",
-    fontWeight: "var(--h4-weight, 700)",
-  },
-  {
-    tag: tags.heading5,
-    fontSize: "var(--h5-size, 1.05em)",
-    fontWeight: "var(--h5-weight, 700)",
-  },
-  {
-    tag: tags.heading6,
-    fontWeight: "var(--h6-weight, 700)",
-  },
-  { tag: tags.strong, fontWeight: "700" },
-  { tag: tags.emphasis, fontStyle: "italic" },
   { tag: tags.strikethrough, textDecoration: "line-through" },
   {
     tag: tags.link,
@@ -113,11 +88,6 @@ const halfdayMarkdownHighlight = HighlightStyle.define([
     textDecoration: "underline",
   },
   { tag: tags.url, color: "var(--color-accent)" },
-  {
-    tag: tags.monospace,
-    fontFamily: "var(--font-monospace, monospace)",
-    color: "var(--color-accent)",
-  },
   { tag: tags.quote, color: "var(--text-muted)", fontStyle: "italic" },
   { tag: tags.list, color: "var(--color-accent)" },
 ]);
@@ -312,8 +282,15 @@ export class AgeFileView extends FileView {
         // show them; ours shouldn't either.
         highlightActiveLine(),
         markdown(),
-        // order matters: our custom style first (heading sizes), then the
-        // default as a fallback so non-heading tokens still get default colors
+        // v0.6.1: inline decorations (headings, emphasis, inline code).
+        // These render the rich live-preview semantics — heading sizes
+        // on lines, bold/italic styling, code chips — and hide their
+        // syntax markers when the cursor isn't on the span. Composed
+        // before syntaxHighlighting so any tokens the decorations don't
+        // touch still pick up default colors as a fallback.
+        ...halfdayInlineDecorations(),
+        // remaining tag-based styling (strikethrough, links, urls, quotes,
+        // lists) — v0.6.2 will replace these with proper block decorations
         syntaxHighlighting(halfdayMarkdownHighlight),
         syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
         // cmd-S handler is *also* registered at the CM6 layer as a backup;
