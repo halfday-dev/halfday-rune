@@ -130,6 +130,28 @@ describe("headingsDecoration", () => {
     const replaceSpans = collect(set).filter((d) => d.from !== d.to);
     expect(replaceSpans).toHaveLength(0);
   });
+
+  it("handles an empty heading (`# ` with no content) without crashing", () => {
+    // Edge: heading marker present but no text. Caught in v0.6.1 QA — the
+    // hide-range logic must not blow up when `# ` is the entire content of
+    // the heading line. Expected: line decoration still applies, hide range
+    // covers the "# " prefix as for any normal heading.
+    const doc = "# \nbody";
+    const state = mkState(doc);
+    // cursor on the body line, so the heading's `# ` should be hidden
+    const set = buildHeadingDecorationsFromState(state, doc.length, FULL(state));
+    const out = collect(set);
+    // line decoration at offset 0 with halfday-md-h1
+    const lineDeco = out.find(
+      (d) => d.from === 0 && d.to === 0 && d.spec?.class === "halfday-md-h1"
+    );
+    expect(lineDeco).toBeDefined();
+    // exactly one replace span covering the "# " prefix (offsets 0..2)
+    const replaceSpans = out.filter((d) => d.from !== d.to);
+    expect(replaceSpans).toHaveLength(1);
+    expect(replaceSpans[0].from).toBe(0);
+    expect(replaceSpans[0].to).toBe(2);
+  });
 });
 
 describe("emphasisDecoration", () => {
@@ -329,6 +351,41 @@ describe("extension factories integrate into an EditorState", () => {
         extensions: [markdown(), ...halfdayInlineDecorations()],
       })
     ).not.toThrow();
+  });
+});
+
+describe("cross-construct nesting", () => {
+  it("`**bold `code` inside**` produces both the strong mark and the inline-code mark", () => {
+    // Spec line 79 calls this exact case out as the nesting smoke test. The
+    // emphasis + inline-code decorations live in separate ViewPlugins, so
+    // each emits its own DecorationSet — CM6 layers them in the rendered
+    // output. We verify here that BOTH decorations fire over a single doc
+    // and that their ranges are sensible: the strong mark spans the full
+    // `**...**`, the inline-code mark spans just the `` `code` ``.
+    const doc = "**bold `code` inside**";
+    const state = mkState(doc);
+    // cursor far from any markers (well, the whole doc IS the span — put
+    // cursor at offset 1 which is between the first two `*`s; still on the
+    // outer span but that's fine, we're checking emission not hide-state).
+    // What we care about: both classes are present, with the expected ranges.
+    const emphasisSet = buildEmphasisDecorationsFromState(state, 1, FULL(state));
+    const codeSet = buildInlineCodeDecorationsFromState(state, 1, FULL(state));
+
+    const strongMarks = collect(emphasisSet).filter(
+      (d) => d.spec?.class === "halfday-md-strong"
+    );
+    expect(strongMarks).toHaveLength(1);
+    // strong mark covers the whole `**...**` — offsets 0..22
+    expect(strongMarks[0].from).toBe(0);
+    expect(strongMarks[0].to).toBe(doc.length);
+
+    const codeMarks = collect(codeSet).filter(
+      (d) => d.spec?.class === "halfday-md-inline-code"
+    );
+    expect(codeMarks).toHaveLength(1);
+    // code mark covers `` `code` `` including backticks — offsets 7..13
+    expect(codeMarks[0].from).toBe(7);
+    expect(codeMarks[0].to).toBe(13);
   });
 });
 
