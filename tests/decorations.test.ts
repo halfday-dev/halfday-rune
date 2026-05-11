@@ -23,10 +23,12 @@ import {
   halfdayInlineDecorations,
   headingsDecoration,
   inlineCodeDecoration,
+  linksDecoration,
 } from "../src/decorations";
 import { buildHeadingDecorationsFromState } from "../src/decorations/headings";
 import { buildEmphasisDecorationsFromState } from "../src/decorations/emphasis";
 import { buildInlineCodeDecorationsFromState } from "../src/decorations/inline-code";
+import { buildLinksDecorationsFromState } from "../src/decorations/links";
 
 interface Span {
   from: number;
@@ -310,6 +312,97 @@ describe("inlineCodeDecoration", () => {
   });
 });
 
+describe("linksDecoration", () => {
+  it("emits a .halfday-md-link mark over the anchor text range", () => {
+    // doc:        see [text](https://example.com) end
+    // offsets:    0123456789...
+    //             ^ "see " is 0..4
+    //             ^ "[" at 4, anchor "text" at 5..9, "]" at 9
+    const doc = "see [text](https://example.com) end";
+    const state = mkState(doc);
+    // cursor at offset 0 — well off the link span
+    const set = buildLinksDecorationsFromState(state, 0, FULL(state));
+    const marks = collect(set).filter(
+      (d) => d.spec?.class === "halfday-md-link"
+    );
+    expect(marks).toHaveLength(1);
+    expect(marks[0].from).toBe(5);
+    expect(marks[0].to).toBe(9);
+  });
+
+  it("hides the [, ], (, URL, and ) when cursor is off the span", () => {
+    const doc = "see [text](https://example.com) end";
+    const state = mkState(doc);
+    // cursor at end of doc — off the link
+    const set = buildLinksDecorationsFromState(state, doc.length, FULL(state));
+    const replaces = collect(set).filter(
+      (d) => d.from !== d.to && d.spec?.class !== "halfday-md-link"
+    );
+    // five hide ranges: [ ] ( URL )
+    expect(replaces).toHaveLength(5);
+  });
+
+  it("reveals the syntax when cursor is on the link span", () => {
+    const doc = "see [text](https://example.com) end";
+    const state = mkState(doc);
+    // cursor inside the anchor text "text" at offset 7
+    const set = buildLinksDecorationsFromState(state, 7, FULL(state));
+    const replaces = collect(set).filter(
+      (d) => d.from !== d.to && d.spec?.class !== "halfday-md-link"
+    );
+    expect(replaces).toHaveLength(0);
+    // the anchor-text mark still fires
+    const marks = collect(set).filter(
+      (d) => d.spec?.class === "halfday-md-link"
+    );
+    expect(marks).toHaveLength(1);
+  });
+
+  it("decorates multiple links independently on one line", () => {
+    // doc:     [a](u1) and [b](u2)
+    // offsets: 0123456789...
+    // link1 span 0..7, anchor "a" at 1..2
+    // link2 span 12..19, anchor "b" at 13..14
+    const doc = "[a](u1) and [b](u2)";
+    const state = mkState(doc);
+    // cursor on the first link (offset 1) — first reveals, second hides
+    const set = buildLinksDecorationsFromState(state, 1, FULL(state));
+    const marks = collect(set).filter(
+      (d) => d.spec?.class === "halfday-md-link"
+    );
+    expect(marks).toHaveLength(2);
+    const replaces = collect(set).filter(
+      (d) => d.from !== d.to && d.spec?.class !== "halfday-md-link"
+    );
+    // only the second link should be hidden — 5 replace ranges
+    expect(replaces).toHaveLength(5);
+    // and all those hide ranges should be inside the second link span (12..19)
+    expect(replaces.every((r) => r.from >= 12 && r.to <= 19)).toBe(true);
+  });
+
+  it("is a no-op for an empty document", () => {
+    const state = mkState("");
+    const set = buildLinksDecorationsFromState(state, 0, FULL(state));
+    expect(collect(set)).toEqual([]);
+  });
+
+  it("is a no-op for plain text with no links", () => {
+    const state = mkState("just regular prose, no links at all");
+    const set = buildLinksDecorationsFromState(state, 0, FULL(state));
+    expect(collect(set)).toEqual([]);
+  });
+
+  it("does NOT decorate wikilinks `[[foo]]` (no URL child → skipped)", () => {
+    // lezer-markdown's default grammar parses `[[foo]]` as a Link node with
+    // only two LinkMark children and no URL — our shape check should bail.
+    // v0.6.2 will handle wikilinks via a custom regex/parser extension.
+    const doc = "see [[wiki]] not a standard link";
+    const state = mkState(doc);
+    const set = buildLinksDecorationsFromState(state, 0, FULL(state));
+    expect(collect(set)).toEqual([]);
+  });
+});
+
 describe("extension factories integrate into an EditorState", () => {
   it("headingsDecoration() returns an extension EditorState accepts", () => {
     expect(() =>
@@ -338,16 +431,25 @@ describe("extension factories integrate into an EditorState", () => {
     ).not.toThrow();
   });
 
-  it("halfdayInlineDecorations() returns a 3-element extension list", () => {
+  it("linksDecoration() returns an extension EditorState accepts", () => {
+    expect(() =>
+      EditorState.create({
+        doc: "[text](https://example.com)",
+        extensions: [markdown(), linksDecoration()],
+      })
+    ).not.toThrow();
+  });
+
+  it("halfdayInlineDecorations() returns a 4-element extension list", () => {
     const ext = halfdayInlineDecorations();
     expect(Array.isArray(ext)).toBe(true);
-    expect(ext).toHaveLength(3);
+    expect(ext).toHaveLength(4);
   });
 
   it("halfdayInlineDecorations() composes into an EditorState with mixed content", () => {
     expect(() =>
       EditorState.create({
-        doc: "# h1\nbody with **bold** and _italic_ and `code`",
+        doc: "# h1\nbody with **bold** and _italic_ and `code` and [link](https://x.y)",
         extensions: [markdown(), ...halfdayInlineDecorations()],
       })
     ).not.toThrow();
@@ -386,6 +488,33 @@ describe("cross-construct nesting", () => {
     // code mark covers `` `code` `` including backticks — offsets 7..13
     expect(codeMarks[0].from).toBe(7);
     expect(codeMarks[0].to).toBe(13);
+  });
+
+  it("`**bold [link](url)**` produces both the strong mark and the link mark", () => {
+    // doc:     **bold [link](url)**
+    // offsets: 0123456789012345678901
+    // StrongEmphasis spans 0..20, Link spans 7..18, anchor "link" 8..12
+    const doc = "**bold [link](url)**";
+    const state = mkState(doc);
+    // cursor at offset 1 — inside the strong span but off the link span
+    // (link is 7..18; cursor 1 is < 7 so link syntax should hide).
+    const emphasisSet = buildEmphasisDecorationsFromState(state, 1, FULL(state));
+    const linkSet = buildLinksDecorationsFromState(state, 1, FULL(state));
+
+    const strongMarks = collect(emphasisSet).filter(
+      (d) => d.spec?.class === "halfday-md-strong"
+    );
+    expect(strongMarks).toHaveLength(1);
+    expect(strongMarks[0].from).toBe(0);
+    expect(strongMarks[0].to).toBe(doc.length);
+
+    const linkMarks = collect(linkSet).filter(
+      (d) => d.spec?.class === "halfday-md-link"
+    );
+    expect(linkMarks).toHaveLength(1);
+    // anchor text "link" — offsets 8..12
+    expect(linkMarks[0].from).toBe(8);
+    expect(linkMarks[0].to).toBe(12);
   });
 });
 
