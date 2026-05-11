@@ -1,18 +1,23 @@
 /**
  * Halfday Rune inline decorations — v0.6.1.
  *
- * Bundles headings, emphasis (bold + italic), and inline-code into one
- * composed extension you can plug into an EditorState.
+ * Bundles headings, emphasis (bold + italic), inline-code, and standard
+ * markdown links into one composed extension you can plug into an
+ * EditorState.
  *
  * Order matters for the lezer walk and for how CM6 layers decorations:
  *   1. headings first — line-level decorations need to land at the line
  *      start before any mark decorations on the same range
- *   2. emphasis next — bold spans can contain inline-code spans
- *   3. inline-code last — innermost styling, applied on top of emphasis
+ *   2. emphasis next — bold spans can contain inline-code or link spans
+ *   3. inline-code — innermost styling, applied on top of emphasis
+ *   4. links last — `[text](url)` collapses to just the anchor text; the
+ *      decoration lives in its own ViewPlugin so its hide/reveal logic is
+ *      independent of inline-code's
  *
- * Future block decorations (lists, code blocks, links) will compose into
- * the same returned array; the inline pass stays at the front so nesting
- * (e.g. `**bold with `code`**`) keeps rendering correctly.
+ * Future block decorations (lists, code blocks, wikilinks, images) will
+ * compose into the same returned array; the inline pass stays at the front
+ * so nesting (e.g. `` **bold with `code` and [link](url)** ``) keeps
+ * rendering correctly.
  *
  * Known live-preview limitations (v0.6.1, by design — match typical CM6
  * live-preview plugins; revisit if user complaints surface):
@@ -31,13 +36,24 @@
 import { emphasisDecoration } from "./emphasis";
 import { headingsDecoration } from "./headings";
 import { inlineCodeDecoration } from "./inline-code";
+import { linksDecoration } from "./links";
 
-export { emphasisDecoration, headingsDecoration, inlineCodeDecoration };
+export {
+  emphasisDecoration,
+  headingsDecoration,
+  inlineCodeDecoration,
+  linksDecoration,
+};
 
 /**
  * Returns all inline decorations as a single array, ready to spread into an
  * EditorState's `extensions` list.
  */
 export function halfdayInlineDecorations() {
-  return [headingsDecoration(), emphasisDecoration(), inlineCodeDecoration()];
+  return [
+    headingsDecoration(),
+    emphasisDecoration(),
+    inlineCodeDecoration(),
+    linksDecoration(),
+  ];
 }

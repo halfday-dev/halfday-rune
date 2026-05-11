@@ -114,3 +114,13 @@
   padding: 1px 6px;
   border-radius: 4px;
 }
+
+/* Standard markdown link `[text](url)` — mark decoration over the anchor
+ * text range. The existing halfdayMarkdownHighlight tags.link rule in
+ * age-view.ts already paints the anchor text with --color-accent and an
+ * underline; we layer this class on top so v0.6.2's click-to-navigate work
+ * has a stable hook. Visually redundant today, intentionally so. */
+.halfday-age-editor .halfday-md-link {
+  color: var(--color-accent, #7f6df2);
+  text-decoration: underline;
+}
