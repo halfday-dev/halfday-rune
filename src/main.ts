@@ -241,12 +241,16 @@ export default class HalfdayObsidianRune extends Plugin {
     this.statusBarEl.empty();
     this.statusBarEl.style.display = "";
 
-    // dot: green when clean, amber when dirty. Inline styles for the
-    // colors keep theme-agnostic; structural styles live in styles.css.
+    // dot: green when clean, orange when dirty. Use Obsidian's theme palette
+    // vars so community themes can re-skin without plugin changes. Fallbacks
+    // are the previous hardcoded hex literals so degenerate themes (or
+    // partial overrides) still render visibly.
     const dot = this.statusBarEl.createSpan({
       cls: "halfday-rune-statusbar-dot",
     });
-    dot.style.backgroundColor = state.dirty ? "#f59e0b" : "#4ade80";
+    dot.style.backgroundColor = state.dirty
+      ? "var(--color-orange, #f59e0b)"
+      : "var(--color-green, #4ade80)";
 
     this.statusBarEl.createSpan({
       cls: "halfday-rune-statusbar-state",

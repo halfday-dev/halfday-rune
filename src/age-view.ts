@@ -342,13 +342,21 @@ export class AgeFileView extends FileView {
         // hardcoded — light/dark + community themes adapt without a
         // plugin reload. Heading scale + line-height are picked up by
         // halfdayMarkdownHighlight (above) using the same vars.
+        // Defense-in-depth note: every var below has a literal fallback for
+        // the load-bearing legibility props (background, body color, cursor
+        // color). Obsidian's core stylesheet always defines these on body,
+        // but a degenerate community theme that strips them would otherwise
+        // fall through to user-agent defaults — unstyled white background
+        // under a dark theme, invisible caret, etc. Cosmetic-only props
+        // (line-height, selection) don't carry fallbacks: the worst case is
+        // a slightly off-spec render, not invisible content.
         EditorView.theme({
           "&": {
             height: "100%",
             fontFamily: "var(--font-text)",
             fontSize: "var(--font-text-size)",
-            backgroundColor: "var(--background-primary)",
-            color: "var(--text-normal)",
+            backgroundColor: "var(--background-primary, #1e1e1e)",
+            color: "var(--text-normal, #dcddde)",
             lineHeight: "var(--line-height-normal)",
           },
           ".cm-scroller": {
@@ -362,13 +370,13 @@ export class AgeFileView extends FileView {
             padding: "var(--size-4-8, 2rem) var(--size-4-12, 4rem)",
             // caret-color tracks the cursor color so native browser
             // fallback (where CM6's overlay isn't visible yet) matches.
-            caretColor: "var(--color-accent)",
+            caretColor: "var(--color-accent, #7f6df2)",
           },
           // v0.6.0: cursor — 2px and tinted with the theme accent so it's
           // legible against both light and dark backgrounds. CM6's default
           // blink (~1.2s) is fine; we don't override it.
           ".cm-cursor, .cm-dropCursor": {
-            borderLeftColor: "var(--color-accent)",
+            borderLeftColor: "var(--color-accent, #7f6df2)",
             borderLeftWidth: "2px",
           },
           ".cm-activeLine": {
