@@ -61,3 +61,56 @@
 .halfday-rune-warning {
   color: var(--text-error);
 }
+
+/* v0.6.1: inline live-preview decorations for AgeFileView.
+ *
+ * Heading classes are applied via Decoration.line — they style the whole
+ * heading line (including the now-hidden `# ` prefix span). Sizes ride
+ * Obsidian's --h1-size..--h6-size vars so community themes get a vote;
+ * em-based fallbacks match the old halfdayMarkdownHighlight defaults
+ * exactly so the visual change is purely additive. */
+.halfday-age-editor .cm-line.halfday-md-h1 {
+  font-size: var(--h1-size, 1.7em);
+  font-weight: var(--h1-weight, 700);
+  line-height: var(--h1-line-height, 1.2);
+}
+.halfday-age-editor .cm-line.halfday-md-h2 {
+  font-size: var(--h2-size, 1.45em);
+  font-weight: var(--h2-weight, 700);
+  line-height: var(--h2-line-height, 1.2);
+}
+.halfday-age-editor .cm-line.halfday-md-h3 {
+  font-size: var(--h3-size, 1.25em);
+  font-weight: var(--h3-weight, 700);
+  line-height: var(--h3-line-height, 1.3);
+}
+.halfday-age-editor .cm-line.halfday-md-h4 {
+  font-size: var(--h4-size, 1.1em);
+  font-weight: var(--h4-weight, 700);
+}
+.halfday-age-editor .cm-line.halfday-md-h5 {
+  font-size: var(--h5-size, 1.05em);
+  font-weight: var(--h5-weight, 700);
+}
+.halfday-age-editor .cm-line.halfday-md-h6 {
+  font-weight: var(--h6-weight, 700);
+}
+
+/* Bold + italic — mark decorations, so these style the inner range. */
+.halfday-age-editor .halfday-md-strong {
+  font-weight: var(--bold-weight, 700);
+}
+.halfday-age-editor .halfday-md-emphasis {
+  font-style: italic;
+}
+
+/* Inline-code chip — mark decoration; the surrounding backticks are hidden
+ * via a separate replace decoration when the cursor is off the span. We
+ * trim the inner spacing a hair so the chip sits inline with prose. */
+.halfday-age-editor .halfday-md-inline-code {
+  background: var(--code-background, rgba(135, 131, 120, 0.15));
+  font-family: var(--font-monospace, monospace);
+  font-size: 0.875em;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
