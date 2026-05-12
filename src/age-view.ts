@@ -64,14 +64,26 @@ const AUTOSAVE_DELAY_MS = 30_000;
  * Custom highlight style for constructs we haven't replaced with proper
  * decorations yet.
  *
- * v0.6.1 (this pass): headings, strong, emphasis, and monospace rules were
- * REMOVED from here. They're now handled by halfdayInlineDecorations in
+ * v0.6.2 (this pass): `tags.list` and `tags.monospace` REMOVED.
+ *   - `tags.list` was the source of the bright purple list-marker bug —
+ *     lists.ts now repaints ListMark ranges in `--text-muted` via the
+ *     `.halfday-md-list-marker` class.
+ *   - `tags.monospace` was the v0.6.1 fenced-code fallback; code-block.ts
+ *     now renders fenced blocks as a proper chip with
+ *     `--background-secondary` background and a per-line decoration set.
+ *
+ * v0.6.1: headings, strong, emphasis, and monospace rules were REMOVED
+ * here (well, monospace was re-added as a fenced-code fallback and is
+ * now gone for real). They're handled by halfdayInlineDecorations in
  * src/decorations/ — which gives them live-preview semantics (size +
  * weight on the line, and hide-syntax-on-cursor-leave) instead of just
- * applying token colors. The rules below stay because v0.6.1 only
- * decorates headings + emphasis + inline-code; strikethrough, links,
- * urls, quotes, and lists keep their highlight-style treatment until the
- * v0.6.2 block-decoration pass replaces them.
+ * applying token colors.
+ *
+ * What's still here:
+ *   - tags.strikethrough — no dedicated decoration yet
+ *   - tags.link / tags.url — defense-in-depth alongside the link
+ *     decoration; covers bare URLs not inside Link nodes too
+ *   - tags.quote — no dedicated decoration yet
  *
  * v0.6.0: heading sizes used to ride Obsidian's `--h1-size`..`--h6-size`
  * variables here; that's now done in styles.css via the
@@ -89,15 +101,6 @@ const halfdayMarkdownHighlight = HighlightStyle.define([
   },
   { tag: tags.url, color: "var(--color-accent)" },
   { tag: tags.quote, color: "var(--text-muted)", fontStyle: "italic" },
-  { tag: tags.list, color: "var(--color-accent)" },
-  // v0.6.1 monospace fallback: `tags.monospace` in @codemirror/lang-markdown
-  // covers BOTH InlineCode (handled by halfdayInlineDecorations) AND
-  // FencedCode (NOT yet handled — v0.6.2 will add a proper chip-style
-  // code-block decoration). Re-add a minimal monospace rule so fenced
-  // blocks at least look like code in v0.6.1. No color or background —
-  // those would step on the inline-code decoration's chip styling.
-  // Removed entirely once v0.6.2's code-block decoration ships.
-  { tag: tags.monospace, fontFamily: "var(--font-monospace, monospace)" },
 ]);
 
 /**
@@ -290,15 +293,19 @@ export class AgeFileView extends FileView {
         // show them; ours shouldn't either.
         highlightActiveLine(),
         markdown(),
-        // v0.6.1: inline decorations (headings, emphasis, inline code).
-        // These render the rich live-preview semantics — heading sizes
-        // on lines, bold/italic styling, code chips — and hide their
-        // syntax markers when the cursor isn't on the span. Composed
-        // before syntaxHighlighting so any tokens the decorations don't
-        // touch still pick up default colors as a fallback.
+        // v0.6.2: full halfday decoration stack — headings, emphasis,
+        // inline-code, links, lists, fenced code blocks, wikilinks. Despite
+        // the name (kept for back-compat with v0.6.1), this now composes
+        // both inline AND block decorations. Each module owns its own
+        // ViewPlugin + DecorationSet; CM6 layers them in the rendered
+        // output. Composed before syntaxHighlighting so any tokens the
+        // decorations don't touch still pick up default colors as a
+        // fallback.
         ...halfdayInlineDecorations(),
-        // remaining tag-based styling (strikethrough, links, urls, quotes,
-        // lists) — v0.6.2 will replace these with proper block decorations
+        // remaining tag-based styling — strikethrough, links/urls (defense-
+        // in-depth alongside the link decoration; also covers bare URLs
+        // outside Link nodes), and quotes. tags.list + tags.monospace were
+        // removed in v0.6.2 — lists.ts and code-block.ts handle them.
         syntaxHighlighting(halfdayMarkdownHighlight),
         syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
         // cmd-S handler is *also* registered at the CM6 layer as a backup;
