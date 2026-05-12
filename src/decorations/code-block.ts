@@ -7,11 +7,21 @@
  *   - `--font-monospace` font
  *   - Padded, with rounded corners (first line: top corners; last line:
  *     bottom corners)
- *   - When the cursor is NOT inside the block, the fence lines (the
- *     `` ``` `` open and close, plus the optional language tag on the open
- *     fence) are hidden via a block-level replace so the visible content is
- *     just the code itself. When the cursor enters the block, the fences
- *     re-appear for editing.
+ *
+ * Fence lines stay visible — i.e. the user always sees the opening
+ * `` ``` `` (+ optional language tag) and the closing `` ``` ``. v0.6.2
+ * originally hid fence lines via a block-level `Decoration.replace
+ * ({ block: true })` and revealed them when the cursor entered the block,
+ * mirroring Obsidian's own live preview. That behaviour interacted badly
+ * with incremental lezer reparses during edits — backspace at the fence
+ * boundary could leave stale block-replace ranges pointing at the wrong
+ * lines briefly, which surfaced as ghost characters and shifted content
+ * after a keystroke. The hide-on-cursor-leave behaviour is removed in
+ * this milestone; the chip is still distinct enough visually that the
+ * fences read as part of the chip rather than as foreign syntax. Hide-
+ * on-cursor-leave can come back in a later milestone with a cleaner
+ * implementation (e.g. `atomicRanges` rather than block replaces), and
+ * the visual loss in the meantime is small.
  *
  * NO syntax highlighting inside — phase 2 problem. The class hooks are
  * stable so that pass can layer a highlighter without re-walking the tree.
@@ -41,40 +51,40 @@ import {
 const CODE_BLOCK_CLASS = "halfday-md-code-block";
 const CODE_BLOCK_FIRST_CLASS = "halfday-md-code-block-first";
 const CODE_BLOCK_LAST_CLASS = "halfday-md-code-block-last";
-/** Block-level replace that collapses an entire fence line when cursor is off. */
-const HIDE_FENCE_LINE = Decoration.replace({ block: true });
 
 interface PendingDeco {
   from: number;
   to: number;
   /**
-   * CM6's RangeSetBuilder requires non-decreasing (from, startSide). Line
-   * decorations and block-replaces both default to startSide=-1, but we
-   * track it explicitly to keep the sort consistent with the other
-   * modules and to make order-at-same-position deterministic.
+   * CM6's RangeSetBuilder requires non-decreasing (from, startSide). All
+   * decorations emitted here are Decoration.line (startSide=-1), but we
+   * track the field explicitly to keep the sort consistent with the other
+   * modules in this directory and to make order-at-same-position
+   * deterministic.
    */
   startSide: number;
   deco: Decoration;
 }
 
 /**
- * Pure builder over an EditorState + cursor position + walk ranges.
+ * Pure builder over an EditorState + walk ranges. The signature still
+ * accepts `cursorPos` for symmetry with sibling decoration modules — it
+ * is unused here because the chip rendering is cursor-independent now.
  *
  * For each FencedCode node:
  *   - Emit a Decoration.line on every line in the block with the base
  *     class. First line gets `-first`, last line gets `-last` so the CSS
  *     can round only the outer corners.
- *   - If the cursor is NOT inside the block, emit a block-level replace
- *     over each fence line (the one containing the opening CodeMark, and
- *     the one containing the closing CodeMark) so the fences collapse out
- *     of the visible flow.
  *
- * `cursorOnBlock` is the inclusive containment check used elsewhere in
- * this module set: `cursorPos >= node.from && cursorPos <= node.to`.
+ * Fence lines (open + close) are treated like any other line of the
+ * block — they get the chip background + monospace + horizontal padding,
+ * and the opening fence picks up `-first` while the closing fence picks
+ * up `-last`. They are NOT hidden. This is the v0.6.2 fix for the
+ * edit-time ghost-character bug; see the file header for context.
  */
 export function buildCodeBlockDecorationsFromState(
   state: EditorState,
-  cursorPos: number,
+  _cursorPos: number,
   ranges: readonly { from: number; to: number }[]
 ): DecorationSet {
   const pending: PendingDeco[] = [];
@@ -87,69 +97,17 @@ export function buildCodeBlockDecorationsFromState(
       enter: (node) => {
         if (node.type.name !== "FencedCode") return;
 
-        const blockFrom = node.from;
-        const blockTo = node.to;
-        const cursorOnBlock = cursorPos >= blockFrom && cursorPos <= blockTo;
-
         // Walk each line that lives entirely or partly inside the block,
         // from doc.lineAt(blockFrom) through doc.lineAt(blockTo). For a
         // typical 3-line fence (```\ncode\n```) that's three iterations.
-        const firstLineNo = doc.lineAt(blockFrom).number;
-        const lastLineNo = doc.lineAt(blockTo).number;
-
-        // Collect fence-line numbers (lines containing a CodeMark child)
-        // up front so we can both (a) decide whether to emit the block-
-        // level hide-replace, and (b) figure out which lines should carry
-        // the `-first` / `-last` rounded-corner classes in each cursor
-        // state. Walked from node.firstChild for the same robustness
-        // reason as the hide path: a degenerate (unclosed) block has only
-        // one CodeMark, and we shouldn't assume open/close from line
-        // bounds.
-        const fenceLineNumbers = new Set<number>();
-        {
-          let child = node.node.firstChild;
-          while (child) {
-            if (child.type.name === "CodeMark") {
-              fenceLineNumbers.add(doc.lineAt(child.from).number);
-            }
-            child = child.nextSibling;
-          }
-        }
-
-        // Determine the FIRST and LAST visible lines for `-first` / `-last`
-        // application. v0.6.2 QA caught the original bug: with cursor on
-        // the block (fences revealed), the open fence line got `-first`
-        // with padding-top, putting a 0.5em gap above the visible ``` —
-        // ugly. The comprehensive fix: when fences are hidden, walk past
-        // them to find the first/last interior line that's actually
-        // visible; when fences are revealed, the fence lines themselves
-        // are the outer edge, so they keep the rounded corners.
-        let firstVisibleLineNo = firstLineNo;
-        let lastVisibleLineNo = lastLineNo;
-        if (!cursorOnBlock) {
-          while (
-            firstVisibleLineNo <= lastLineNo &&
-            fenceLineNumbers.has(firstVisibleLineNo)
-          ) {
-            firstVisibleLineNo++;
-          }
-          while (
-            lastVisibleLineNo >= firstLineNo &&
-            fenceLineNumbers.has(lastVisibleLineNo)
-          ) {
-            lastVisibleLineNo--;
-          }
-        }
-        // Edge: a block with only fence lines and no interior content
-        // (e.g. an empty ```\n```), when cursor is off, leaves
-        // firstVisible > lastVisible — no -first / -last applied, which
-        // is fine because the block has no visible content to round.
+        const firstLineNo = doc.lineAt(node.from).number;
+        const lastLineNo = doc.lineAt(node.to).number;
 
         for (let n = firstLineNo; n <= lastLineNo; n++) {
           const line = doc.line(n);
           const classes = [CODE_BLOCK_CLASS];
-          if (n === firstVisibleLineNo) classes.push(CODE_BLOCK_FIRST_CLASS);
-          if (n === lastVisibleLineNo) classes.push(CODE_BLOCK_LAST_CLASS);
+          if (n === firstLineNo) classes.push(CODE_BLOCK_FIRST_CLASS);
+          if (n === lastLineNo) classes.push(CODE_BLOCK_LAST_CLASS);
           pending.push({
             from: line.from,
             to: line.from,
@@ -157,32 +115,13 @@ export function buildCodeBlockDecorationsFromState(
             deco: Decoration.line({ class: classes.join(" ") }),
           });
         }
-
-        // Hide each fence line (open + close) when cursor is off the block.
-        if (!cursorOnBlock) {
-          for (const fenceLineNo of fenceLineNumbers) {
-            const fenceLine = doc.line(fenceLineNo);
-            // Block-level replace from line start through line end+1
-            // (i.e. include the trailing newline) so the line collapses
-            // out of the visible flow. For the last line of the doc
-            // (no trailing newline) we clamp `to` at doc.length.
-            const replaceTo = Math.min(fenceLine.to + 1, doc.length);
-            pending.push({
-              from: fenceLine.from,
-              to: replaceTo,
-              startSide: -1, // Decoration.replace default
-              deco: HIDE_FENCE_LINE,
-            });
-          }
-        }
       },
     });
   }
 
   // Sort by (from asc, startSide asc, to desc). For this module everything
-  // emits at startSide=-1 (both Decoration.line and Decoration.replace),
-  // but the wider-first tiebreak still keeps block-replace ahead of any
-  // co-located line decoration so RangeSetBuilder is happy.
+  // emits at startSide=-1, but the consistent sort keeps the contract
+  // identical to sibling modules and makes the build deterministic.
   pending.sort(
     (a, b) =>
       a.from - b.from || a.startSide - b.startSide || b.to - a.to
@@ -205,10 +144,9 @@ function buildCodeBlockDecorations(view: EditorView): DecorationSet {
 /**
  * CM6 extension for fenced-code-block chip rendering.
  *
- * Note: this plugin owns block-level Decoration.replace ranges; we expose
- * them as a separate `decorations` provider so CM6 knows to handle
- * line-shifting correctly. Same pattern as the other modules — the
- * provider is the ViewPlugin's `decorations` field.
+ * As of v0.6.2 the build is cursor-independent (fences always visible),
+ * so we only rebuild on docChanged / viewportChanged — selectionSet no
+ * longer changes the output and triggering on it is wasted work.
  */
 export function codeBlockDecoration() {
   return ViewPlugin.fromClass(
@@ -220,11 +158,7 @@ export function codeBlockDecoration() {
       }
 
       update(update: ViewUpdate): void {
-        if (
-          update.docChanged ||
-          update.viewportChanged ||
-          update.selectionSet
-        ) {
+        if (update.docChanged || update.viewportChanged) {
           this.decorations = buildCodeBlockDecorations(update.view);
         }
       }

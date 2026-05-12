@@ -625,30 +625,30 @@ describe("codeBlockDecoration", () => {
     expect(middle).toHaveLength(1);
   });
 
-  it("hides fence lines via block-replace when cursor is off the block", () => {
-    // doc: prose\n```\ncode\n```
+  it("emits no block-replace decorations — fences stay visible regardless of cursor", () => {
+    // v0.6.2 used to hide fence lines via Decoration.replace({block: true})
+    // when the cursor was off the block, mirroring Obsidian's own live
+    // preview. That interacted badly with incremental lezer reparses at
+    // the fence boundary (backspace on the fence could surface stale
+    // hidden content as ghost characters in adjacent lines) so the
+    // hide-on-cursor-leave behaviour was removed in the v0.6.2 ship.
+    // Test pins the new contract: NO replace decorations are emitted
+    // in either cursor state. The chip styling still applies via
+    // Decoration.line; the fences read as part of the chip.
     const doc = "prose\n```\ncode\n```";
     const state = mkState(doc);
-    // cursor at the very start (offset 0) — on "prose", off the block
-    const set = buildCodeBlockDecorationsFromState(state, 0, FULL(state));
-    const blockReplaces = collect(set).filter(
+    // cursor off the block
+    const offSet = buildCodeBlockDecorationsFromState(state, 0, FULL(state));
+    const offReplaces = collect(offSet).filter(
       (d) => d.from !== d.to && d.spec?.class === undefined
     );
-    // two fence lines = two block-replaces (open + close)
-    expect(blockReplaces).toHaveLength(2);
-  });
-
-  it("reveals fence lines when cursor is inside the block", () => {
-    // doc: ```\ncode\n```
-    // FencedCode spans the whole doc here. Cursor inside the "code" line
-    // (offset 6) is on the block; fences should NOT be replaced.
-    const doc = "```\ncode\n```";
-    const state = mkState(doc);
-    const set = buildCodeBlockDecorationsFromState(state, 6, FULL(state));
-    const replaces = collect(set).filter(
+    expect(offReplaces).toHaveLength(0);
+    // cursor inside the block (on the "code" line, offset 12)
+    const onSet = buildCodeBlockDecorationsFromState(state, 12, FULL(state));
+    const onReplaces = collect(onSet).filter(
       (d) => d.from !== d.to && d.spec?.class === undefined
     );
-    expect(replaces).toHaveLength(0);
+    expect(onReplaces).toHaveLength(0);
   });
 
   it("decorates code blocks with a language tag (CodeInfo)", () => {
