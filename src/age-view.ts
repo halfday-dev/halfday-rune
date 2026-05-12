@@ -46,6 +46,7 @@ import {
   syntaxHighlighting,
 } from "@codemirror/language";
 import { markdown } from "@codemirror/lang-markdown";
+import { GFM } from "@lezer/markdown";
 import { tags } from "@lezer/highlight";
 import {
   decryptToString,
@@ -292,7 +293,13 @@ export class AgeFileView extends FileView {
         // v0.6.0: lineNumbers() removed. Obsidian's markdown views don't
         // show them; ours shouldn't either.
         highlightActiveLine(),
-        markdown(),
+        // GFM = Strikethrough + Table + TaskList + Autolink. The default
+        // markdown() is CommonMark-only, which means `~~strike~~` never
+        // emits a strikethrough tag and the halfdayMarkdownHighlight rule
+        // for tags.strikethrough above never fires. Enabling GFM unlocks
+        // it (plus tables, task lists, and autolinks). All four are part
+        // of what feels like "obsidian-flavored" markdown to users.
+        markdown({ extensions: GFM }),
         // v0.6.2: full halfday decoration stack — headings, emphasis,
         // inline-code, links, lists, fenced code blocks, wikilinks. Despite
         // the name (kept for back-compat with v0.6.1), this now composes
