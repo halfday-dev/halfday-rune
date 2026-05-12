@@ -19,16 +19,22 @@ import { EditorState, Extension } from "@codemirror/state";
 import { markdown } from "@codemirror/lang-markdown";
 import { Decoration, DecorationSet } from "@codemirror/view";
 import {
+  codeBlockDecoration,
   emphasisDecoration,
   halfdayInlineDecorations,
   headingsDecoration,
   inlineCodeDecoration,
   linksDecoration,
+  listsDecoration,
+  wikilinksDecoration,
 } from "../src/decorations";
 import { buildHeadingDecorationsFromState } from "../src/decorations/headings";
 import { buildEmphasisDecorationsFromState } from "../src/decorations/emphasis";
 import { buildInlineCodeDecorationsFromState } from "../src/decorations/inline-code";
 import { buildLinksDecorationsFromState } from "../src/decorations/links";
+import { buildListsDecorationsFromState } from "../src/decorations/lists";
+import { buildCodeBlockDecorationsFromState } from "../src/decorations/code-block";
+import { buildWikilinksDecorationsFromState } from "../src/decorations/wikilinks";
 
 interface Span {
   from: number;
@@ -440,10 +446,39 @@ describe("extension factories integrate into an EditorState", () => {
     ).not.toThrow();
   });
 
-  it("halfdayInlineDecorations() returns a 4-element extension list", () => {
+  it("listsDecoration() returns an extension EditorState accepts", () => {
+    expect(() =>
+      EditorState.create({
+        doc: "- one\n- two\n- three",
+        extensions: [markdown(), listsDecoration()],
+      })
+    ).not.toThrow();
+  });
+
+  it("codeBlockDecoration() returns an extension EditorState accepts", () => {
+    expect(() =>
+      EditorState.create({
+        doc: "```ts\nconst x = 1;\n```",
+        extensions: [markdown(), codeBlockDecoration()],
+      })
+    ).not.toThrow();
+  });
+
+  it("wikilinksDecoration() returns an extension EditorState accepts", () => {
+    expect(() =>
+      EditorState.create({
+        doc: "see [[wiki]]",
+        extensions: [markdown(), wikilinksDecoration()],
+      })
+    ).not.toThrow();
+  });
+
+  it("halfdayInlineDecorations() returns a 7-element extension list", () => {
+    // v0.6.2: grew from 4 (headings/emphasis/inline-code/links) to 7 with
+    // the addition of lists, code-block, and wikilinks.
     const ext = halfdayInlineDecorations();
     expect(Array.isArray(ext)).toBe(true);
-    expect(ext).toHaveLength(4);
+    expect(ext).toHaveLength(7);
   });
 
   it("halfdayInlineDecorations() composes into an EditorState with mixed content", () => {
@@ -453,6 +488,323 @@ describe("extension factories integrate into an EditorState", () => {
         extensions: [markdown(), ...halfdayInlineDecorations()],
       })
     ).not.toThrow();
+  });
+
+  it("halfdayInlineDecorations() composes with v0.6.2 constructs (lists, code blocks, wikilinks)", () => {
+    expect(() =>
+      EditorState.create({
+        doc: "- one\n- two\n\n```ts\nconst x = 1;\n```\n\nsee [[wiki]] and [link](https://x.y)",
+        extensions: [markdown(), ...halfdayInlineDecorations()],
+      })
+    ).not.toThrow();
+  });
+});
+
+describe("listsDecoration", () => {
+  it("emits a .halfday-md-list-marker mark over the `-` of a bullet item", () => {
+    // doc:    "- one"
+    // offsets: 01234
+    // ListMark is "-" at offset 0..1
+    const doc = "- one";
+    const state = mkState(doc);
+    const set = buildListsDecorationsFromState(state, 0, FULL(state));
+    const marks = collect(set).filter(
+      (d) => d.spec?.class === "halfday-md-list-marker"
+    );
+    expect(marks).toHaveLength(1);
+    expect(marks[0].from).toBe(0);
+    expect(marks[0].to).toBe(1);
+  });
+
+  it("decorates every item in an unordered list", () => {
+    const doc = "- one\n- two\n- three";
+    const state = mkState(doc);
+    const set = buildListsDecorationsFromState(state, 0, FULL(state));
+    const marks = collect(set).filter(
+      (d) => d.spec?.class === "halfday-md-list-marker"
+    );
+    expect(marks).toHaveLength(3);
+  });
+
+  it("decorates every item in an ordered list", () => {
+    // ordered list markers include the digit + dot: "1.", "2.", "3."
+    const doc = "1. one\n2. two\n3. three";
+    const state = mkState(doc);
+    const set = buildListsDecorationsFromState(state, 0, FULL(state));
+    const marks = collect(set).filter(
+      (d) => d.spec?.class === "halfday-md-list-marker"
+    );
+    expect(marks).toHaveLength(3);
+    // first marker covers "1." — offsets 0..2
+    expect(marks[0].from).toBe(0);
+    expect(marks[0].to).toBe(2);
+  });
+
+  it("emits markers regardless of cursor position (always visible)", () => {
+    // Lists are NOT hide-on-cursor-leave; markers stay visible whether the
+    // cursor is on the list or far away.
+    const doc = "- one\nbody";
+    const state = mkState(doc);
+    const onItem = buildListsDecorationsFromState(state, 2, FULL(state));
+    const offItem = buildListsDecorationsFromState(state, doc.length, FULL(state));
+    const onCount = collect(onItem).filter(
+      (d) => d.spec?.class === "halfday-md-list-marker"
+    ).length;
+    const offCount = collect(offItem).filter(
+      (d) => d.spec?.class === "halfday-md-list-marker"
+    ).length;
+    expect(onCount).toBe(offCount);
+    expect(onCount).toBe(1);
+  });
+
+  it("is a no-op for an empty document", () => {
+    const state = mkState("");
+    const set = buildListsDecorationsFromState(state, 0, FULL(state));
+    expect(collect(set)).toEqual([]);
+  });
+
+  it("is a no-op for plain prose with no list markers", () => {
+    const state = mkState("just a paragraph with no list at all");
+    const set = buildListsDecorationsFromState(state, 0, FULL(state));
+    expect(collect(set)).toEqual([]);
+  });
+
+  it("does not emit hide-syntax replace decorations (markers stay visible)", () => {
+    const doc = "- one\n- two";
+    const state = mkState(doc);
+    const set = buildListsDecorationsFromState(state, doc.length, FULL(state));
+    const replaces = collect(set).filter(
+      (d) => d.from !== d.to && d.spec?.class === undefined
+    );
+    expect(replaces).toHaveLength(0);
+  });
+});
+
+describe("codeBlockDecoration", () => {
+  it("emits per-line decorations for a 3-line fenced code block", () => {
+    const doc = "```\ncode\n```";
+    const state = mkState(doc);
+    // cursor at start — well, start is offset 0 which is on the block.
+    // To test line emission we just need the line decorations themselves;
+    // cursor position is orthogonal.
+    const set = buildCodeBlockDecorationsFromState(state, 0, FULL(state));
+    const lineDecos = collect(set).filter(
+      (d) =>
+        d.from === d.to &&
+        typeof d.spec?.class === "string" &&
+        d.spec.class.includes("halfday-md-code-block")
+    );
+    // three lines in the block
+    expect(lineDecos).toHaveLength(3);
+  });
+
+  it("applies -first and -last classes only to the outer lines", () => {
+    const doc = "```\ncode\n```";
+    const state = mkState(doc);
+    const set = buildCodeBlockDecorationsFromState(state, 0, FULL(state));
+    const lineDecos = collect(set).filter(
+      (d) =>
+        d.from === d.to &&
+        typeof d.spec?.class === "string" &&
+        d.spec.class.includes("halfday-md-code-block")
+    );
+    const firsts = lineDecos.filter((d) =>
+      (d.spec.class as string).includes("halfday-md-code-block-first")
+    );
+    const lasts = lineDecos.filter((d) =>
+      (d.spec.class as string).includes("halfday-md-code-block-last")
+    );
+    expect(firsts).toHaveLength(1);
+    expect(lasts).toHaveLength(1);
+    // the middle line has only the base class
+    const middle = lineDecos.filter(
+      (d) =>
+        !(d.spec.class as string).includes("halfday-md-code-block-first") &&
+        !(d.spec.class as string).includes("halfday-md-code-block-last")
+    );
+    expect(middle).toHaveLength(1);
+  });
+
+  it("hides fence lines via block-replace when cursor is off the block", () => {
+    // doc: prose\n```\ncode\n```
+    const doc = "prose\n```\ncode\n```";
+    const state = mkState(doc);
+    // cursor at the very start (offset 0) — on "prose", off the block
+    const set = buildCodeBlockDecorationsFromState(state, 0, FULL(state));
+    const blockReplaces = collect(set).filter(
+      (d) => d.from !== d.to && d.spec?.class === undefined
+    );
+    // two fence lines = two block-replaces (open + close)
+    expect(blockReplaces).toHaveLength(2);
+  });
+
+  it("reveals fence lines when cursor is inside the block", () => {
+    // doc: ```\ncode\n```
+    // FencedCode spans the whole doc here. Cursor inside the "code" line
+    // (offset 6) is on the block; fences should NOT be replaced.
+    const doc = "```\ncode\n```";
+    const state = mkState(doc);
+    const set = buildCodeBlockDecorationsFromState(state, 6, FULL(state));
+    const replaces = collect(set).filter(
+      (d) => d.from !== d.to && d.spec?.class === undefined
+    );
+    expect(replaces).toHaveLength(0);
+  });
+
+  it("decorates code blocks with a language tag (CodeInfo)", () => {
+    // doc: ```ts\nconst x = 1;\n```
+    // The language tag lives on the opening fence line; the line decoration
+    // covers that whole line regardless.
+    const doc = "```ts\nconst x = 1;\n```";
+    const state = mkState(doc);
+    const set = buildCodeBlockDecorationsFromState(state, 0, FULL(state));
+    const lineDecos = collect(set).filter(
+      (d) =>
+        d.from === d.to &&
+        typeof d.spec?.class === "string" &&
+        d.spec.class.includes("halfday-md-code-block")
+    );
+    expect(lineDecos).toHaveLength(3);
+  });
+
+  it("is a no-op for an empty document", () => {
+    const state = mkState("");
+    const set = buildCodeBlockDecorationsFromState(state, 0, FULL(state));
+    expect(collect(set)).toEqual([]);
+  });
+
+  it("is a no-op for prose with no fenced code blocks", () => {
+    const state = mkState("just a paragraph\nno backticks here");
+    const set = buildCodeBlockDecorationsFromState(state, 0, FULL(state));
+    expect(collect(set)).toEqual([]);
+  });
+
+  it("decorates multiple fenced blocks independently", () => {
+    // two blocks, separated by a blank line
+    const doc = "```\na\n```\n\n```\nb\n```";
+    const state = mkState(doc);
+    const set = buildCodeBlockDecorationsFromState(state, 0, FULL(state));
+    const lineDecos = collect(set).filter(
+      (d) =>
+        d.from === d.to &&
+        typeof d.spec?.class === "string" &&
+        d.spec.class.includes("halfday-md-code-block")
+    );
+    // 3 lines per block × 2 blocks = 6
+    expect(lineDecos).toHaveLength(6);
+  });
+});
+
+describe("wikilinksDecoration", () => {
+  it("emits a .halfday-md-wikilink mark over the anchor text of `[[wiki]]`", () => {
+    // doc:     see [[wiki]] end
+    // offsets: 0123456789012345
+    // span 4..12, anchor "wiki" 6..10
+    const doc = "see [[wiki]] end";
+    const state = mkState(doc);
+    // cursor at offset 0 — off the span
+    const set = buildWikilinksDecorationsFromState(state, 0, FULL(state));
+    const marks = collect(set).filter(
+      (d) => d.spec?.class === "halfday-md-wikilink"
+    );
+    expect(marks).toHaveLength(1);
+    expect(marks[0].from).toBe(6);
+    expect(marks[0].to).toBe(10);
+  });
+
+  it("hides `[[` and `]]` when cursor is off the span", () => {
+    const doc = "see [[wiki]] end";
+    const state = mkState(doc);
+    const set = buildWikilinksDecorationsFromState(state, 0, FULL(state));
+    const replaces = collect(set).filter(
+      (d) => d.from !== d.to && d.spec?.class !== "halfday-md-wikilink"
+    );
+    // two hide ranges: leading "[[" and trailing "]]"
+    expect(replaces).toHaveLength(2);
+  });
+
+  it("reveals `[[` and `]]` when cursor is on the span", () => {
+    const doc = "see [[wiki]] end";
+    const state = mkState(doc);
+    // cursor inside the anchor "wiki" at offset 8
+    const set = buildWikilinksDecorationsFromState(state, 8, FULL(state));
+    const replaces = collect(set).filter(
+      (d) => d.from !== d.to && d.spec?.class !== "halfday-md-wikilink"
+    );
+    expect(replaces).toHaveLength(0);
+    // the anchor-text mark still fires
+    const marks = collect(set).filter(
+      (d) => d.spec?.class === "halfday-md-wikilink"
+    );
+    expect(marks).toHaveLength(1);
+  });
+
+  it("decorates multiple wikilinks independently", () => {
+    // doc:     [[a]] and [[b]]
+    // offsets: 0123456789012345
+    // [[a]] spans 0..5, anchor "a" at 2..3
+    // [[b]] spans 10..15, anchor "b" at 12..13
+    const doc = "[[a]] and [[b]]";
+    const state = mkState(doc);
+    // cursor at offset 2 — on the first wikilink
+    const set = buildWikilinksDecorationsFromState(state, 2, FULL(state));
+    const marks = collect(set).filter(
+      (d) => d.spec?.class === "halfday-md-wikilink"
+    );
+    expect(marks).toHaveLength(2);
+    // first wikilink revealed, second hidden — 2 hide ranges (only on link 2)
+    const replaces = collect(set).filter(
+      (d) => d.from !== d.to && d.spec?.class !== "halfday-md-wikilink"
+    );
+    expect(replaces).toHaveLength(2);
+    expect(replaces.every((r) => r.from >= 10 && r.to <= 15)).toBe(true);
+  });
+
+  it("does NOT conflict with standard `[regular](link)` syntax", () => {
+    // wikilinks regex must not match regular markdown links. The links
+    // module already skips wikilinks via the lezer shape check (no URL
+    // child); this test confirms the wikilinks module ignores standard
+    // links in turn.
+    const doc = "see [regular](https://example.com) and [[wiki]]";
+    const state = mkState(doc);
+    const set = buildWikilinksDecorationsFromState(state, 0, FULL(state));
+    const marks = collect(set).filter(
+      (d) => d.spec?.class === "halfday-md-wikilink"
+    );
+    // only the wikilink should be marked, not the regular link
+    expect(marks).toHaveLength(1);
+    // and its range should be inside the "[[wiki]]" — anchor "wiki" at
+    // offsets 41..45 in this doc.
+    expect(marks[0].from).toBe(41);
+    expect(marks[0].to).toBe(45);
+  });
+
+  it("is a no-op for an empty document", () => {
+    const state = mkState("");
+    const set = buildWikilinksDecorationsFromState(state, 0, FULL(state));
+    expect(collect(set)).toEqual([]);
+  });
+
+  it("is a no-op for plain prose with no wikilinks", () => {
+    const state = mkState("just a paragraph with no [[wiki]]links here, kidding");
+    // (the doc above DOES contain [[wiki]] — let's make sure it really
+    // doesn't by using a clean string.)
+    const cleanState = mkState("just a paragraph with no wikilinks here");
+    const set = buildWikilinksDecorationsFromState(cleanState, 0, FULL(cleanState));
+    expect(collect(set)).toEqual([]);
+  });
+
+  it("does not match wikilink-shaped spans that cross newlines", () => {
+    // The regex negates \n inside the anchor, so a literal `[[foo\nbar]]`
+    // should NOT match. This is the guard that keeps a doc with unmatched
+    // brackets across lines from collapsing into one wide span.
+    const doc = "[[foo\nbar]]";
+    const state = mkState(doc);
+    const set = buildWikilinksDecorationsFromState(state, 0, FULL(state));
+    const marks = collect(set).filter(
+      (d) => d.spec?.class === "halfday-md-wikilink"
+    );
+    expect(marks).toHaveLength(0);
   });
 });
 
@@ -488,6 +840,42 @@ describe("cross-construct nesting", () => {
     // code mark covers `` `code` `` including backticks — offsets 7..13
     expect(codeMarks[0].from).toBe(7);
     expect(codeMarks[0].to).toBe(13);
+  });
+
+  it("`**bold with `code` and [link](url) and [[wiki]]**` fires every relevant decoration", () => {
+    // The v0.6.2 cross-construct smoke: one doc, every decoration module
+    // that can plausibly fire over it should fire. We check that the
+    // outer strong span, the inner inline-code chip, the inner link
+    // anchor, and the inner wikilink anchor all emit their marks. No
+    // assertion on hide-state — we just want to confirm the decorators
+    // don't trip over each other when stacked.
+    const doc = "**bold with `code` and [link](url) and [[wiki]]**";
+    const state = mkState(doc);
+    // cursor at offset 2 — inside the strong span, off the link/wikilink/code
+    const emphasisSet = buildEmphasisDecorationsFromState(state, 2, FULL(state));
+    const codeSet = buildInlineCodeDecorationsFromState(state, 2, FULL(state));
+    const linkSet = buildLinksDecorationsFromState(state, 2, FULL(state));
+    const wikiSet = buildWikilinksDecorationsFromState(state, 2, FULL(state));
+
+    const strongMarks = collect(emphasisSet).filter(
+      (d) => d.spec?.class === "halfday-md-strong"
+    );
+    expect(strongMarks).toHaveLength(1);
+
+    const codeMarks = collect(codeSet).filter(
+      (d) => d.spec?.class === "halfday-md-inline-code"
+    );
+    expect(codeMarks).toHaveLength(1);
+
+    const linkMarks = collect(linkSet).filter(
+      (d) => d.spec?.class === "halfday-md-link"
+    );
+    expect(linkMarks).toHaveLength(1);
+
+    const wikiMarks = collect(wikiSet).filter(
+      (d) => d.spec?.class === "halfday-md-wikilink"
+    );
+    expect(wikiMarks).toHaveLength(1);
   });
 
   it("`**bold [link](url)**` produces both the strong mark and the link mark", () => {
