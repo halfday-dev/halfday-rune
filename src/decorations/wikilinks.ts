@@ -24,10 +24,14 @@
  * decorations do.
  *
  * The regex `/\[\[([^\[\]\n]+?)\]\]/g`:
- *   - Negates `[` and `]` inside the anchor so `[[[[foo]]]]` doesn't
- *     match as one giant span — only the inner `[[foo]]` would, but the
- *     outer brackets aren't a wikilink either, so the whole construct is
- *     correctly rejected.
+ *   - Negates `[` and `]` inside the anchor so a string like `[[foo]bar]]`
+ *     doesn't get glued together into one anchor span. Note this is NOT a
+ *     full rejection of nested brackets: `[[[[foo]]]]` produces ONE match
+ *     against the inner `[[foo]]` — the outer `[[` and `]]` stay as raw
+ *     visible characters around the decorated span. That's acceptable
+ *     for v0.6.2 (the pathological inputs that produce it are rare and
+ *     read as obvious typos), and a stricter regex with lookbehind would
+ *     trade clarity for very little user-facing benefit.
  *   - Negates `\n` so wikilink syntax never spans newlines.
  *   - `+?` (non-greedy) so adjacent wikilinks `[[a]][[b]]` parse as two
  *     separate matches rather than one wide match.

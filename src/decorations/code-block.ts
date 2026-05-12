@@ -97,11 +97,59 @@ export function buildCodeBlockDecorationsFromState(
         const firstLineNo = doc.lineAt(blockFrom).number;
         const lastLineNo = doc.lineAt(blockTo).number;
 
+        // Collect fence-line numbers (lines containing a CodeMark child)
+        // up front so we can both (a) decide whether to emit the block-
+        // level hide-replace, and (b) figure out which lines should carry
+        // the `-first` / `-last` rounded-corner classes in each cursor
+        // state. Walked from node.firstChild for the same robustness
+        // reason as the hide path: a degenerate (unclosed) block has only
+        // one CodeMark, and we shouldn't assume open/close from line
+        // bounds.
+        const fenceLineNumbers = new Set<number>();
+        {
+          let child = node.node.firstChild;
+          while (child) {
+            if (child.type.name === "CodeMark") {
+              fenceLineNumbers.add(doc.lineAt(child.from).number);
+            }
+            child = child.nextSibling;
+          }
+        }
+
+        // Determine the FIRST and LAST visible lines for `-first` / `-last`
+        // application. v0.6.2 QA caught the original bug: with cursor on
+        // the block (fences revealed), the open fence line got `-first`
+        // with padding-top, putting a 0.5em gap above the visible ``` —
+        // ugly. The comprehensive fix: when fences are hidden, walk past
+        // them to find the first/last interior line that's actually
+        // visible; when fences are revealed, the fence lines themselves
+        // are the outer edge, so they keep the rounded corners.
+        let firstVisibleLineNo = firstLineNo;
+        let lastVisibleLineNo = lastLineNo;
+        if (!cursorOnBlock) {
+          while (
+            firstVisibleLineNo <= lastLineNo &&
+            fenceLineNumbers.has(firstVisibleLineNo)
+          ) {
+            firstVisibleLineNo++;
+          }
+          while (
+            lastVisibleLineNo >= firstLineNo &&
+            fenceLineNumbers.has(lastVisibleLineNo)
+          ) {
+            lastVisibleLineNo--;
+          }
+        }
+        // Edge: a block with only fence lines and no interior content
+        // (e.g. an empty ```\n```), when cursor is off, leaves
+        // firstVisible > lastVisible — no -first / -last applied, which
+        // is fine because the block has no visible content to round.
+
         for (let n = firstLineNo; n <= lastLineNo; n++) {
           const line = doc.line(n);
           const classes = [CODE_BLOCK_CLASS];
-          if (n === firstLineNo) classes.push(CODE_BLOCK_FIRST_CLASS);
-          if (n === lastLineNo) classes.push(CODE_BLOCK_LAST_CLASS);
+          if (n === firstVisibleLineNo) classes.push(CODE_BLOCK_FIRST_CLASS);
+          if (n === lastVisibleLineNo) classes.push(CODE_BLOCK_LAST_CLASS);
           pending.push({
             from: line.from,
             to: line.from,
@@ -111,28 +159,20 @@ export function buildCodeBlockDecorationsFromState(
         }
 
         // Hide each fence line (open + close) when cursor is off the block.
-        // The fence lines are the ones that contain a CodeMark child. We
-        // collect the CodeMark children rather than assuming first/last
-        // line, because a degenerate block could have only one fence (an
-        // unclosed block at the end of the doc).
         if (!cursorOnBlock) {
-          let child = node.node.firstChild;
-          while (child) {
-            if (child.type.name === "CodeMark") {
-              const fenceLine = doc.lineAt(child.from);
-              // Block-level replace from line start through line end+1
-              // (i.e. include the trailing newline) so the line collapses
-              // out of the visible flow. For the last line of the doc
-              // (no trailing newline) we clamp `to` at doc.length.
-              const replaceTo = Math.min(fenceLine.to + 1, doc.length);
-              pending.push({
-                from: fenceLine.from,
-                to: replaceTo,
-                startSide: -1, // Decoration.replace default
-                deco: HIDE_FENCE_LINE,
-              });
-            }
-            child = child.nextSibling;
+          for (const fenceLineNo of fenceLineNumbers) {
+            const fenceLine = doc.line(fenceLineNo);
+            // Block-level replace from line start through line end+1
+            // (i.e. include the trailing newline) so the line collapses
+            // out of the visible flow. For the last line of the doc
+            // (no trailing newline) we clamp `to` at doc.length.
+            const replaceTo = Math.min(fenceLine.to + 1, doc.length);
+            pending.push({
+              from: fenceLine.from,
+              to: replaceTo,
+              startSide: -1, // Decoration.replace default
+              deco: HIDE_FENCE_LINE,
+            });
           }
         }
       },
