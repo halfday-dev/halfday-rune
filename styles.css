@@ -124,3 +124,51 @@
   color: var(--color-accent, #7f6df2);
   text-decoration: underline;
 }
+
+/* v0.6.2: list-marker repaint.
+ *
+ * Mark decoration over each ListMark (the literal `-`, `*`, `+`, `1.`).
+ * Replaces the bright `var(--color-accent)` paint the old
+ * halfdayMarkdownHighlight `tags.list` rule applied. We use --text-muted to
+ * match Obsidian's native list bullet color — a quieter neutral that lets
+ * the list content carry the visual weight. */
+.halfday-age-editor .halfday-md-list-marker {
+  color: var(--text-muted);
+}
+
+/* v0.6.2: fenced code-block chip.
+ *
+ * Line decorations applied to every line of a FencedCode node. The base
+ * class paints the background + monospace font + horizontal padding; the
+ * -first / -last variants round only the outer corners and add the top /
+ * bottom padding so the chip reads as one block rather than three stacked
+ * lines. The fence lines themselves are hidden via a block-level
+ * Decoration.replace when the cursor is off the block — see
+ * code-block.ts. No syntax highlighting inside (phase 2). */
+.halfday-age-editor .cm-line.halfday-md-code-block {
+  background: var(--background-secondary, #1a1a1a);
+  font-family: var(--font-monospace, monospace);
+  padding-left: 1em;
+  padding-right: 1em;
+}
+.halfday-age-editor .cm-line.halfday-md-code-block-first {
+  padding-top: 0.5em;
+  border-top-left-radius: 6px;
+  border-top-right-radius: 6px;
+}
+.halfday-age-editor .cm-line.halfday-md-code-block-last {
+  padding-bottom: 0.5em;
+  border-bottom-left-radius: 6px;
+  border-bottom-right-radius: 6px;
+}
+
+/* v0.6.2: `[[wikilink]]` decoration.
+ *
+ * Mark decoration over the anchor text between `[[` and `]]`. Same accent +
+ * underline as standard markdown links — wikilinks should read as link-y
+ * regardless of whether Obsidian's metadata cache would resolve them.
+ * Click-to-navigate is phase 2. */
+.halfday-age-editor .halfday-md-wikilink {
+  color: var(--color-accent, #7f6df2);
+  text-decoration: underline;
+}
