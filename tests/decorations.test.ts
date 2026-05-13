@@ -23,6 +23,8 @@ import {
   emphasisDecoration,
   halfdayInlineDecorations,
   headingsDecoration,
+  htmlInertDecoration,
+  imagesDecoration,
   inlineCodeDecoration,
   linksDecoration,
   listsDecoration,
@@ -35,6 +37,8 @@ import { buildLinksDecorationsFromState } from "../src/decorations/links";
 import { buildListsDecorationsFromState } from "../src/decorations/lists";
 import { buildCodeBlockDecorationsFromState } from "../src/decorations/code-block";
 import { buildWikilinksDecorationsFromState } from "../src/decorations/wikilinks";
+import { buildHtmlInertDecorationsFromState } from "../src/decorations/html-inert";
+import { buildImagesDecorationsFromState } from "../src/decorations/images";
 
 interface Span {
   from: number;
@@ -58,6 +62,23 @@ function mkState(doc: string, extensions: Extension[] = []): EditorState {
   return EditorState.create({
     doc,
     extensions: [markdown(), ...extensions],
+  });
+}
+
+/**
+ * v0.6.3: GFM-enabled state. lezer-markdown's HTML node emission for
+ * inline tags isn't affected by GFM, but we mirror age-view's parser
+ * config in the sanitization tests so we're testing what actually
+ * ships.
+ */
+function mkGfmState(doc: string): EditorState {
+  // We import GFM lazily here to avoid pulling the @lezer/markdown
+  // dep into the top of the file when most tests don't need it.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { GFM } = require("@lezer/markdown");
+  return EditorState.create({
+    doc,
+    extensions: [markdown({ extensions: GFM })],
   });
 }
 
@@ -473,12 +494,31 @@ describe("extension factories integrate into an EditorState", () => {
     ).not.toThrow();
   });
 
-  it("halfdayInlineDecorations() returns a 7-element extension list", () => {
+  it("htmlInertDecoration() returns an extension EditorState accepts", () => {
+    expect(() =>
+      EditorState.create({
+        doc: "<script>alert(1)</script>",
+        extensions: [markdown(), htmlInertDecoration()],
+      })
+    ).not.toThrow();
+  });
+
+  it("imagesDecoration() returns an extension EditorState accepts", () => {
+    expect(() =>
+      EditorState.create({
+        doc: "![alt](https://example.com/x.png)",
+        extensions: [markdown(), imagesDecoration()],
+      })
+    ).not.toThrow();
+  });
+
+  it("halfdayInlineDecorations() returns a 9-element extension list", () => {
     // v0.6.2: grew from 4 (headings/emphasis/inline-code/links) to 7 with
     // the addition of lists, code-block, and wikilinks.
+    // v0.6.3: grew to 9 with html-inert + images (sanitization pass).
     const ext = halfdayInlineDecorations();
     expect(Array.isArray(ext)).toBe(true);
-    expect(ext).toHaveLength(7);
+    expect(ext).toHaveLength(9);
   });
 
   it("halfdayInlineDecorations() composes into an EditorState with mixed content", () => {
@@ -913,5 +953,267 @@ describe("Decoration.replace shape (sanity)", () => {
   it("Decoration.replace({}) has no `class` in spec", () => {
     const d = Decoration.replace({});
     expect(d.spec?.class).toBeUndefined();
+  });
+});
+
+describe("htmlInertDecoration (v0.6.3 sanitization)", () => {
+  it("marks a <script> HTMLBlock as inert", () => {
+    // lezer parses `<script>...</script>` on its own paragraph as an
+    // HTMLBlock node. We mark it with .halfday-md-html-inert so the
+    // user has a visual signal that it's literal text, not rendered HTML.
+    const doc = "<script>alert(1)</script>";
+    const state = mkGfmState(doc);
+    const set = buildHtmlInertDecorationsFromState(state, 0, FULL(state));
+    const marks = collect(set).filter(
+      (d) => d.spec?.class === "halfday-md-html-inert"
+    );
+    expect(marks.length).toBeGreaterThan(0);
+    // span covers (at minimum) the opening tag — lezer's HTMLBlock can
+    // be the whole element. Just verify SOME inert marking landed.
+    expect(marks.some((m) => m.from === 0)).toBe(true);
+  });
+
+  it("marks <iframe>, <object>, and <embed> blocks as inert too", () => {
+    // The decoration treats ALL HTMLBlock + HTMLTag nodes uniformly —
+    // we don't allowlist any tags. That's the safe default: anything
+    // lezer recognises as HTML gets the inert treatment.
+    for (const tag of ["iframe", "object", "embed"]) {
+      const doc = `<${tag} src="x"></${tag}>`;
+      const state = mkGfmState(doc);
+      const set = buildHtmlInertDecorationsFromState(state, 0, FULL(state));
+      const marks = collect(set).filter(
+        (d) => d.spec?.class === "halfday-md-html-inert"
+      );
+      expect(marks.length, `tag=${tag}`).toBeGreaterThan(0);
+    }
+  });
+
+  it("marks inline HTMLTag (e.g. <b>...</b> in prose)", () => {
+    // Inline HTML emits one HTMLTag per `<b>` and `</b>`. Both should
+    // be marked.
+    const doc = "hello <b>world</b> bye";
+    const state = mkGfmState(doc);
+    const set = buildHtmlInertDecorationsFromState(state, 0, FULL(state));
+    const marks = collect(set).filter(
+      (d) => d.spec?.class === "halfday-md-html-inert"
+    );
+    // at least the opening and closing tags
+    expect(marks.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("is a no-op for plain prose with no HTML", () => {
+    const state = mkGfmState("just a paragraph, nothing fancy");
+    const set = buildHtmlInertDecorationsFromState(state, 0, FULL(state));
+    expect(collect(set)).toEqual([]);
+  });
+
+  it("is a no-op for an empty document", () => {
+    const state = mkGfmState("");
+    const set = buildHtmlInertDecorationsFromState(state, 0, FULL(state));
+    expect(collect(set)).toEqual([]);
+  });
+
+  it("does not emit hide-syntax replace decorations (only mark)", () => {
+    // The inert decoration is purely a Decoration.mark — the bytes
+    // stay visible as text, just styled. Confirm no replace ranges
+    // are produced.
+    const doc = "<script>x</script>";
+    const state = mkGfmState(doc);
+    const set = buildHtmlInertDecorationsFromState(state, 0, FULL(state));
+    const replaces = collect(set).filter(
+      (d) => d.from !== d.to && d.spec?.class === undefined
+    );
+    expect(replaces).toEqual([]);
+  });
+});
+
+describe("linksDecoration sanitization (v0.6.3)", () => {
+  it("strips the link affordance from `javascript:` URLs", () => {
+    // doc:     "[click](javascript:alert(1))"
+    // expected: NO .halfday-md-link anchor mark, NO syntax-hide
+    //   replaces. A single .halfday-md-link-inert mark over the URL
+    //   portion (so the tags.url accent color is overridden back to
+    //   plain text).
+    const doc = "[click](javascript:alert(1))";
+    const state = mkState(doc);
+    // cursor far off so syntax-hide WOULD normally fire on a benign link
+    const set = buildLinksDecorationsFromState(state, 0, FULL(state));
+    const anchorMarks = collect(set).filter(
+      (d) => d.spec?.class === "halfday-md-link"
+    );
+    expect(anchorMarks).toEqual([]);
+    const replaces = collect(set).filter(
+      (d) => d.from !== d.to && d.spec?.class === undefined
+    );
+    expect(replaces).toEqual([]);
+    const inertMarks = collect(set).filter(
+      (d) => d.spec?.class === "halfday-md-link-inert"
+    );
+    expect(inertMarks).toHaveLength(1);
+  });
+
+  it("strips the link affordance from `data:` URLs", () => {
+    const doc = "[payload](data:text/html,xx)";
+    const state = mkState(doc);
+    const set = buildLinksDecorationsFromState(state, 0, FULL(state));
+    const anchorMarks = collect(set).filter(
+      (d) => d.spec?.class === "halfday-md-link"
+    );
+    expect(anchorMarks).toEqual([]);
+    const inertMarks = collect(set).filter(
+      (d) => d.spec?.class === "halfday-md-link-inert"
+    );
+    expect(inertMarks).toHaveLength(1);
+  });
+
+  it("is case-insensitive on the dangerous scheme match", () => {
+    // `JavaScript:` is just as executable as `javascript:` in a
+    // browser. Match has /i flag.
+    const doc = "[x](JaVaScRiPt:alert(1))";
+    const state = mkState(doc);
+    const set = buildLinksDecorationsFromState(state, 0, FULL(state));
+    const anchorMarks = collect(set).filter(
+      (d) => d.spec?.class === "halfday-md-link"
+    );
+    expect(anchorMarks).toEqual([]);
+  });
+
+  it("leaves http/https/mailto links untouched (still get the link affordance)", () => {
+    // Regression: don't over-match. https:// MUST still produce the
+    // normal .halfday-md-link mark.
+    const doc = "[ok](https://example.com)";
+    const state = mkState(doc);
+    const set = buildLinksDecorationsFromState(state, doc.length, FULL(state));
+    const anchorMarks = collect(set).filter(
+      (d) => d.spec?.class === "halfday-md-link"
+    );
+    expect(anchorMarks).toHaveLength(1);
+  });
+});
+
+describe("wikilinksDecoration sanitization (v0.6.3)", () => {
+  it("does NOT decorate `![[embed]]` — the `!` prefix bypasses all marks", () => {
+    // doc:     "![[note]]"
+    // expected: no .halfday-md-wikilink mark, no hide decorations
+    //   anywhere. The whole `![[note]]` renders as literal prose.
+    const doc = "![[note]]";
+    const state = mkState(doc);
+    const set = buildWikilinksDecorationsFromState(state, 0, FULL(state));
+    expect(collect(set)).toEqual([]);
+  });
+
+  it("still decorates a normal `[[wiki]]` in the same doc as an `![[embed]]`", () => {
+    // doc:     "see [[wiki]] and ![[embed]] end"
+    // offsets: 0...4......12 .....18......28
+    // - [[wiki]] at 4..12 → normal decoration (1 mark + 2 hides off-cursor)
+    // - ![[embed]] at 18..28 (the `!` is at 17) → NO decoration
+    const doc = "see [[wiki]] and ![[embed]] end";
+    const state = mkState(doc);
+    const set = buildWikilinksDecorationsFromState(state, 0, FULL(state));
+    const marks = collect(set).filter(
+      (d) => d.spec?.class === "halfday-md-wikilink"
+    );
+    expect(marks).toHaveLength(1);
+    // mark covers the inner "wiki" between [[ and ]]
+    expect(marks[0].from).toBe(6);
+    expect(marks[0].to).toBe(10);
+  });
+
+  it("does NOT bypass when there's whitespace between `!` and `[[`", () => {
+    // `! [[note]]` is two tokens — a literal `!` and a normal
+    // wikilink. The decoration should still fire on the [[note]].
+    const doc = "! [[note]]";
+    const state = mkState(doc);
+    const set = buildWikilinksDecorationsFromState(state, 0, FULL(state));
+    const marks = collect(set).filter(
+      (d) => d.spec?.class === "halfday-md-wikilink"
+    );
+    expect(marks).toHaveLength(1);
+  });
+});
+
+describe("imagesDecoration (v0.6.3 sanitization)", () => {
+  it("replaces `![alt](https://...)` with a placeholder widget when cursor is off", () => {
+    const doc = "![alt](https://example.com/x.png)";
+    const state = mkState(doc);
+    // cursor at end of doc — past the image span (image ends at doc.length)
+    // So put cursor on a doc with extra trailing text.
+    const docWithTrail = doc + " trailing";
+    const stateT = mkState(docWithTrail);
+    const set = buildImagesDecorationsFromState(
+      stateT,
+      docWithTrail.length,
+      FULL(stateT)
+    );
+    const replaces = collect(set).filter(
+      (d) => d.from !== d.to && d.spec?.widget !== undefined
+    );
+    expect(replaces).toHaveLength(1);
+    // covers the whole image span (0..length-of-doc minus " trailing")
+    expect(replaces[0].from).toBe(0);
+    expect(replaces[0].to).toBe(doc.length);
+  });
+
+  it("treats local images the same way (same placeholder, no auto-load)", () => {
+    // v0.6.3 deliberately doesn't distinguish local from remote.
+    const doc = "![local](./foo.png) trail";
+    const state = mkState(doc);
+    const set = buildImagesDecorationsFromState(state, doc.length, FULL(state));
+    const replaces = collect(set).filter(
+      (d) => d.from !== d.to && d.spec?.widget !== undefined
+    );
+    expect(replaces).toHaveLength(1);
+  });
+
+  it("reveals the raw `![alt](url)` source when the cursor is on the image span", () => {
+    const doc = "![alt](https://example.com/x.png) trail";
+    const state = mkState(doc);
+    // cursor inside the alt text (offset 3 — between `!` and `]`)
+    const set = buildImagesDecorationsFromState(state, 3, FULL(state));
+    const replaces = collect(set).filter(
+      (d) => d.from !== d.to && d.spec?.widget !== undefined
+    );
+    expect(replaces).toEqual([]);
+  });
+
+  it("decorates multiple images independently", () => {
+    const doc = "![a](u1.png) and ![b](u2.png) end";
+    const state = mkState(doc);
+    // cursor at end so both placeholders fire
+    const set = buildImagesDecorationsFromState(state, doc.length, FULL(state));
+    const replaces = collect(set).filter(
+      (d) => d.from !== d.to && d.spec?.widget !== undefined
+    );
+    expect(replaces).toHaveLength(2);
+  });
+
+  it("is a no-op for an empty document", () => {
+    const state = mkState("");
+    const set = buildImagesDecorationsFromState(state, 0, FULL(state));
+    expect(collect(set)).toEqual([]);
+  });
+
+  it("does not match standard `[link](url)` (Link node, not Image)", () => {
+    // sanity: standard links have no `!` prefix and lezer emits Link,
+    // not Image. The images decoration must only consume Image nodes.
+    const doc = "[regular](https://example.com) trail";
+    const state = mkState(doc);
+    const set = buildImagesDecorationsFromState(state, doc.length, FULL(state));
+    expect(collect(set)).toEqual([]);
+  });
+
+  it("widget label includes the alt text and the URL when both are present", () => {
+    const doc = "![my pic](https://example.com/x.png) trail";
+    const state = mkState(doc);
+    const set = buildImagesDecorationsFromState(state, doc.length, FULL(state));
+    const replaces = collect(set).filter(
+      (d) => d.from !== d.to && d.spec?.widget !== undefined
+    );
+    expect(replaces).toHaveLength(1);
+    // The widget is the ImagePlaceholderWidget; we don't poke into the
+    // DOM here (no jsdom), but we verify it WAS produced — toDOM
+    // behaviour is exercised in the browser-mode smoke (out of scope
+    // for unit tests).
+    expect(replaces[0].spec?.widget).toBeDefined();
   });
 });

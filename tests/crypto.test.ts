@@ -22,6 +22,7 @@ import {
   readRecipients,
   readRecipientsRaw,
   roundTrip,
+  statRecipientsMtime,
   validateRecipientsContent,
   writeRecipientsRaw,
 } from "../src/crypto";
@@ -567,5 +568,100 @@ describe("readRecipientsRaw / writeRecipientsRaw / validateRecipientsContent (v0
       const after = fs.readFileSync(tmpFile, "utf8");
       expect(after).toBe("previous-good-content\n");
     });
+  });
+});
+
+describe("writeRecipientsRaw — chmod 0600 on first write (v0.6.3)", () => {
+  let tmpFile: string;
+
+  beforeEach(() => {
+    tmpFile = path.join(
+      os.tmpdir(),
+      `halfday-rune-chmod-test-${process.pid}-${Date.now()}`
+    );
+  });
+
+  afterEach(() => {
+    try {
+      fs.unlinkSync(tmpFile);
+    } catch {
+      /* ignore */
+    }
+  });
+
+  it("creates the file with mode 0600 when it did not exist before", () => {
+    // sanity: file doesn't exist
+    expect(fs.existsSync(tmpFile)).toBe(false);
+    writeRecipientsRaw(tmpFile, "# new\nage1aaaabbbbccccddddeeeeffffgggghhhhiiiijjjjkkkkllllmmmm\n");
+    const st = fs.statSync(tmpFile);
+    // mask to permission bits; expect 0o600 (owner rw, group/other none)
+    expect(st.mode & 0o777).toBe(0o600);
+  });
+
+  it("preserves existing permissions on subsequent writes", () => {
+    // simulate a user who explicitly chmod 0644'd the file later
+    writeRecipientsRaw(tmpFile, "age1aaaabbbbccccddddeeeeffffgggghhhhiiiijjjjkkkkllllmmmm\n");
+    fs.chmodSync(tmpFile, 0o644);
+    // sanity-check the chmod actually applied
+    expect(fs.statSync(tmpFile).mode & 0o777).toBe(0o644);
+    // second write should NOT silently lock the file back down
+    writeRecipientsRaw(tmpFile, "age1aaaabbbbccccddddeeeeffffgggghhhhiiiijjjjkkkkllllmmmm\n# updated\n");
+    expect(fs.statSync(tmpFile).mode & 0o777).toBe(0o644);
+  });
+
+  it("round-trips content through openSync/writeSync correctly (no truncation)", () => {
+    const content =
+      "# main mac\nage1aaaabbbbccccddddeeeeffffgggghhhhiiiijjjjkkkkllllmmmm\n# offline backup\nage1xxxxyyyyzzzz1111222233334444555566667777888899990000\n";
+    writeRecipientsRaw(tmpFile, content);
+    const read = fs.readFileSync(tmpFile, "utf8");
+    expect(read).toBe(content);
+  });
+});
+
+describe("statRecipientsMtime (v0.6.3)", () => {
+  let tmpFile: string;
+
+  beforeEach(() => {
+    tmpFile = path.join(
+      os.tmpdir(),
+      `halfday-rune-mtime-test-${process.pid}-${Date.now()}`
+    );
+  });
+
+  afterEach(() => {
+    try {
+      fs.unlinkSync(tmpFile);
+    } catch {
+      /* ignore */
+    }
+  });
+
+  it("returns null for a non-existent file (first-write semantics)", () => {
+    expect(fs.existsSync(tmpFile)).toBe(false);
+    expect(statRecipientsMtime(tmpFile)).toBeNull();
+  });
+
+  it("returns the file's mtimeMs after writing", () => {
+    fs.writeFileSync(tmpFile, "hi\n");
+    const mt = statRecipientsMtime(tmpFile);
+    expect(mt).not.toBeNull();
+    expect(typeof mt).toBe("number");
+    // mtime should be close to "now" — sanity check it's not unix epoch
+    expect(mt as number).toBeGreaterThan(Date.now() - 60_000);
+  });
+
+  it("reports a higher mtime after an external edit (the detector contract)", async () => {
+    fs.writeFileSync(tmpFile, "first\n");
+    const before = statRecipientsMtime(tmpFile)!;
+    // wait long enough for the filesystem timestamp resolution; macOS HFS
+    // has 1s mtime granularity historically, modern APFS is finer but
+    // we still need to ensure a measurable gap.
+    await new Promise((r) => setTimeout(r, 50));
+    // bump the mtime explicitly — utimes is more reliable than counting
+    // on the next write to land on a later tick.
+    const nowSec = (Date.now() + 5000) / 1000;
+    fs.utimesSync(tmpFile, nowSec, nowSec);
+    const after = statRecipientsMtime(tmpFile)!;
+    expect(after).toBeGreaterThan(before);
   });
 });
