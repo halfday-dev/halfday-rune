@@ -83,6 +83,7 @@ import {
   readRecipients,
   readRecipientsRaw,
   roundTrip,
+  statRecipientsMtime,
   validateRecipientsContent,
   writeRecipientsRaw,
 } from "./crypto";
@@ -110,7 +111,7 @@ const DEFAULT_SETTINGS: HalfdayObsidianRuneSettings = {
 };
 
 /** Plugin version surfaced in the status bar. Keep in sync with manifest.json. */
-const PLUGIN_VERSION = "0.6.0";
+const PLUGIN_VERSION = "0.6.3";
 
 export default class HalfdayObsidianRune extends Plugin {
   settings: HalfdayObsidianRuneSettings;
@@ -167,6 +168,22 @@ export default class HalfdayObsidianRune extends Plugin {
       id: "halfday-rune-rotate-keys",
       name: "Rotate vault keys",
       callback: () => this.rotateKeys(),
+    });
+
+    // v0.6.3: inverse of "Encrypt current note → .age". Reads a .age
+    // file, decrypts it, writes a sibling .md, and (optionally) deletes
+    // the .age. Two modes via the confirm modal — atomic replacement
+    // (default) or scratch-only (keeps the .age intact). Refuses to
+    // clobber an existing .md at the target path.
+    this.addCommand({
+      id: "halfday-rune-decrypt-to-md",
+      name: "Decrypt current .age → .md",
+      checkCallback: (checking: boolean) => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file || file.extension !== "age") return false;
+        if (!checking) this.decryptCurrentAge(file);
+        return true;
+      },
     });
 
     // v0.3.0: custom view + .age extension routing
@@ -665,6 +682,113 @@ export default class HalfdayObsidianRune extends Plugin {
   }
 
   /**
+   * v0.6.3: Inverse of v0.2's encrypt command. Reads a .age file,
+   * decrypts it with vault.identity, writes the plaintext as a sibling
+   * .md, and (optionally) deletes the .age.
+   *
+   * Target path resolution:
+   *   - `notes/foo.md.age` → `notes/foo.md` (strip the `.age` suffix)
+   *   - `notes/foo.age`    → `notes/foo.md` (replace the `.age` ext)
+   *   - any other shape   — refuses (defensive; shouldn't happen
+   *     because the command's checkCallback only enables on .age files)
+   *
+   * Refuses to clobber an existing `.md` at the target path. Surfaces
+   * the conflict via Notice — the user can rename the conflicting file
+   * and retry.
+   *
+   * Two modes via DecryptConfirmModal:
+   *   - "Decrypt and delete .age" (default — atomic replacement,
+   *     inverse of the encrypt command's flow)
+   *   - "Decrypt to scratch only" (writes .md, keeps the .age)
+   *
+   * Failure handling: if the decrypt itself throws (wrong identity,
+   * corrupt ciphertext, etc.), nothing is written. If the .md write
+   * succeeds but the subsequent .age delete fails, the .md stays on
+   * disk and the user sees a Notice — same trade-off as the encrypt
+   * command (preferable to losing the source).
+   */
+  async decryptCurrentAge(file: TFile): Promise<void> {
+    const started = Date.now();
+    try {
+      if (file.extension !== "age") {
+        new Notice(
+          `Halfday Rune: can only decrypt .age files (got .${file.extension})`
+        );
+        return;
+      }
+
+      // Resolve target path. ".md.age" → ".md"; bare ".age" → ".md".
+      // We keep the parent folder intact in both cases.
+      let targetPath: string;
+      if (file.path.endsWith(".md.age")) {
+        targetPath = file.path.slice(0, -".age".length);
+      } else if (file.path.endsWith(".age")) {
+        targetPath = file.path.slice(0, -".age".length) + ".md";
+      } else {
+        new Notice(`Halfday Rune: unexpected file path: ${file.path}`);
+        return;
+      }
+
+      if (this.app.vault.getAbstractFileByPath(targetPath)) {
+        new Notice(
+          `Halfday Rune: refusing to overwrite existing ${targetPath}`,
+          8_000
+        );
+        return;
+      }
+
+      const mode = await promptForDecryptMode(this.app, {
+        sourcePath: file.path,
+        targetPath,
+      });
+      if (mode === null) return; // user cancelled
+
+      // ---- decrypt ----
+      const identity = readIdentity(this.settings.identityPath);
+      const buf = await this.app.vault.readBinary(file);
+      const ciphertext = new Uint8Array(buf);
+      const plaintext = await decryptToString(identity, ciphertext);
+
+      // ---- write .md ----
+      const created = await this.app.vault.create(targetPath, plaintext);
+
+      // ---- optional .age delete ----
+      if (mode === "replace") {
+        try {
+          await this.app.vault.delete(file);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          new Notice(
+            `Halfday Rune: decrypted to ${targetPath} but failed to delete ${file.name} — ${msg}`,
+            10_000
+          );
+          console.error("[halfday-rune] decrypt .age delete failed", err);
+          return;
+        }
+      }
+
+      // ---- open the new .md so the user lands on it ----
+      const leaf = this.app.workspace.getLeaf(false);
+      await leaf.openFile(created);
+
+      const dt = Date.now() - started;
+      const verb = mode === "replace" ? "decrypted (replaced)" : "decrypted (scratch)";
+      new Notice(`Halfday Rune: ${verb} ${targetPath} (${dt}ms)`);
+      console.log("[halfday-rune] decrypt to md", {
+        source: file.path,
+        target: targetPath,
+        mode,
+        bytes: plaintext.length,
+        dt,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      new Notice(`Halfday Rune: decrypt failed — ${msg}`);
+      console.error("[halfday-rune] decrypt to md failed", err);
+    }
+  }
+
+  /**
    * Suggest `untitled.age`, `untitled-2.age`, … that doesn't already exist
    * in the chosen folder. The user can overwrite this in the prompt.
    */
@@ -770,6 +894,122 @@ async function promptForFilename(
 ): Promise<string | null> {
   return new Promise((resolve) => {
     const modal = new FilenamePromptModal(app, opts, resolve);
+    modal.open();
+  });
+}
+
+/**
+ * v0.6.3: Confirm modal for "Decrypt current .age → .md".
+ *
+ * Two outcomes:
+ *   - "replace" — decrypt to .md AND delete the .age (atomic; the
+ *     inverse of "Encrypt current note → .age"). Default action.
+ *   - "scratch" — decrypt to .md and leave the .age intact. Useful for
+ *     one-off inspection or when the user wants to keep the sealed
+ *     copy around as the canonical version.
+ *   - `null` — Cancel / Esc / click-outside. Nothing happens.
+ *
+ * "Replace" is presented as the .mod-cta button because it's the
+ * inverse of the encrypt flow — symmetry with that command's behaviour
+ * is the least surprising default for a user reaching for this
+ * command. The scratch option sits beside it so users who want it can
+ * pick it without dropping into a settings menu.
+ */
+type DecryptMode = "replace" | "scratch";
+
+interface DecryptPlan {
+  sourcePath: string;
+  targetPath: string;
+}
+
+class DecryptConfirmModal extends Modal {
+  private chosen: DecryptMode | null = null;
+  private readonly plan: DecryptPlan;
+  private readonly resolver: (m: DecryptMode | null) => void;
+
+  constructor(
+    app: App,
+    plan: DecryptPlan,
+    resolver: (m: DecryptMode | null) => void
+  ) {
+    super(app);
+    this.plan = plan;
+    this.resolver = resolver;
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Decrypt .age → .md" });
+
+    const summary = contentEl.createEl("p");
+    summary.createSpan({ text: "Decrypt " });
+    summary.createEl("code", { text: this.plan.sourcePath });
+    summary.createSpan({ text: " to " });
+    summary.createEl("code", { text: this.plan.targetPath });
+    summary.createSpan({ text: "." });
+
+    contentEl.createEl("p", {
+      text:
+        "Default: replace — decrypt to .md AND delete the .age. This is the inverse of 'Encrypt current note → .age'.",
+    });
+    contentEl.createEl("p", {
+      text:
+        "Scratch: decrypt to .md and leave the .age intact. Use this for one-off inspection or if you want to keep the sealed copy as the canonical version.",
+    });
+
+    const buttons = contentEl.createDiv();
+    buttons.style.display = "flex";
+    buttons.style.gap = "0.5rem";
+    buttons.style.justifyContent = "flex-end";
+    buttons.style.marginTop = "1rem";
+
+    // Cancel comes first in keyboard order and is auto-focused so
+    // hitting Enter on the modal doesn't accidentally delete the
+    // .age. Same destructive-default avoidance as the rotate-keys
+    // confirm modal.
+    const cancelBtn = buttons.createEl("button", { text: "Cancel" });
+    cancelBtn.addEventListener("click", () => this.close());
+
+    const scratchBtn = buttons.createEl("button", {
+      text: "Decrypt to scratch only",
+    });
+    scratchBtn.addEventListener("click", () => {
+      this.chosen = "scratch";
+      this.close();
+    });
+
+    const replaceBtn = buttons.createEl("button", {
+      text: "Decrypt and delete .age",
+      cls: "mod-cta",
+    });
+    replaceBtn.addEventListener("click", () => {
+      this.chosen = "replace";
+      this.close();
+    });
+
+    contentEl.addEventListener("keydown", (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        this.close();
+      }
+    });
+
+    setTimeout(() => cancelBtn.focus(), 0);
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+    this.resolver(this.chosen);
+  }
+}
+
+async function promptForDecryptMode(
+  app: App,
+  plan: DecryptPlan
+): Promise<DecryptMode | null> {
+  return new Promise((resolve) => {
+    const modal = new DecryptConfirmModal(app, plan, resolve);
     modal.open();
   });
 }
@@ -1136,6 +1376,11 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
     // v0.5.2: track which path the textarea content was loaded from, so
     // Save can warn if the path field has been edited since load.
     let lastLoadedFromPath: string = this.plugin.settings.recipientsPath;
+    // v0.6.3: capture mtime on populate so Save can detect external
+    // edits before stomping them. `null` means "file didn't exist when
+    // we loaded" — first-write semantics; we don't enforce the mtime
+    // check in that case because there's nothing to stomp.
+    let lastLoadedMtime: number | null = null;
 
     // initial load from disk
     const loadFromDisk = (announce: boolean = false): void => {
@@ -1145,6 +1390,17 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
         );
         textareaEl.value = result.content;
         lastLoadedFromPath = this.plugin.settings.recipientsPath;
+        try {
+          lastLoadedMtime = statRecipientsMtime(
+            this.plugin.settings.recipientsPath
+          );
+        } catch {
+          // stat failed for a reason other than ENOENT — leave mtime
+          // null. The on-save check will then refuse to enforce
+          // staleness (best-effort), but the read above already
+          // surfaced the deeper problem if there was one.
+          lastLoadedMtime = null;
+        }
         if (!result.exists) {
           setStatus(
             `recipients.txt does not exist yet at ${this.plugin.settings.recipientsPath} — paste your age1... recipients above and click Save to create it.`
@@ -1181,6 +1437,44 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
       if (!validation.ok) {
         setStatus(`✗ ${validation.error}`, /*isError*/ true);
         return;
+      }
+
+      // v0.6.3: modified-on-disk detector. If the file's mtime
+      // advanced between populate and Save, someone (or some other
+      // process) edited it externally. Refuse the save and offer a
+      // Reload affordance — the standard "external edits detected"
+      // pattern.
+      //
+      // We skip this check when:
+      //   - mtime was null at load (file didn't exist; first-write
+      //     semantics — nothing to stomp)
+      //   - the path field changed since load (the existing v0.5.2
+      //     drift warning already covers this; mtime check against a
+      //     DIFFERENT file's mtime would be misleading)
+      const pathSameAsLoaded =
+        this.plugin.settings.recipientsPath === lastLoadedFromPath;
+      if (pathSameAsLoaded && lastLoadedMtime !== null) {
+        let currentMtime: number | null = null;
+        try {
+          currentMtime = statRecipientsMtime(
+            this.plugin.settings.recipientsPath
+          );
+        } catch (err) {
+          // If we can't stat, fall through to the write — the write
+          // will surface the same I/O error in a clearer place.
+          console.warn("[halfday-rune] mtime stat failed", err);
+        }
+        if (currentMtime !== null && currentMtime > lastLoadedMtime) {
+          setStatus(
+            `✗ ${this.plugin.settings.recipientsPath} was modified on disk since you opened this tab — click "Reload from disk" to pick up the external edit (your current textarea contents will be lost), then re-apply your changes.`,
+            /*isError*/ true
+          );
+          new Notice(
+            "Halfday Rune: recipients.txt was modified externally — refusing to overwrite. Reload from disk to merge.",
+            10_000
+          );
+          return;
+        }
       }
 
       // v0.5.2: capture the pre-write disk content for the on-save Notice's
@@ -1220,6 +1514,15 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
         );
         // textarea now reflects what's on disk at the new path
         lastLoadedFromPath = this.plugin.settings.recipientsPath;
+        // v0.6.3: refresh the mtime baseline so subsequent saves
+        // don't see OUR write as a stale-edit conflict.
+        try {
+          lastLoadedMtime = statRecipientsMtime(
+            this.plugin.settings.recipientsPath
+          );
+        } catch {
+          lastLoadedMtime = null;
+        }
 
         // v0.5.2: on-save Notice for recipient list changes. Diff against
         // the pre-write disk content (parseRecipientsFile already did

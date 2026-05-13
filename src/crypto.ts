@@ -131,21 +131,88 @@ export function readRecipientsRaw(
 }
 
 /**
- * v0.5.1: Write recipients.txt content verbatim. Truncate+write (no atomic
- * rename — same iCloud-safe pattern as `_scripts/migrate_privacy_tier.py`).
- * Creates the file if missing.
+ * v0.5.1 / v0.6.3: Write recipients.txt content verbatim. Truncate+write
+ * (no atomic rename — same iCloud-safe pattern as
+ * `_scripts/migrate_privacy_tier.py`). Creates the file if missing.
+ *
+ * v0.6.3: on FIRST write (file did not exist before), the file is
+ * created with mode 0600 to match the permissions of
+ * `~/.age/vault.identity`. The recipient list is public-key material
+ * — 0644 isn't a leak — but consistency with the rest of `~/.age/` is
+ * the principle. On subsequent writes we leave existing permissions
+ * alone, so a user who explicitly chmod-ed the file later (e.g. to
+ * share-read with another local account) isn't silently fought.
+ *
+ * Implementation notes:
+ *   - We check existence via `fs.statSync` rather than relying on
+ *     `wx` open mode + retry, because we WANT to create-or-truncate;
+ *     the "first write" detection has to be informational, not
+ *     load-bearing for correctness.
+ *   - On create we use `openSync(path, "w", 0o600)` + `writeSync` +
+ *     `closeSync` rather than `writeFileSync` with `{mode: 0o600}`
+ *     because the latter applies the mode only on creation but the
+ *     two-arg `writeFileSync(path, content, "utf8")` overload doesn't
+ *     accept a `mode` field in a way that's portable across Node
+ *     versions. The lower-level path is unambiguous.
  *
  * Caller is responsible for validating content with
- * `validateRecipientsContent()` BEFORE calling this — this helper trusts
- * its input and writes whatever bytes it's given. Keeps each helper
- * single-purpose.
+ * `validateRecipientsContent()` BEFORE calling this — this helper
+ * trusts its input and writes whatever bytes it's given. Keeps each
+ * helper single-purpose.
  *
  * Does NOT create parent directories. `~/.age/` is expected to exist
  * already (it's a v1 CLI prerequisite).
  */
 export function writeRecipientsRaw(filePath: string, content: string): void {
   const expanded = expandHome(filePath);
-  fs.writeFileSync(expanded, content, "utf8");
+
+  let existedBefore = false;
+  try {
+    fs.statSync(expanded);
+    existedBefore = true;
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code !== "ENOENT") throw err;
+  }
+
+  if (existedBefore) {
+    // Preserve existing permissions (don't fight a user who explicitly
+    // set them later).
+    fs.writeFileSync(expanded, content, "utf8");
+    return;
+  }
+
+  // First write — create with 0600.
+  const fd = fs.openSync(expanded, "w", 0o600);
+  try {
+    fs.writeSync(fd, content, 0, "utf8");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * v0.6.3: Best-effort stat of recipients.txt to capture its mtime.
+ * Returns `null` if the file doesn't exist (mirrors `readRecipientsRaw`'s
+ * `exists: false` shape — first-save semantics). Throws on other I/O
+ * errors so the caller can surface them; the settings tab catches and
+ * shows an inline error.
+ *
+ * Used by the modified-on-disk detector: the settings tab captures
+ * mtime on textarea-populate, then compares against a fresh stat on
+ * Save. If the mtime advanced, the file was edited externally and we
+ * refuse the write until the user reloads.
+ */
+export function statRecipientsMtime(filePath: string): number | null {
+  const expanded = expandHome(filePath);
+  try {
+    const st = fs.statSync(expanded);
+    return st.mtimeMs;
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "ENOENT") return null;
+    throw err;
+  }
 }
 
 /**
