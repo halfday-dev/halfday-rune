@@ -53,22 +53,38 @@ const HIDE_LINK_SYNTAX = Decoration.replace({});
 
 /**
  * v0.6.3: URL schemes that are NEVER allowed to look like a clickable
- * link. The list is intentionally small — every entry here is a known
- * vehicle for active content delivery in markdown ecosystems:
+ * link. Every entry is a known vehicle for active content delivery or
+ * for accidentally exposing the user to local-file content:
  *
  *   - `javascript:` — executes script when navigated to. Even though
  *     our view has no click-to-navigate today, the link affordance
  *     (anchor color + underline + hidden raw URL) signals "this is
  *     safe to click" — exactly the wrong message.
- *   - `data:` — can encode an entire HTML/JS payload inline. Same
- *     reasoning. A `data:text/html,<script>...` URL is a self-
- *     contained attack vector if it ever ends up in a browser.
+ *   - `vbscript:` — old IE-era script protocol. Modern browsers reject
+ *     it but a future click-to-navigate path might shell out to a less
+ *     curated handler; cheap to refuse it here.
+ *   - `data:` — can encode an entire HTML/JS payload inline. A
+ *     `data:text/html,<script>...` URL is a self-contained attack
+ *     vector if it ever ends up in a browser.
+ *   - `blob:` — references an in-memory blob; usually safe but the
+ *     blob's content could be anything. Same affordance-lie concern as
+ *     `data:` in a markdown context.
+ *   - `file:` — local file access. In a markdown ecosystem, a
+ *     `file:///etc/passwd` link masquerading as an innocuous label
+ *     would be a real social-engineering risk if click-to-navigate
+ *     ever lands. Inert by default.
  *
  * Matched case-insensitively and tolerant of leading whitespace inside
  * the URL portion (lezer's URL node trims the parens but not internal
  * whitespace).
+ *
+ * NOT covered (worth knowing): HTML-entity-encoded forms like
+ * `&#x6A;avascript:` aren't decoded before matching. lezer parses raw
+ * bytes; the regex sees them literally. Acceptable today because no
+ * click-to-navigate exists — the affordance lie is the only payload.
+ * Revisit when click-to-navigate lands (v0.7+).
  */
-const DANGEROUS_URL_SCHEMES = /^\s*(?:javascript|data)\s*:/i;
+const DANGEROUS_URL_SCHEMES = /^\s*(?:javascript|vbscript|data|blob|file)\s*:/i;
 
 interface PendingMark {
   from: number;

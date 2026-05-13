@@ -206,7 +206,15 @@
 }
 
 .halfday-age-editor .halfday-md-image-placeholder {
-  display: inline;
+  /* inline-block so max-width applies (inline elements ignore it).
+   * Long remote URLs would otherwise blow the placeholder out to the
+   * full editor width and force horizontal scroll on the line. */
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
   color: var(--text-muted);
   font-family: var(--font-monospace, monospace);
   font-size: 0.9em;

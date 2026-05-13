@@ -1089,6 +1089,27 @@ describe("linksDecoration sanitization (v0.6.3)", () => {
     );
     expect(anchorMarks).toHaveLength(1);
   });
+
+  it("strips the affordance from `vbscript:`, `blob:`, and `file:` schemes (v0.6.3 expansion)", () => {
+    // v0.6.3 fix-bundle: DANGEROUS_URL_SCHEMES was expanded beyond
+    // javascript+data to cover the legacy IE-era vbscript handler, the
+    // in-memory blob: scheme (content unknown to us), and file: which
+    // would expose local-disk content via affordance. All three should
+    // produce inert marks, not the normal link affordance.
+    for (const scheme of ["vbscript:alert(1)", "blob:foo", "file:///etc/passwd"]) {
+      const doc = `[x](${scheme})`;
+      const state = mkState(doc);
+      const set = buildLinksDecorationsFromState(state, 0, FULL(state));
+      const anchorMarks = collect(set).filter(
+        (d) => d.spec?.class === "halfday-md-link"
+      );
+      const inertMarks = collect(set).filter(
+        (d) => d.spec?.class === "halfday-md-link-inert"
+      );
+      expect(anchorMarks).toEqual([]);
+      expect(inertMarks).toHaveLength(1);
+    }
+  });
 });
 
 describe("wikilinksDecoration sanitization (v0.6.3)", () => {
@@ -1129,6 +1150,18 @@ describe("wikilinksDecoration sanitization (v0.6.3)", () => {
       (d) => d.spec?.class === "halfday-md-wikilink"
     );
     expect(marks).toHaveLength(1);
+  });
+
+  it("treats `![[foo|bar]]` embed display-text syntax as inert (no decoration)", () => {
+    // F4 from v0.6.3 QA: the embed bypass should fire on display-text-
+    // aliased wikilinks too. The regex matches `[[foo|bar]]` and the
+    // prevChar check sees `!` so we skip — `foo|bar` does NOT get the
+    // wikilink mark, and the brackets do NOT hide. The whole
+    // `![[foo|bar]]` renders as literal prose.
+    const doc = "![[foo|bar]]";
+    const state = mkState(doc);
+    const set = buildWikilinksDecorationsFromState(state, 0, FULL(state));
+    expect(collect(set)).toEqual([]);
   });
 });
 
@@ -1215,5 +1248,34 @@ describe("imagesDecoration (v0.6.3 sanitization)", () => {
     // behaviour is exercised in the browser-mode smoke (out of scope
     // for unit tests).
     expect(replaces[0].spec?.widget).toBeDefined();
+  });
+
+  it("handles empty alt `![](url)` without crashing — placeholder still fires", () => {
+    // F3 from v0.6.3 QA: defensive code in images.ts handles the empty-
+    // alt case by emitting `[image]` (no `: alt` suffix). The replace
+    // decoration must still cover the full Image node range so the
+    // ![](url) source bytes don't render alongside the placeholder.
+    const doc = "![](https://example.com/x.png) trail";
+    const state = mkState(doc);
+    const set = buildImagesDecorationsFromState(state, doc.length, FULL(state));
+    const replaces = collect(set).filter(
+      (d) => d.from !== d.to && d.spec?.widget !== undefined
+    );
+    expect(replaces).toHaveLength(1);
+    expect(replaces[0].from).toBe(0);
+    // span covers `![](https://example.com/x.png)` (offsets 0..30)
+    expect(replaces[0].to).toBe(30);
+  });
+
+  it("handles empty URL `![alt]()` without crashing", () => {
+    // F3 from v0.6.3 QA: defensive code in images.ts handles the empty-
+    // url case. Either it emits a placeholder labelled `[image: alt]`
+    // (URL omitted from the chip text) or it skips emission entirely —
+    // both are acceptable. Either way it must not throw.
+    const doc = "![alt]() trail";
+    const state = mkState(doc);
+    expect(() =>
+      buildImagesDecorationsFromState(state, doc.length, FULL(state))
+    ).not.toThrow();
   });
 });

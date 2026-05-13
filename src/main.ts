@@ -903,7 +903,9 @@ async function promptForFilename(
  *
  * Two outcomes:
  *   - "replace" — decrypt to .md AND delete the .age (atomic; the
- *     inverse of "Encrypt current note → .age"). Default action.
+ *     inverse of "Encrypt current note → .age"). Highlighted as the
+ *     mod-cta button but NOT auto-focused — Cancel is, so accidental
+ *     Enter on the modal cancels rather than deletes.
  *   - "scratch" — decrypt to .md and leave the .age intact. Useful for
  *     one-off inspection or when the user wants to keep the sealed
  *     copy around as the canonical version.
@@ -951,11 +953,11 @@ class DecryptConfirmModal extends Modal {
 
     contentEl.createEl("p", {
       text:
-        "Default: replace — decrypt to .md AND delete the .age. This is the inverse of 'Encrypt current note → .age'.",
+        "Atomic mode: decrypt to .md AND delete the .age. This is the inverse of 'Encrypt current note → .age'.",
     });
     contentEl.createEl("p", {
       text:
-        "Scratch: decrypt to .md and leave the .age intact. Use this for one-off inspection or if you want to keep the sealed copy as the canonical version.",
+        "Scratch mode: decrypt to .md and leave the .age intact. Use this for one-off inspection or if you want to keep the sealed copy as the canonical version.",
     });
 
     const buttons = contentEl.createDiv();

@@ -6,13 +6,7 @@ Halfday Obsidian Rune handles cryptographic material and decrypted personal cont
 
 **Please do not file a public GitHub issue for security reports.**
 
-Send security reports to:
-
-> **TBD: security disclosure email address — to be filled in before v0.7 community plugin submission. Suggested: `security@halfday.dev` or a dedicated address on a domain you control.**
-
-If you'd like to encrypt your report, our PGP key is:
-
-> **TBD: PGP key fingerprint and public key URL — to be filled in before v0.7. Suggested: publish the public key at `https://halfday.dev/pgp.asc` and list the fingerprint here.**
+Send security reports to **hello@halfday.dev**.
 
 Please include:
 - A description of the vulnerability and its potential impact.
