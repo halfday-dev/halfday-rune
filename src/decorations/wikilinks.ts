@@ -1,11 +1,20 @@
 /**
- * Wikilinks decoration — v0.6.2.
+ * Wikilinks decoration — v0.6.2 / v0.6.3.
  *
  * Renders Obsidian-style `[[wikilink]]` syntax with the same visual
  * treatment as standard markdown links: accent-colored, underlined anchor
  * text with the surrounding `[[` / `]]` brackets hidden when the cursor is
  * off the span. When the cursor enters the span, the brackets re-appear
  * for editing.
+ *
+ * v0.6.3 sanitization: an `!` immediately preceding `[[note]]` is the
+ * Obsidian embed/transclusion syntax. We render embeds as fully inert
+ * literal text — no decoration emission, no anchor color, no bracket
+ * hiding. The `!`, the `[[`, the inner text, and the `]]` all show as
+ * plain prose. No transclusion is performed; that would require
+ * routing the embedded note through Obsidian's resolver, which
+ * defeats the entire encrypted-by-design property. Showing the embed
+ * source verbatim is the least surprising thing we can do.
  *
  * NOT in scope here (phase 2):
  *   - Click-to-navigate. The wikilink renders visually only; clicking it
@@ -91,6 +100,17 @@ export function buildWikilinksDecorationsFromState(
     while ((m = WIKILINK_RE.exec(text)) !== null) {
       const spanFrom = from + m.index;
       const spanTo = spanFrom + m[0].length;
+
+      // v0.6.3: `![[note]]` is an Obsidian embed/transclusion. We
+      // refuse to render it — no anchor mark, no bracket hiding. The
+      // `!` and the brackets stay visible as literal text so the user
+      // sees exactly what's on disk. Check the immediately preceding
+      // char in the document (not just the slice) so this still works
+      // when visibleRanges starts mid-line.
+      const prevChar =
+        spanFrom > 0 ? state.doc.sliceString(spanFrom - 1, spanFrom) : "";
+      if (prevChar === "!") continue;
+
       // Inner anchor lives between the closing `[[` and the opening `]]`
       // — i.e. spanFrom+2 through spanTo-2.
       const anchorFrom = spanFrom + 2;

@@ -172,3 +172,46 @@
   color: var(--color-accent, #7f6df2);
   text-decoration: underline;
 }
+
+/* v0.6.3 sanitization styles.
+ *
+ * .halfday-md-html-inert — raw `<script>` / `<iframe>` / `<b>` etc. CM6
+ * never executes HTML (the source is parsed by lezer and painted as
+ * plain characters), but the user has no signal that the tag is
+ * intentionally inert unless we style it. Muted color + monospace +
+ * subtle background makes the literalness legible.
+ *
+ * .halfday-md-link-inert — links whose URL uses `javascript:` or
+ * `data:`. The URL portion is repainted in --text-muted, overriding
+ * the lezer tags.url accent. The anchor text (text inside `[`/`]`) is
+ * deliberately NOT marked with .halfday-md-link, so it stays as plain
+ * text — no underline, no accent — and the raw markdown syntax stays
+ * visible so the user can see exactly what's on disk.
+ *
+ * .halfday-md-image-placeholder — replacement widget for `![](...)`.
+ * Quiet bracketed chip; user can move the cursor onto the span to
+ * reveal the raw markdown for editing. */
+.halfday-age-editor .halfday-md-html-inert {
+  color: var(--text-muted);
+  font-family: var(--font-monospace, monospace);
+  font-size: 0.9em;
+  background: var(--background-modifier-hover, transparent);
+  padding: 0 2px;
+  border-radius: 3px;
+}
+
+.halfday-age-editor .halfday-md-link-inert {
+  color: var(--text-muted);
+  text-decoration: none;
+}
+
+.halfday-age-editor .halfday-md-image-placeholder {
+  display: inline;
+  color: var(--text-muted);
+  font-family: var(--font-monospace, monospace);
+  font-size: 0.9em;
+  background: var(--background-secondary, rgba(0, 0, 0, 0.08));
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--background-modifier-border, transparent);
+}

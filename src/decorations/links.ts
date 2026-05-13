@@ -1,11 +1,20 @@
 /**
- * Links decoration — v0.6.1.
+ * Links decoration — v0.6.1 / v0.6.3.
  *
  * Renders standard markdown links `[text](url)` so only the anchor text is
  * visible when the cursor is off the span; brackets, parens, and the URL
  * collapse out of view. When the caret enters the link span, the full
  * `[text](url)` syntax is revealed for editing — same live-preview semantics
  * as headings + emphasis + inline-code.
+ *
+ * v0.6.3 sanitization: links whose URL uses the `javascript:` or `data:`
+ * scheme are rendered as INERT — no accent-color anchor mark, no syntax
+ * hiding, no "this is a link" affordance. The raw `[text](url)` source
+ * stays visible verbatim so the user can see exactly what's on disk. We
+ * don't have click-to-navigate, so the threat surface today is small
+ * (the user would have to manually copy the URL into a browser to fire
+ * the payload), but the visual affordance was the only thing telling
+ * them "this is safe to click." Removing it removes the lie.
  *
  * lezer-markdown labels (confirmed by walking the tree on a probe doc):
  *   - Link:     the whole `[text](url)` span (from `[` through `)`)
@@ -41,6 +50,25 @@ import {
 
 const LINK_CLASS = "halfday-md-link";
 const HIDE_LINK_SYNTAX = Decoration.replace({});
+
+/**
+ * v0.6.3: URL schemes that are NEVER allowed to look like a clickable
+ * link. The list is intentionally small — every entry here is a known
+ * vehicle for active content delivery in markdown ecosystems:
+ *
+ *   - `javascript:` — executes script when navigated to. Even though
+ *     our view has no click-to-navigate today, the link affordance
+ *     (anchor color + underline + hidden raw URL) signals "this is
+ *     safe to click" — exactly the wrong message.
+ *   - `data:` — can encode an entire HTML/JS payload inline. Same
+ *     reasoning. A `data:text/html,<script>...` URL is a self-
+ *     contained attack vector if it ever ends up in a browser.
+ *
+ * Matched case-insensitively and tolerant of leading whitespace inside
+ * the URL portion (lezer's URL node trims the parens but not internal
+ * whitespace).
+ */
+const DANGEROUS_URL_SCHEMES = /^\s*(?:javascript|data)\s*:/i;
 
 interface PendingMark {
   from: number;
@@ -95,6 +123,28 @@ export function buildLinksDecorationsFromState(
         // Standard `[text](url)` has 4 LinkMarks + 1 URL. Anything else
         // (wikilinks, reference-style links, malformed) — bail.
         if (linkMarks.length !== 4 || urlNode === null) return;
+
+        // v0.6.3: if the URL uses a dangerous scheme, refuse to render
+        // any link affordance for this span. No anchor mark (so no
+        // accent color, no underline), no hide-syntax replace (so the
+        // raw `[text](javascript:...)` text shows verbatim). The user
+        // sees exactly what's on disk and gets no false signal that
+        // the link is clickable. We also defense-in-depth this in the
+        // halfdayMarkdownHighlight tags.link / tags.url rules at the
+        // age-view layer — a tags-based highlight rule would still
+        // paint accent over a `javascript:` URL — so we mark the URL
+        // span itself with an inert class that the stylesheet uses
+        // to override the tags-based color back to plain text.
+        const urlText = state.doc.sliceString(urlNode.from, urlNode.to);
+        if (DANGEROUS_URL_SCHEMES.test(urlText)) {
+          pending.push({
+            from: urlNode.from,
+            to: urlNode.to,
+            startSide: 1,
+            deco: Decoration.mark({ class: "halfday-md-link-inert" }),
+          });
+          return;
+        }
 
         const openBracket = linkMarks[0]; // [
         const closeBracket = linkMarks[1]; // ]
