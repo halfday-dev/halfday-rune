@@ -4,7 +4,17 @@ X25519 [age](https://age-encryption.org/) encryption for Obsidian notes.
 
 Open a `.age` file in your vault and Halfday Rune decrypts it in memory, mounts a CodeMirror editor on the cleartext, and re-encrypts on save. Plaintext never touches disk for born-encrypted notes; for converted notes it lives on disk only as ciphertext.
 
+> 🌐 **[halfday.dev/products/rune](https://halfday.dev/products/rune)** — full product page, screenshots, and the launch story.
+
 Status: pre-release. The plugin is in active development by [halfday](https://halfday.dev). v0.7 will submit it to the Obsidian Community Plugins catalog.
+
+## Why Rune
+
+Your Obsidian vault is plaintext on disk. That used to be fine. In 2026 it isn't: AI desktop tools (Claude Desktop via MCP filesystem servers, Cursor's codebase indexing, ChatGPT's macOS Work-with-Apps), cloud sync providers, indexers like Microsoft Recall, and the growing pile of agents with disk access can all read your notes. Obsidian Sync is end-to-end encrypted in transit but the local files are plaintext.
+
+Rune encrypts at rest using [age](https://age-encryption.org/). Plaintext exists only in editor memory while a note is open; close the tab and it's gone from the process. New notes can be born-encrypted (plaintext never on disk at all). Multi-recipient support means you encrypt to both your daily-driver key and a backup, so losing one device doesn't lose the vault. Rotate-keys re-encrypts every `.age` file to your current recipients when you change the set.
+
+Full case in the launch post: [Using Obsidian Securely in the AI Era](https://halfday.dev/blog/halfday-rune-secure-obsidian-ai-era).
 
 ---
 
