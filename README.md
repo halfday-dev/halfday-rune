@@ -1,4 +1,4 @@
-# Halfday Obsidian Rune
+# Halfday Rune
 
 X25519 [age](https://age-encryption.org/) encryption for Obsidian notes.
 

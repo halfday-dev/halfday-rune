@@ -1,10 +1,10 @@
 {
   "id": "halfday-rune",
   "name": "Halfday Rune",
-  "description": "Born-encrypted notes for Obsidian. age (X25519) at rest, live-preview markdown in memory.",
+  "description": "Born-encrypted notes using age (X25519) at rest, with live-preview markdown rendering in memory.",
   "author": "Halfday.dev",
   "authorUrl": "https://halfday.dev",
   "minAppVersion": "1.5.0",
-  "version": "0.6.4",
+  "version": "0.6.5",
   "isDesktopOnly": true
 }
