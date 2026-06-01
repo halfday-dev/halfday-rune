@@ -38,7 +38,7 @@ Full case in the launch post: [Using Obsidian Securely in the AI Era](https://ha
 ### Manual (today — pre-community-catalog)
 
 1. Download `manifest.json`, `main.js`, and `styles.css` from the latest [release](https://github.com/halfday-dev/halfday-obsidian-rune/releases) (TBD: link will go live with the v0.7 submission).
-2. Copy them into `<your-vault>/.obsidian/plugins/halfday-obsidian-rune/`.
+2. Copy them into `<your-vault>/.obsidian/plugins/halfday-rune/`.
 3. Enable the plugin in **Settings → Community plugins**. (You'll need **Settings → Community plugins → "Turn on community plugins"** if you've never enabled one before.)
 
 ### Community catalog (post-v0.7)
