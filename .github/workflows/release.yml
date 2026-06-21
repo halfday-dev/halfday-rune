@@ -1,0 +1,55 @@
+name: Release
+
+# Push a version tag (e.g. `0.6.6`) to build the plugin, attach build-provenance
+# attestations to the release assets, and publish the GitHub release.
+#
+# This replaces the old manual `gh release create` flow. The Obsidian community
+# catalog review recommended that release assets carry GitHub artifact
+# attestations; `actions/attest-build-provenance` does that here for main.js,
+# styles.css, and manifest.json.
+
+on:
+  push:
+    tags:
+      - "*.*.*"
+
+permissions:
+  contents: write # create the GitHub release
+  id-token: write # OIDC token for attestation
+  attestations: write # write the build-provenance attestation
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build plugin
+        run: npm run build
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            main.js
+            styles.css
+            manifest.json
+
+      - name: Create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "Halfday Rune ${GITHUB_REF_NAME}" \
+            --notes "Automated release. Build artifacts (main.js, styles.css, manifest.json) carry GitHub build-provenance attestations (\`gh attestation verify\`)." \
+            main.js manifest.json styles.css

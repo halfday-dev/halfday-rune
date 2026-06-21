@@ -8,8 +8,8 @@
  *                                      never hits disk)
  *   - "Rotate vault keys"            — v0.5.2, re-encrypts every .age in the
  *                                      vault to the current recipients list
- *                                      (with optional pre-rotation tar.gz
- *                                      backup). Run after adding a backup
+ *                                      (with optional pre-rotation backup
+ *                                      copy). Run after adding a backup
  *                                      recipient so existing files include it.
  *
  * Views:
@@ -19,11 +19,12 @@
  *     autosave kicks in after the last edit. Dirty state is reflected both in
  *     the status line and in the tab title bullet.
  *
- * v0.5.2 design notes:
- *   - Rotate command shells out to `tar` for the pre-rotation backup. The
- *     archive lands at ~/halfday/logs/age-backups/age-backup-{ISO}.tar.gz —
- *     out-of-vault so iCloud doesn't churn on it. Toggle via the new
- *     `autoBackupBeforeRotate` setting (default ON).
+ * design notes:
+ *   - Rotate command makes a pre-rotation backup by copying every .age
+ *     file into ~/halfday/logs/age-backups/age-backup-{ISO}/ via Node fs
+ *     (no shell, no child_process as of v0.6.6) — out-of-vault so iCloud
+ *     doesn't churn on it. Toggle via the `autoBackupBeforeRotate`
+ *     setting (default ON).
  *   - Per-file failures during rotate skip+continue rather than abort —
  *     a bad sectoral file shouldn't lose the rest. Summary is a Notice on
  *     all-success and a modal on partial failure.
@@ -96,7 +97,7 @@ interface HalfdayObsidianRuneSettings {
   recipientsPath: string;
   identityPath: string;
   /**
-   * v0.5.2: tar.gz every .age file before rotation. ON by default — rotation
+   * v0.5.2: back up (copy) every .age file before rotation. ON by default — rotation
    * is the most destructive plugin operation and the backup is the recovery
    * story. Toggle off only if you have your own backup discipline (Time
    * Machine + offsite, etc.).
@@ -109,9 +110,6 @@ const DEFAULT_SETTINGS: HalfdayObsidianRuneSettings = {
   identityPath: "~/.age/vault.identity",
   autoBackupBeforeRotate: true,
 };
-
-/** Plugin version surfaced in the status bar. Keep in sync with manifest.json. */
-const PLUGIN_VERSION = "0.6.3";
 
 export default class HalfdayObsidianRune extends Plugin {
   settings: HalfdayObsidianRuneSettings;
@@ -162,7 +160,7 @@ export default class HalfdayObsidianRune extends Plugin {
 
     // v0.5.2: rotate every .age file in the vault to the current
     // recipients list. Pre-flight confirm dialog + optional pre-rotation
-    // tar.gz backup are intentional friction — this is the most destructive
+    // backup copy are intentional friction — this is the most destructive
     // plugin operation we ship.
     this.addCommand({
       id: "halfday-rune-rotate-keys",
@@ -294,7 +292,10 @@ export default class HalfdayObsidianRune extends Plugin {
 
     this.statusBarEl.createSpan({
       cls: "halfday-rune-statusbar-version",
-      text: `v${PLUGIN_VERSION}`,
+      // Read straight from the manifest so the displayed version can never
+      // drift from manifest.json again (it was hardcoded to 0.6.3 through
+      // v0.6.5 — fixed in 0.6.6).
+      text: `v${this.manifest.version}`,
     });
   }
 
@@ -520,7 +521,7 @@ export default class HalfdayObsidianRune extends Plugin {
    *      settings; if anything is missing or malformed, bail with a Notice
    *      BEFORE showing the confirm dialog (no friction-then-error).
    *   2. Show RotateConfirmModal with the file count + planned backup path.
-   *      On confirm: optional tar.gz backup → rotate loop → summary
+   *      On confirm: optional backup copy → rotate loop → summary
    *      (Notice on all-success, modal on partial failure).
    *
    * Per-file failures don't abort. The rotate logic itself lives in
@@ -561,8 +562,8 @@ export default class HalfdayObsidianRune extends Plugin {
         : adapter.basePath ?? "";
 
     // F1: if neither getBasePath() nor .basePath resolved a non-empty path,
-    // we'd silently `tar -C ""` against Electron's cwd — wrong vault, possibly
-    // archiving Obsidian's app bundle. Bail BEFORE any user-visible friction.
+    // we'd silently copy from `path.join("", rel)` — i.e. relative to Electron's
+    // cwd, the wrong vault. Bail BEFORE any user-visible friction.
     if (!vaultBase) {
       new Notice(
         "Halfday Rune: cannot determine vault path — rotation aborted. Please file a bug.",
@@ -606,7 +607,7 @@ export default class HalfdayObsidianRune extends Plugin {
           ageFiles.map((f) => f.path),
           DEFAULT_BACKUP_DIR
         );
-        backupNote = `backup: ${result.path} (${result.bytes.toLocaleString()} bytes)`;
+        backupNote = `backup: ${result.count} file${result.count === 1 ? "" : "s"} → ${result.path} (${result.bytes.toLocaleString()} bytes)`;
         console.log("[halfday-rune] rotate backup written", result);
         rotateLog.backup({ ok: true, path: result.path, bytes: result.bytes });
         new Notice(`Halfday Rune: backup written → ${result.path}`, 6_000);
@@ -1061,9 +1062,9 @@ class RotateConfirmModal extends Modal {
 
     if (this.plan.autoBackup) {
       const p = contentEl.createEl("p");
-      p.createSpan({ text: "A tar.gz backup will be created first at " });
+      p.createSpan({ text: "A backup copy of every .age file will be created first in " });
       p.createEl("code", { text: this.plan.backupDir });
-      p.createSpan({ text: "/age-backup-{ISO}.tar.gz before any file is touched." });
+      p.createSpan({ text: "/age-backup-{ISO}/ before any file is touched." });
     } else {
       // M3: when auto-backup is OFF the modal needs to look and read
       // differently. Sharper copy + de-emphasized proceed button so the
@@ -1219,20 +1220,11 @@ class RotateSummaryModal extends Modal {
     buttons.style.justifyContent = "flex-end";
     buttons.style.marginTop = "1rem";
 
-    // F5: copy-log-path button. Lets the user paste the path into a
-    // terminal / Finder Go-to-folder. The button stays in this slot for
-    // any future copy-failure-list addition.
-    const copyBtn = buttons.createEl("button", { text: "Copy log path" });
-    copyBtn.addEventListener("click", () => {
-      navigator.clipboard
-        .writeText(this.meta.logPath)
-        .then(() => new Notice("Halfday Rune: log path copied"))
-        .catch((err) => {
-          console.error("[halfday-rune] clipboard write failed", err);
-          new Notice("Halfday Rune: copy failed — see console");
-        });
-    });
-
+    // v0.6.6: the log path is already shown above as selectable, copyable
+    // <code> text (see logLine). We dropped the "Copy log path" button that
+    // used navigator.clipboard — the Obsidian catalog review flags clipboard
+    // access, and for a one-off path that's already selectable on screen the
+    // convenience isn't worth the trust cost.
     const okBtn = buttons.createEl("button", {
       text: "Close",
       cls: "mod-cta",
@@ -1258,7 +1250,10 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    containerEl.createEl("h2", { text: "Halfday Obsidian Rune" });
+    // Read the display name from the manifest so the settings heading can't
+    // drift from the plugin name (it was hardcoded to the old "Halfday
+    // Obsidian Rune" through v0.6.5 — fixed in 0.6.6).
+    containerEl.createEl("h2", { text: this.plugin.manifest.name });
     containerEl.createEl("p", {
       text:
         "Encrypts and decrypts notes using one or more X25519 age recipients. " +
@@ -1305,7 +1300,7 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Auto-backup before rotate")
       .setDesc(
-        "When running 'Rotate vault keys', tar.gz every .age file to " +
+        "When running 'Rotate vault keys', copy every .age file to " +
           "~/halfday/logs/age-backups/ before re-encrypting. Recommended ON. " +
           "Turn off only if you have your own backup discipline."
       )

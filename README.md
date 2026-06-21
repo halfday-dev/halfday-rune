@@ -94,7 +94,7 @@ Halfday Rune exists because **plaintext on disk is the primary risk for a vault 
 - **Plaintext leakage to Obsidian's metadata cache and search index.** `.age` files are routed through Halfday Rune's custom view; they never reach Obsidian's `MarkdownView`, file cache, or backlinks resolver. There is no `[[wikilink]]` graph routing, no backlink, no full-text search index for sealed notes.
 - **Auto-load network leaks.** The v0.6.3 sanitization pass refuses to auto-load remote images, refuses to render `javascript:` or `data:` URLs as clickable affordances, refuses to transclude `![[embed]]` references, and renders raw HTML (`<script>`, `<iframe>`, `<b>`, …) as literal text rather than parsed markup.
 - **Plaintext on encrypt.** "Encrypt current note → .age" round-trip-verifies the ciphertext before deleting the plaintext source. If verification fails, the plaintext is preserved.
-- **Plaintext on rotate.** "Rotate vault keys" round-trip-verifies each file before overwriting it, optionally tar.gz-backs-up the whole vault's `.age` files first, and continues on per-file failure rather than aborting.
+- **Plaintext on rotate.** "Rotate vault keys" round-trip-verifies each file before overwriting it, optionally backs up (copies) the whole vault's `.age` files first, and continues on per-file failure rather than aborting.
 
 ### What it does NOT protect
 
@@ -104,6 +104,18 @@ Halfday Rune exists because **plaintext on disk is the primary risk for a vault 
 - **The age cryptography itself.** Halfday Rune wraps [typage](https://github.com/FiloSottile/typage) (the TypeScript port of [age](https://age-encryption.org/)); cryptographic correctness is age's responsibility, not ours.
 - **Obsidian, Electron, or your operating system.** A compromised Obsidian build, a malicious community plugin running in the same context, or a kernel-level adversary defeats this plugin trivially.
 - **Cloud sync providers (iCloud, Dropbox, etc.).** Sync replicates `.age` ciphertext, not plaintext, so confidentiality holds — but a sync provider with timing visibility can correlate edit patterns. If that's in scope, host your vault locally.
+
+### Permissions & why
+
+A security plugin should be legible about every capability it uses. Here's the full list — including the ones an automated reviewer (correctly) flags — and why each is necessary:
+
+- **Filesystem access outside the vault (Node `fs`).** Halfday Rune reads your age identity from `~/.age/vault.identity` and your recipient public keys from `~/.age/recipients.txt`, and writes rotation logs and pre-rotation backups under `~/halfday/logs/`. **The identity lives *outside* the vault on purpose:** storing your private key inside the encrypted vault it unlocks would defeat the encryption. Logs and backups stay out of the vault so cloud sync doesn't churn on recovery artifacts. This out-of-vault filesystem dependency is also why the plugin is **desktop-only** — Obsidian mobile has no equivalent filesystem access.
+- **Vault enumeration (Obsidian API).** The "Rotate vault keys" command lists `.age` files via Obsidian's vault API so it can re-encrypt every sealed note to your current recipient set. It only ever reads `.age` paths; it does not read or index your plaintext notes.
+- **No shell execution.** As of v0.6.6 the plugin uses **no `child_process` and runs no shell commands**. The pre-rotation backup is a plain Node `fs` file copy. (Earlier versions shelled out to `tar`; that was removed.)
+- **No network access.** The plugin makes **no network requests** of any kind — no telemetry, no update checks, no remote image loading (see sanitization below).
+- **No clipboard access.** As of v0.6.6 the plugin reads and writes **nothing** to the system clipboard.
+
+Everything above is auditable in the open-source code under `src/`.
 
 ### Sanitization rules (v0.6.3)
 
@@ -118,6 +130,12 @@ Decrypted markdown flows through these passes before rendering:
 ## Reporting security issues
 
 See [SECURITY.md](./SECURITY.md). In short: please report security issues privately (not via a public GitHub issue) and we'll get back to you.
+
+---
+
+## Support
+
+Rune is free and open source, and always will be. If it's part of how you keep your vault private, you can [buy us a coffee](https://buymeacoffee.com/halfday) — a thank-you for the work, not a feature gate. Security OSS only works when trust is the currency, so nothing is ever paywalled.
 
 ---
 

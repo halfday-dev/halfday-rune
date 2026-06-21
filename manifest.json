@@ -4,7 +4,8 @@
   "description": "Born-encrypted notes using age (X25519) at rest, with live-preview markdown rendering in memory.",
   "author": "Halfday.dev",
   "authorUrl": "https://halfday.dev",
+  "fundingUrl": "https://buymeacoffee.com/halfday",
   "minAppVersion": "1.5.0",
-  "version": "0.6.5",
+  "version": "0.6.6",
   "isDesktopOnly": true
 }

@@ -1,31 +1,35 @@
 /**
- * v0.5.2: Pre-rotation backup. Tars + gzips every `.age` file in the vault
- * to `~/halfday/logs/age-backups/age-backup-{ISO}.tar.gz` BEFORE rotation
- * touches anything. Auto-toggle in settings (default ON). Mirrors today's
+ * v0.5.2 / v0.6.6: Pre-rotation backup. Copies every `.age` file in the
+ * vault into a fresh timestamped directory at
+ * `~/halfday/logs/age-backups/age-backup-{ISO}/` BEFORE rotation touches
+ * anything. Auto-toggle in settings (default ON). Mirrors today's
  * pre-seal backup pattern from seal.sh.
  *
+ * v0.6.6 change — NO MORE SHELL OUT.
+ *   Earlier versions shelled out to `/usr/bin/tar` via child_process to
+ *   produce a single `.tar.gz`. The Obsidian community-catalog review
+ *   (correctly) flags any `child_process` use as "Shell Execution — full
+ *   control over the system", which is a poor signal for a security
+ *   plugin. We now do a pure Node `fs` copy: no child_process, no shell,
+ *   no archive tool dependency. The backup is a plain directory of file
+ *   copies instead of a tarball — functionally identical for recovery
+ *   (copy the files back), and gzip barely compresses age ciphertext
+ *   anyway, so we lose nothing meaningful.
+ *
  * Why out-of-vault?
- *   - keeps iCloud sync from churning on a tarball it doesn't need
+ *   - keeps iCloud sync from churning on backup copies it doesn't need
  *   - the backup is a recovery artifact, not vault content
  *   - matches `~/halfday/logs/seal.log` placement, so all halfday-CLI/plugin
  *     crash-recovery state lives in one well-known directory
  *
- * Why shell-out to `tar`?
- *   - Electron has node child_process; no new npm dep
- *   - tar handles symlinks, permissions, and large file lists faster than
- *     any pure-JS implementation we'd ship
- *   - `-C vaultBase` lets the archive store relative paths so a restore
- *     extracts cleanly into any vault root
- *
- * Throws on non-zero tar exit. Caller (main.ts rotate command) aborts the
- * whole rotation in that case — no partial backups, no half-rotated vaults
- * with no safety net.
+ * Throws if any copy fails. Caller (main.ts rotate command) aborts the
+ * whole rotation in that case — no partial backups, no half-rotated
+ * vaults with no safety net.
  */
 
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { execFile } from "child_process";
 
 /** Default backup directory. Override-able via `backupDir` arg. */
 export const DEFAULT_BACKUP_DIR = path.join(
@@ -36,21 +40,30 @@ export const DEFAULT_BACKUP_DIR = path.join(
 );
 
 export interface BackupResult {
-  /** Absolute path to the created tar.gz. */
+  /** Absolute path to the created backup directory (empty string if no-op). */
   path: string;
-  /** Size of the tar.gz in bytes (post-gzip, not sum-of-inputs). */
+  /** Number of files copied. */
+  count: number;
+  /** Total bytes copied (sum of input file sizes). */
   bytes: number;
-  /** ISO timestamp embedded in the filename — handy for log lines. */
+  /** ISO timestamp embedded in the directory name — handy for log lines. */
   timestamp: string;
 }
 
 /**
- * Backup all `.age` files at `relPaths` (relative to `vaultBase`) into a
- * single tar.gz. Empty `relPaths` is a no-op that returns a result with
- * `path: ""` so the caller can report "nothing to back up" without
- * branching on whether tar was invoked.
+ * Back up all `.age` files at `relPaths` (relative to `vaultBase`) by
+ * copying each into a fresh `age-backup-{ISO}/` directory under
+ * `backupDir`, preserving the file's relative subpath. Empty `relPaths`
+ * is a no-op that returns a result with `path: ""` so the caller can
+ * report "nothing to back up" without branching.
  *
- * `backupDir` is created (recursive) before tar runs.
+ * The timestamped subdir and any nested parent dirs are created
+ * (recursive) before each copy.
+ *
+ * Fails closed: the first copy error throws, and the caller aborts the
+ * rotation. A partial backup directory may be left behind on failure —
+ * harmless (it's a recovery artifact in a logs dir), and rotation never
+ * proceeds without a complete backup.
  */
 export async function backupAgeFiles(
   vaultBase: string,
@@ -60,53 +73,35 @@ export async function backupAgeFiles(
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
 
   if (relPaths.length === 0) {
-    return { path: "", bytes: 0, timestamp };
+    return { path: "", count: 0, bytes: 0, timestamp };
   }
 
-  fs.mkdirSync(backupDir, { recursive: true });
-  const archivePath = path.join(backupDir, `age-backup-${timestamp}.tar.gz`);
+  const backupRoot = path.join(backupDir, `age-backup-${timestamp}`);
+  fs.mkdirSync(backupRoot, { recursive: true });
 
-  // -C runs tar relative to vaultBase so the archive stores paths as
-  // `subdir/file.age` rather than absolute paths. Easier to reason about
-  // on restore. Use --no-mac-metadata to skip ._foo AppleDouble files
-  // that iCloud occasionally leaves around — they're not vault content
-  // and bloat the archive. (BSD tar on macOS supports the flag; GNU tar
-  // on Linux ignores unknown flags after a warning, but we're targeting
-  // macOS via Electron.)
-  //
-  // L2: `--` separator before the file list prevents any future filename
-  // starting with `-` from being parsed as a flag. (Obsidian itself
-  // doesn't allow leading-`-` filenames, but defense-in-depth — if a
-  // weird vault import ever sneaks one in, tar must treat it as a path.)
-  const args = ["-czf", archivePath, "-C", vaultBase, "--", ...relPaths];
-  await runTar(args);
+  let bytes = 0;
+  let copied = 0;
+  for (const rel of relPaths) {
+    // Defense-in-depth: keep every copy strictly inside backupRoot.
+    // Vault API paths are always in-vault relative paths, but reject
+    // anything absolute (path.join would quietly contain it) or escaping
+    // via `..`, rather than silently writing to an unexpected location.
+    const dest = path.join(backupRoot, rel);
+    if (path.isAbsolute(rel) || path.relative(backupRoot, dest).startsWith("..")) {
+      throw new Error(`backup: refusing to write outside backup dir: ${rel}`);
+    }
 
-  const stat = fs.statSync(archivePath);
-  return { path: archivePath, bytes: stat.size, timestamp };
-}
+    const src = path.join(vaultBase, rel);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    // copyFileSync is a byte-exact copy — correct for ciphertext.
+    fs.copyFileSync(src, dest);
+    bytes += fs.statSync(dest).size;
+    copied++;
+  }
 
-/**
- * L2: pin the tar binary to `/usr/bin/tar` instead of resolving via PATH.
- * Eliminates a hijack vector if a user-writable directory (e.g. /usr/local/bin
- * or a Homebrew prefix on Apple Silicon) ever appears earlier in PATH and
- * shadows system tar. macOS guarantees /usr/bin/tar is BSD tar; that's the
- * version we tested -czf + -C against.
- */
-const TAR_BIN = "/usr/bin/tar";
-
-function runTar(args: string[]): Promise<void> {
-  return new Promise((resolve, reject) => {
-    execFile(TAR_BIN, args, { maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) {
-        const code = (err as NodeJS.ErrnoException).code ?? "unknown";
-        reject(
-          new Error(
-            `tar failed (code=${code}): ${stderr?.toString().trim() || err.message}`
-          )
-        );
-        return;
-      }
-      resolve();
-    });
-  });
+  // `copied` is incremented only after a successful copy, so it can never
+  // over-report even if a future edit adds per-file error tolerance to the
+  // loop. (Today the loop throws on first error, so copied === relPaths.length
+  // on the success path.)
+  return { path: backupRoot, count: copied, bytes, timestamp };
 }
