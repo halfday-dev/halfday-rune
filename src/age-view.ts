@@ -143,7 +143,7 @@ export class AgeFileView extends FileView {
 
   // dirty / autosave bookkeeping — reset on every onLoadFile
   private dirty = false;
-  private autosaveTimer: ReturnType<typeof setTimeout> | null = null;
+  private autosaveTimer: number | null = null;
   private inFlightSave: Promise<void> | null = null;
   private lastSavedAt: Date | null = null;
   /** Byte-length of the ciphertext we last successfully wrote — surfaced via the status bar. */
@@ -415,7 +415,7 @@ export class AgeFileView extends FileView {
 
   private scheduleAutosave(): void {
     this.cancelAutosave();
-    this.autosaveTimer = setTimeout(() => {
+    this.autosaveTimer = window.setTimeout(() => {
       this.autosaveTimer = null;
       void this.save("autosave");
     }, AUTOSAVE_DELAY_MS);
@@ -423,7 +423,7 @@ export class AgeFileView extends FileView {
 
   private cancelAutosave(): void {
     if (this.autosaveTimer !== null) {
-      clearTimeout(this.autosaveTimer);
+      window.clearTimeout(this.autosaveTimer);
       this.autosaveTimer = null;
     }
   }
@@ -435,7 +435,7 @@ export class AgeFileView extends FileView {
    */
   private async save(reason: SaveReason): Promise<void> {
     if (!this.editor || !this.file) return;
-    if (this.inFlightSave) {
+    if (this.inFlightSave !== null) {
       try {
         await this.inFlightSave;
       } catch {

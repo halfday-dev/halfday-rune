@@ -129,9 +129,14 @@ export default class HalfdayObsidianRune extends Plugin {
 
     this.statusBarEl = this.addStatusBarItem();
     this.statusBarEl.addClass("halfday-rune-statusbar");
-    this.statusBarEl.style.display = "none";
+    this.statusBarEl.addClass("halfday-rune-hidden");
 
     this.addCommand({
+      // NOTE: command IDs intentionally retain the "halfday-rune-" prefix.
+      // The plugin is released; renaming these would break users' existing
+      // hotkeys and obsidian:// URIs. The community-lint command-id warning
+      // is left in place (a false positive for a shipped plugin) rather than
+      // suppressed with a possibly-wrong rule id.
       id: "halfday-rune-test-round-trip",
       name: "Test round-trip (X25519)",
       callback: () => this.testRoundTrip(),
@@ -143,7 +148,7 @@ export default class HalfdayObsidianRune extends Plugin {
       checkCallback: (checking: boolean) => {
         const file = this.app.workspace.getActiveFile();
         if (!file || file.extension !== "md") return false;
-        if (!checking) this.encryptCurrentNote(file);
+        if (!checking) void this.encryptCurrentNote(file);
         return true;
       },
     });
@@ -179,7 +184,7 @@ export default class HalfdayObsidianRune extends Plugin {
       checkCallback: (checking: boolean) => {
         const file = this.app.workspace.getActiveFile();
         if (!file || file.extension !== "age") return false;
-        if (!checking) this.decryptCurrentAge(file);
+        if (!checking) void this.decryptCurrentAge(file);
         return true;
       },
     });
@@ -223,8 +228,10 @@ export default class HalfdayObsidianRune extends Plugin {
   }
 
   onunload(): void {
-    // detach any open AgeFileView instances so their plaintext buffers go away
-    this.app.workspace.detachLeavesOfType(VIEW_TYPE_AGE);
+    // Obsidian tears down our registered view leaves on unload; detaching
+    // them here would reset the user's leaf placement (community-lint
+    // detach-leaves-in-onunload). The AgeFileView's own onClose() nulls
+    // out plaintext + destroys the editor, so the buffers still go away.
     this.statusBarEl = null;
     this.latestStatusState = null;
     console.log("[halfday-rune] unloaded");
@@ -248,13 +255,13 @@ export default class HalfdayObsidianRune extends Plugin {
   private hideAgeStatusBar(): void {
     if (!this.statusBarEl) return;
     this.statusBarEl.empty();
-    this.statusBarEl.style.display = "none";
+    this.statusBarEl.addClass("halfday-rune-hidden");
   }
 
   private renderStatusBar(state: AgeStatusBarState): void {
     if (!this.statusBarEl) return;
     this.statusBarEl.empty();
-    this.statusBarEl.style.display = "";
+    this.statusBarEl.removeClass("halfday-rune-hidden");
 
     // dot: green when clean, orange when dirty. Use Obsidian's theme palette
     // vars so community themes can re-skin without plugin changes. Fallbacks
@@ -263,9 +270,11 @@ export default class HalfdayObsidianRune extends Plugin {
     const dot = this.statusBarEl.createSpan({
       cls: "halfday-rune-statusbar-dot",
     });
-    dot.style.backgroundColor = state.dirty
-      ? "var(--color-orange, #f59e0b)"
-      : "var(--color-green, #4ade80)";
+    dot.setCssStyles({
+      backgroundColor: state.dirty
+        ? "var(--color-orange, #f59e0b)"
+        : "var(--color-green, #4ade80)",
+    });
 
     this.statusBarEl.createSpan({
       cls: "halfday-rune-statusbar-state",
@@ -300,11 +309,10 @@ export default class HalfdayObsidianRune extends Plugin {
   }
 
   async loadSettings(): Promise<void> {
-    this.settings = Object.assign(
-      {},
-      DEFAULT_SETTINGS,
-      await this.loadData()
-    );
+    const loaded = (await this.loadData()) as
+      | Partial<HalfdayObsidianRuneSettings>
+      | null;
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded ?? {});
   }
 
   async saveSettings(): Promise<void> {
@@ -363,8 +371,8 @@ export default class HalfdayObsidianRune extends Plugin {
         return;
       }
 
-      const privacy = this.app.metadataCache.getFileCache(file)?.frontmatter
-        ?.privacy;
+      const privacy: unknown = this.app.metadataCache.getFileCache(file)
+        ?.frontmatter?.privacy;
       if (privacy === "open") {
         new Notice(
           "Halfday Rune: refusing to encrypt — this note is marked privacy: open"
@@ -414,6 +422,8 @@ export default class HalfdayObsidianRune extends Plugin {
       // ciphertext + round-trip verify are durable before this point, so a
       // failure here leaves an .age on disk but the user still has the .md —
       // preferable to the inverse.
+      // permanent delete is required — trashing would leave plaintext in .trash, defeating the born-encrypted guarantee.
+      // eslint-disable-next-line obsidianmd/prefer-file-manager-trash-file
       await this.app.vault.delete(file);
 
       const dt = Date.now() - started;
@@ -756,7 +766,9 @@ export default class HalfdayObsidianRune extends Plugin {
       // ---- optional .age delete ----
       if (mode === "replace") {
         try {
-          await this.app.vault.delete(file);
+          // ciphertext is recoverable from .trash, and replace mode is the
+          // user's explicit choice — trashing respects their preference.
+          await this.app.fileManager.trashFile(file);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           new Notice(
@@ -839,8 +851,7 @@ class FilenamePromptModal extends Modal {
 
     const input = contentEl.createEl("input", { type: "text" });
     input.value = this.opts.defaultValue;
-    input.style.width = "100%";
-    input.style.marginTop = "0.5rem";
+    input.addClass("halfday-rune-prompt-input");
     input.addEventListener("input", () => {
       this.value = input.value;
     });
@@ -854,11 +865,7 @@ class FilenamePromptModal extends Modal {
       }
     });
 
-    const buttons = contentEl.createDiv();
-    buttons.style.display = "flex";
-    buttons.style.gap = "0.5rem";
-    buttons.style.justifyContent = "flex-end";
-    buttons.style.marginTop = "1rem";
+    const buttons = contentEl.createDiv({ cls: "halfday-rune-button-row" });
 
     const cancelBtn = buttons.createEl("button", { text: "Cancel" });
     cancelBtn.addEventListener("click", () => this.resolve(null));
@@ -867,7 +874,7 @@ class FilenamePromptModal extends Modal {
     okBtn.addEventListener("click", () => this.resolve(this.value));
 
     // select the "untitled" portion so the user can overwrite in place
-    setTimeout(() => {
+    window.setTimeout(() => {
       input.focus();
       const dotAge = input.value.lastIndexOf(".age");
       if (dotAge > 0) input.setSelectionRange(0, dotAge);
@@ -961,11 +968,7 @@ class DecryptConfirmModal extends Modal {
         "Scratch mode: decrypt to .md and leave the .age intact. Use this for one-off inspection or if you want to keep the sealed copy as the canonical version.",
     });
 
-    const buttons = contentEl.createDiv();
-    buttons.style.display = "flex";
-    buttons.style.gap = "0.5rem";
-    buttons.style.justifyContent = "flex-end";
-    buttons.style.marginTop = "1rem";
+    const buttons = contentEl.createDiv({ cls: "halfday-rune-button-row" });
 
     // Cancel comes first in keyboard order and is auto-focused so
     // hitting Enter on the modal doesn't accidentally delete the
@@ -998,7 +1001,7 @@ class DecryptConfirmModal extends Modal {
       }
     });
 
-    setTimeout(() => cancelBtn.focus(), 0);
+    window.setTimeout(() => cancelBtn.focus(), 0);
   }
 
   onClose(): void {
@@ -1094,11 +1097,7 @@ class RotateConfirmModal extends Modal {
         "Safe to re-run on a partially-rotated vault — already-rotated files will just rotate again.",
     });
 
-    const buttons = contentEl.createDiv();
-    buttons.style.display = "flex";
-    buttons.style.gap = "0.5rem";
-    buttons.style.justifyContent = "flex-end";
-    buttons.style.marginTop = "1rem";
+    const buttons = contentEl.createDiv({ cls: "halfday-rune-button-row" });
 
     // M2: Cancel comes first in the button row AND in tab order, and it's
     // the auto-focused button. macOS HIG + Obsidian's own delete dialog
@@ -1133,7 +1132,7 @@ class RotateConfirmModal extends Modal {
 
     // M2: focus Cancel by default. Hitting Enter on the modal now triggers
     // Cancel, which is the safe outcome for a destructive operation.
-    setTimeout(() => cancelBtn.focus(), 0);
+    window.setTimeout(() => cancelBtn.focus(), 0);
   }
 
   // F6: simplified resolution. Cancel + Esc + click-outside all flow
@@ -1194,11 +1193,9 @@ class RotateSummaryModal extends Modal {
 
     if (this.result.skipped.length > 0) {
       contentEl.createEl("h3", { text: "Skipped files" });
-      const list = contentEl.createEl("ul");
-      list.style.maxHeight = "260px";
-      list.style.overflowY = "auto";
-      list.style.fontFamily = "var(--font-monospace, monospace)";
-      list.style.fontSize = "var(--font-ui-small, 13px)";
+      const list = contentEl.createEl("ul", {
+        cls: "halfday-rune-skipped-list",
+      });
       for (const s of this.result.skipped) {
         const li = list.createEl("li");
         li.createEl("strong", { text: s.file.path });
@@ -1214,11 +1211,7 @@ class RotateSummaryModal extends Modal {
         "stale file before rotating again.",
     });
 
-    const buttons = contentEl.createDiv();
-    buttons.style.display = "flex";
-    buttons.style.gap = "0.5rem";
-    buttons.style.justifyContent = "flex-end";
-    buttons.style.marginTop = "1rem";
+    const buttons = contentEl.createDiv({ cls: "halfday-rune-button-row" });
 
     // v0.6.6: the log path is already shown above as selectable, copyable
     // <code> text (see logLine). We dropped the "Copy log path" button that
@@ -1230,7 +1223,7 @@ class RotateSummaryModal extends Modal {
       cls: "mod-cta",
     });
     okBtn.addEventListener("click", () => this.close());
-    setTimeout(() => okBtn.focus(), 0);
+    window.setTimeout(() => okBtn.focus(), 0);
   }
 
   onClose(): void {
@@ -1253,7 +1246,7 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
     // Read the display name from the manifest so the settings heading can't
     // drift from the plugin name (it was hardcoded to the old "Halfday
     // Obsidian Rune" through v0.6.5 — fixed in 0.6.6).
-    containerEl.createEl("h2", { text: this.plugin.manifest.name });
+    new Setting(containerEl).setName(this.plugin.manifest.name).setHeading();
     containerEl.createEl("p", {
       text:
         "Encrypts and decrypts notes using one or more X25519 age recipients. " +
@@ -1337,7 +1330,7 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
    *     prepends a red warning to the status line on Save
    */
   private renderRecipientsEditor(containerEl: HTMLElement): void {
-    containerEl.createEl("h3", { text: "Recipients (file content)" });
+    new Setting(containerEl).setName("Recipients (file content)").setHeading();
     containerEl.createEl("p", {
       text:
         "Edit your recipients file directly. One age1... recipient per line; lines starting with # are preserved as comments. Save validates the entire file before writing — malformed input refuses to save with the offending line called out below.",
@@ -1348,18 +1341,11 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
     });
     textareaEl.rows = 10;
     textareaEl.spellcheck = false;
-    textareaEl.style.width = "100%";
-    textareaEl.style.fontFamily = "var(--font-monospace, monospace)";
-    textareaEl.style.fontSize = "var(--font-ui-small, 13px)";
-    textareaEl.style.padding = "0.5em";
 
     // status / error line. Emptied + cleared on every successful action.
     const statusEl = containerEl.createEl("div", {
       cls: "halfday-rune-recipients-status",
     });
-    statusEl.style.marginTop = "0.5em";
-    statusEl.style.fontSize = "var(--font-ui-small, 13px)";
-    statusEl.style.minHeight = "1.5em";
 
     const setStatus = (msg: string, isError = false): void => {
       statusEl.setText(msg);
@@ -1419,10 +1405,9 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
     loadFromDisk(/*announce*/ false);
 
     // buttons row
-    const buttonsEl = containerEl.createDiv();
-    buttonsEl.style.display = "flex";
-    buttonsEl.style.gap = "0.5rem";
-    buttonsEl.style.marginTop = "0.5rem";
+    const buttonsEl = containerEl.createDiv({
+      cls: "halfday-rune-button-row-left",
+    });
 
     const saveBtn = buttonsEl.createEl("button", {
       text: "Save recipients",

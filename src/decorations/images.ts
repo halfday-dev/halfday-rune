@@ -83,7 +83,7 @@ class ImagePlaceholderWidget extends WidgetType {
   }
 
   toDOM(): HTMLElement {
-    const span = document.createElement("span");
+    const span = activeDocument.createElement("span");
     span.className = PLACEHOLDER_CLASS;
     // textContent (not innerHTML) is load-bearing: the alt + url come
     // from cleartext which can contain `<`, `&`, or `"` — putting them

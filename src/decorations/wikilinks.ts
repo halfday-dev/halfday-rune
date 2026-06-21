@@ -62,7 +62,7 @@ const HIDE_WIKILINK_BRACKETS = Decoration.replace({});
  * Inner content (between `[[` and `]]`) — must not contain `[`, `]`, or
  * newline. Non-greedy so adjacent wikilinks don't collapse.
  */
-const WIKILINK_RE = /\[\[([^\[\]\n]+?)\]\]/g;
+const WIKILINK_RE = /\[\[([^[\]\n]+?)\]\]/g;
 
 interface PendingMark {
   from: number;

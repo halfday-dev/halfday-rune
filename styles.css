@@ -1,5 +1,61 @@
 /* Halfday Obsidian Rune — styles */
 
+/* v0.6.6 lint pass: classes replacing inline `el.style.*` assignments in
+ * main.ts (community-lint no-static-styles-assignment). Static layout +
+ * type styles live here; only the dynamic status-dot color stays in JS
+ * (it depends on dirty state) via setCssStyles. */
+
+/* Toggle for the status-bar item — shown when an AgeFileView is active,
+ * hidden otherwise. Replaces `statusBarEl.style.display = "none" | ""`. */
+.halfday-rune-hidden {
+  display: none;
+}
+
+/* Right-aligned modal button row (Cancel + action). Replaces the inline
+ * flex/gap/justify/margin block repeated across the modals. */
+.halfday-rune-button-row {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-end;
+  margin-top: 1rem;
+}
+
+/* Left-aligned button row used by the recipients editor (Save / Reload). */
+.halfday-rune-button-row-left {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+/* FilenamePromptModal text input. */
+.halfday-rune-prompt-input {
+  width: 100%;
+  margin-top: 0.5rem;
+}
+
+/* RotateSummaryModal — scrollable monospace list of skipped files. */
+.halfday-rune-skipped-list {
+  max-height: 260px;
+  overflow-y: auto;
+  font-family: var(--font-monospace, monospace);
+  font-size: var(--font-ui-small, 13px);
+}
+
+/* Recipients editor textarea (settings tab). */
+.halfday-rune-recipients-textarea {
+  width: 100%;
+  font-family: var(--font-monospace, monospace);
+  font-size: var(--font-ui-small, 13px);
+  padding: 0.5em;
+}
+
+/* Recipients editor status / error line. */
+.halfday-rune-recipients-status {
+  margin-top: 0.5em;
+  font-size: var(--font-ui-small, 13px);
+  min-height: 1.5em;
+}
+
 /* AgeFileView — v0.6.0: pane is just the editor host. No banner, no
  * padding around the host (CM6's `.cm-content` padding handles the
  * inner gutter so it matches Obsidian's own editor spacing). */

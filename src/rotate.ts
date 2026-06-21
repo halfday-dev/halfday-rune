@@ -23,7 +23,7 @@
  * recipient list isn't worth the complexity at v0.
  */
 
-import type { TFile, Vault } from "obsidian";
+import type { TFile } from "obsidian";
 
 /**
  * The minimal Vault surface the rotator uses. Defined as a structural type
