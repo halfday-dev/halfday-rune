@@ -422,9 +422,12 @@ export default class HalfdayObsidianRune extends Plugin {
       // ciphertext + round-trip verify are durable before this point, so a
       // failure here leaves an .age on disk but the user still has the .md —
       // preferable to the inverse.
-      // permanent delete is required — trashing would leave plaintext in .trash, defeating the born-encrypted guarantee.
-      // eslint-disable-next-line obsidianmd/prefer-file-manager-trash-file
-      await this.app.vault.delete(file);
+      // Blank the plaintext BEFORE trashing so no readable copy lands in
+      // .trash — this preserves the born-encrypted guarantee (cleartext is
+      // overwritten, not just unlinked) while still using the user's
+      // preferred trash flow (Obsidian's recommended deletion path).
+      await this.app.vault.modify(file, "");
+      await this.app.fileManager.trashFile(file);
 
       const dt = Date.now() - started;
       new Notice(
