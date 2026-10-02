@@ -6,6 +6,6 @@
   "authorUrl": "https://halfday.dev",
   "fundingUrl": "https://buymeacoffee.com/halfday",
   "minAppVersion": "1.6.6",
-  "version": "0.6.8",
-  "isDesktopOnly": true
+  "version": "0.7.0",
+  "isDesktopOnly": false
 }

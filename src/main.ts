@@ -242,11 +242,14 @@ export default class HalfdayObsidianRune extends Plugin {
     // recipients list. Pre-flight confirm dialog + optional pre-rotation
     // backup copy are intentional friction — this is the most destructive
     // plugin operation we ship.
-    this.addCommand({
-      id: "halfday-rune-rotate-keys",
-      name: "Rotate vault keys",
-      callback: () => this.rotateKeys(),
-    });
+    // Desktop only: reads the vault's base path and writes backups/logs.
+    if (Platform.isDesktopApp) {
+      this.addCommand({
+        id: "halfday-rune-rotate-keys",
+        name: "Rotate vault keys",
+        callback: () => this.rotateKeys(),
+      });
+    }
 
     // v0.6.3: inverse of "Encrypt current note → .age". Reads a .age
     // file, decrypts it, writes a sibling .md, and (optionally) deletes
@@ -1414,63 +1417,68 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
     // Obsidian Rune" through v0.6.5 — fixed in 0.6.6).
     new Setting(containerEl).setName(this.plugin.manifest.name).setHeading();
     containerEl.createEl("p", {
-      text:
-        "Encrypts and decrypts notes using one or more X25519 age recipients. " +
-        "Configure paths to your recipients file (public keys) and identity (private key) below. " +
-        "Generate a keypair with `age-keygen -o ~/.age/vault.identity` and put each recipient " +
-        "(public key) line in `~/.age/recipients.txt`. Lines starting with `#` are treated as " +
-        "comments — useful for labeling each recipient (e.g. `# main mac` on the line above its key).",
+      text: Platform.isDesktopApp
+        ? "Encrypts and decrypts notes using one or more X25519 age recipients. " +
+          "Configure paths to your recipients file (public keys) and identity (private key) below. " +
+          "Generate a keypair with `age-keygen -o ~/.age/vault.identity` and put each recipient " +
+          "(public key) line in `~/.age/recipients.txt`. Lines starting with `#` are treated as " +
+          "comments — useful for labeling each recipient (e.g. `# main mac` on the line above its key)."
+        : "Unlock rune with the passphrase for your mobile unlock copy " +
+          "(created on desktop with 'Create mobile unlock copy'). The key is held in memory only " +
+          "and is dropped by the lock settings below.",
     });
 
-    new Setting(containerEl)
-      .setName("Recipients file path")
-      .setDesc(
-        'File containing one or more age recipient lines (each starting with "age1..."). ' +
-          'Lines starting with "#" are comments. Tilde expands to your home directory. ' +
-          "If the file is missing or malformed, encrypt-related commands will fail loudly."
-      )
-      .addText((text) =>
-        text
-          .setPlaceholder("~/.age/recipients.txt")
-          .setValue(this.plugin.settings.recipientsPath)
-          .onChange(async (value) => {
-            this.plugin.settings.recipientsPath = value.trim();
-            await this.plugin.saveSettings();
-          })
-      );
+    if (Platform.isDesktopApp) {
+      new Setting(containerEl)
+        .setName("Recipients file path")
+        .setDesc(
+          'File containing one or more age recipient lines (each starting with "age1..."). ' +
+            'Lines starting with "#" are comments. Tilde expands to your home directory. ' +
+            "If the file is missing or malformed, encrypt-related commands will fail loudly."
+        )
+        .addText((text) =>
+          text
+            .setPlaceholder("~/.age/recipients.txt")
+            .setValue(this.plugin.settings.recipientsPath)
+            .onChange(async (value) => {
+              this.plugin.settings.recipientsPath = value.trim();
+              await this.plugin.saveSettings();
+            })
+        );
 
-    new Setting(containerEl)
-      .setName("Identity path")
-      .setDesc(
-        "File containing your age identity (AGE-SECRET-KEY-1...). The plugin reads this on demand; it is never written anywhere."
-      )
-      .addText((text) =>
-        text
-          .setPlaceholder("~/.age/vault.identity")
-          .setValue(this.plugin.settings.identityPath)
-          .onChange(async (value) => {
-            this.plugin.settings.identityPath = value.trim();
-            await this.plugin.saveSettings();
-          })
-      );
+      new Setting(containerEl)
+        .setName("Identity path")
+        .setDesc(
+          "File containing your age identity (AGE-SECRET-KEY-1...). The plugin reads this on demand; it is never written anywhere."
+        )
+        .addText((text) =>
+          text
+            .setPlaceholder("~/.age/vault.identity")
+            .setValue(this.plugin.settings.identityPath)
+            .onChange(async (value) => {
+              this.plugin.settings.identityPath = value.trim();
+              await this.plugin.saveSettings();
+            })
+        );
 
-    // v0.5.2: pre-rotation backup toggle. ON by default — see RotateConfirmModal
-    // copy. The backup lands at ~/halfday/logs/age-backups/, out-of-vault.
-    new Setting(containerEl)
-      .setName("Auto-backup before rotate")
-      .setDesc(
-        "When running 'Rotate vault keys', copy every .age file to " +
-          "~/halfday/logs/age-backups/ before re-encrypting. Recommended ON. " +
-          "Turn off only if you have your own backup discipline."
-      )
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.autoBackupBeforeRotate)
-          .onChange(async (value) => {
-            this.plugin.settings.autoBackupBeforeRotate = value;
-            await this.plugin.saveSettings();
-          })
-      );
+      // v0.5.2: pre-rotation backup toggle. ON by default — see RotateConfirmModal
+      // copy. The backup lands at ~/halfday/logs/age-backups/, out-of-vault.
+      new Setting(containerEl)
+        .setName("Auto-backup before rotate")
+        .setDesc(
+          "When running 'Rotate vault keys', copy every .age file to " +
+            "~/halfday/logs/age-backups/ before re-encrypting. Recommended ON. " +
+            "Turn off only if you have your own backup discipline."
+        )
+        .addToggle((toggle) =>
+          toggle
+            .setValue(this.plugin.settings.autoBackupBeforeRotate)
+            .onChange(async (value) => {
+              this.plugin.settings.autoBackupBeforeRotate = value;
+              await this.plugin.saveSettings();
+            })
+        );
+    }
 
     new Setting(containerEl)
       .setName("Mobile unlock file")
@@ -1491,6 +1499,42 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           });
       });
+
+    // Mobile lock behaviour. Used by the phone; harmless on desktop.
+    const numberSetting = (
+      name: string,
+      desc: string,
+      get: () => number,
+      set: (n: number) => void
+    ): void => {
+      new Setting(containerEl)
+        .setName(name)
+        .setDesc(desc)
+        .addText((text) => {
+          text.inputEl.type = "number";
+          text.inputEl.min = "0";
+          text.setValue(String(get())).onChange(async (value) => {
+            const n = Number(value.trim());
+            const ok = value.trim() !== "" && Number.isInteger(n) && n >= 0 && n <= 100000;
+            text.inputEl.toggleClass("halfday-rune-invalid", !ok);
+            if (!ok) return;
+            set(n);
+            await this.plugin.saveSettings();
+          });
+        });
+    };
+    numberSetting(
+      "Auto-lock after idle (minutes)",
+      "Mobile: lock rune after this many minutes without use. 0 = never.",
+      () => this.plugin.settings.autoLockMinutes,
+      (n) => (this.plugin.settings.autoLockMinutes = n)
+    );
+    numberSetting(
+      "Lock after leaving the app (seconds)",
+      "Mobile: lock rune this many seconds after the app goes to the background. 0 = immediately.",
+      () => this.plugin.settings.backgroundLockGraceSeconds,
+      (n) => (this.plugin.settings.backgroundLockGraceSeconds = n)
+    );
 
     // v0.5.1: in-place editor for recipients.txt content. The path field
     // above controls WHICH file this textarea operates on. We use raw

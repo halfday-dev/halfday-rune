@@ -68,12 +68,34 @@ grep '^# public key:' ~/.age/vault.identity \
 
 ### Plugin settings
 
-Halfday Rune's settings tab has three fields:
+Halfday Rune's settings tab has these fields (the first three are desktop-only; the mobile ones are described under *Using rune on your phone*):
 - **Recipients file path** — defaults to `~/.age/recipients.txt`.
 - **Identity path** — defaults to `~/.age/vault.identity`.
-- **Auto-backup before rotate** — on by default. Creates a tar.gz of every `.age` file at `~/halfday/logs/age-backups/` before running `Rotate vault keys`.
+- **Auto-backup before rotate** — on by default. Copies every `.age` file to `~/halfday/logs/age-backups/` before running `Rotate vault keys`.
+- **Mobile unlock file**, **Auto-lock after idle**, **Lock after leaving the app** — see below.
 
 There's also an inline "Recipients (file content)" editor — paste your `age1...` lines, save, and the plugin writes them to disk verbatim (preserving comments and ordering). Save validates the whole file before writing; malformed input refuses to save with the offending line called out inline.
+
+### Using rune on your phone
+
+Rune runs on Obsidian mobile. Your key never leaves your desktop in the clear: you make a passphrase-protected copy of it, it syncs with the vault, and the phone unlocks it once per session and keeps it in memory only.
+
+1. **Set up (desktop, once).** Command palette → `Halfday Rune: Create mobile unlock copy`. Choose a long random passphrase (20+ characters, from a password manager). Rune writes `_rune/identity.age` in your vault and checks it by unwrapping it again before reporting success. If the file already exists you are asked before it is replaced. The path is the **Mobile unlock file** setting.
+2. **Let it sync.** The `_rune` folder is a normal visible folder so Obsidian Sync and iCloud carry it. If you use Obsidian Sync, enable "Other file types" so `.age` files sync.
+3. **Unlock (phone).** Open any `.age` note, or run `Halfday Rune: Unlock rune`. Enter the passphrase (a password manager can fill it). A wrong passphrase shows "Wrong passphrase" and lets you retry. Notes you write on the phone are encrypted to your main key and open on desktop as usual.
+4. **Lock.** `Halfday Rune: Lock rune now`, or tap the "rune: unlocked" status-bar item. Open notes switch to a locked screen and their decrypted text is discarded. Two settings lock automatically:
+   - **Auto-lock after idle (minutes)**, default 15. `0` = never.
+   - **Lock after leaving the app (seconds)**, default 60. `0` = lock the moment the app is backgrounded.
+
+Rotating the key and editing recipients stay desktop-only. The mobile copy covers your main key only.
+
+### Lost your phone?
+
+The unlock file in your vault is useless without its passphrase, but anyone holding the file can guess the passphrase offline with no rate limit, which is why it must be long and random. If you lose a phone:
+
+1. **Change the passphrase.** On desktop, run `Create mobile unlock copy` again with a NEW passphrase and confirm the replacement. The old passphrase stops working on new copies of the file. This does not help against someone who already has a copy of the old file plus the old passphrase: assume that person has your key.
+2. **If the old passphrase may have leaked** (or the phone was unlocked when lost), rotate the key: create a new key, run `Rotate vault keys` to re-encrypt every note, then run `Create mobile unlock copy` again so the phone copy holds the new key.
+3. **Remove rune from the lost device's sync** if you can (sign the device out of Obsidian Sync / iCloud), and delete any stale copies of the old `_rune/identity.age`.
 
 ### Usage
 
@@ -109,7 +131,7 @@ Halfday Rune exists because **plaintext on disk is the primary risk for a vault 
 
 A security plugin should be legible about every capability it uses. Here's the full list — including the ones an automated reviewer (correctly) flags — and why each is necessary:
 
-- **Filesystem access outside the vault (Node `fs`).** Halfday Rune reads your age identity from `~/.age/vault.identity` and your recipient public keys from `~/.age/recipients.txt`, and writes rotation logs and pre-rotation backups under `~/halfday/logs/`. **The identity lives *outside* the vault on purpose:** storing your private key inside the encrypted vault it unlocks would defeat the encryption. Logs and backups stay out of the vault so cloud sync doesn't churn on recovery artifacts. This out-of-vault filesystem dependency is also why the plugin is **desktop-only** — Obsidian mobile has no equivalent filesystem access.
+- **Filesystem access outside the vault (Node `fs`).** Halfday Rune reads your age identity from `~/.age/vault.identity` and your recipient public keys from `~/.age/recipients.txt`, and writes rotation logs and pre-rotation backups under `~/halfday/logs/`. **The identity lives *outside* the vault on purpose:** storing your private key inside the encrypted vault it unlocks would defeat the encryption. Logs and backups stay out of the vault so cloud sync doesn't churn on recovery artifacts. On desktop this is the key source. Obsidian mobile has no such filesystem access, so the phone uses a passphrase-protected copy of the identity stored in the vault (`_rune/identity.age`, read through the Obsidian vault API) and holds the unlocked key in memory only; rotate, backup and the recipients editor stay desktop-only.
 - **Vault enumeration (Obsidian API).** The "Rotate vault keys" command lists `.age` files via Obsidian's vault API so it can re-encrypt every sealed note to your current recipient set. It only ever reads `.age` paths; it does not read or index your plaintext notes.
 - **No shell execution.** As of v0.6.6 the plugin uses **no `child_process` and runs no shell commands**. The pre-rotation backup is a plain Node `fs` file copy. (Earlier versions shelled out to `tar`; that was removed.)
 - **No network access.** The plugin makes **no network requests** of any kind — no telemetry, no update checks, no remote image loading (see sanitization below).
