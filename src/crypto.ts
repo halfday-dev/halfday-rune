@@ -15,7 +15,7 @@
  * is byte-compatible with v0.4.
  */
 
-import { Encrypter, Decrypter } from "age-encryption";
+import { Encrypter, Decrypter, identityToRecipient } from "age-encryption";
 
 /**
  * v0.5.0: Parse a recipients.txt file into a list of age1... recipient
@@ -161,4 +161,96 @@ export async function roundTrip(
 ): Promise<string> {
   const ciphertext = await encrypt(recipients, plaintext);
   return decryptToString(identity, ciphertext);
+}
+
+// ---------------------------------------------------------------------------
+// Passphrase-wrapped identity (mobile unlock copy)
+// ---------------------------------------------------------------------------
+
+/** scrypt work factor (log2 N) used when none is given. */
+export const DEFAULT_WRAP_LOGN = 18;
+/** Accepted work-factor range; typage refuses to decrypt above 20. */
+export const MIN_WRAP_LOGN = 16;
+export const MAX_WRAP_LOGN = 20;
+
+/** The passphrase did not open the wrapped identity. Fixed message, no detail. */
+export class WrongPassphraseError extends Error {
+  constructor() {
+    super("Wrong passphrase");
+    this.name = "WrongPassphraseError";
+  }
+}
+
+/** The wrapped file is not a readable passphrase-wrapped identity. Fixed message. */
+export class InvalidWrappedIdentityError extends Error {
+  constructor() {
+    super("The unlock file is not a valid wrapped identity");
+    this.name = "InvalidWrappedIdentityError";
+  }
+}
+
+const IDENTITY_RE = /^AGE-SECRET-KEY-1[A-Z0-9]+$/;
+
+/**
+ * True when `s` is a well-formed X25519 age identity: right shape AND it
+ * actually derives a recipient (so the bech32 checksum holds).
+ */
+async function isWellFormedIdentity(s: string): Promise<boolean> {
+  if (!IDENTITY_RE.test(s)) return false;
+  try {
+    await identityToRecipient(s);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Wrap an age identity under a passphrase (age scrypt stanza). The output is
+ * a standard age file: `age -d` opens it. Pure; never logs or echoes either
+ * input.
+ */
+export async function wrapIdentity(
+  identity: string,
+  passphrase: string,
+  logN: number = DEFAULT_WRAP_LOGN
+): Promise<Uint8Array> {
+  if (!Number.isInteger(logN) || logN < MIN_WRAP_LOGN || logN > MAX_WRAP_LOGN) {
+    throw new RangeError(
+      `scrypt work factor must be an integer from ${MIN_WRAP_LOGN} to ${MAX_WRAP_LOGN}`
+    );
+  }
+  if (!passphrase) throw new Error("a passphrase is required");
+  const id = identity.trim();
+  if (!(await isWellFormedIdentity(id))) {
+    throw new Error("not a well-formed AGE-SECRET-KEY-1 identity");
+  }
+  const enc = new Encrypter();
+  enc.setPassphrase(passphrase);
+  enc.setScryptWorkFactor(logN);
+  return enc.encrypt(id);
+}
+
+/**
+ * Open a wrapped identity. Throws WrongPassphraseError for a wrong passphrase
+ * and InvalidWrappedIdentityError for anything else (not an age file, damaged,
+ * or the plaintext is not a well-formed identity). Messages are fixed.
+ */
+export async function unwrapIdentity(
+  wrapped: Uint8Array,
+  passphrase: string
+): Promise<string> {
+  let text: string;
+  try {
+    const dec = new Decrypter();
+    dec.addPassphrase(passphrase);
+    text = await dec.decrypt(wrapped, "text");
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "";
+    if (msg.includes("no identity matched")) throw new WrongPassphraseError();
+    throw new InvalidWrappedIdentityError();
+  }
+  const id = text.trim();
+  if (!(await isWellFormedIdentity(id))) throw new InvalidWrappedIdentityError();
+  return id;
 }
