@@ -16,16 +16,18 @@ import {
 import {
   decryptToString,
   encrypt,
-  expandHome,
   parseRecipientsFile,
+  roundTrip,
+  validateRecipientsContent,
+} from "../src/crypto";
+import {
+  expandHome,
   readIdentity,
   readRecipients,
   readRecipientsRaw,
-  roundTrip,
   statRecipientsMtime,
-  validateRecipientsContent,
   writeRecipientsRaw,
-} from "../src/crypto";
+} from "../src/crypto-node";
 
 describe("expandHome", () => {
   it("expands ~/foo to $HOME/foo", () => {

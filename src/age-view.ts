@@ -51,10 +51,9 @@ import { tags } from "@lezer/highlight";
 import {
   decryptToString,
   encrypt,
-  readIdentity,
-  readRecipients,
 } from "./crypto";
 import { halfdayInlineDecorations } from "./decorations";
+import { loadCryptoNode } from "./node-loader";
 
 export const VIEW_TYPE_AGE = "halfday-age-view";
 
@@ -219,7 +218,7 @@ export class AgeFileView extends FileView {
 
     try {
       const identityPath = this.deps.getIdentityPath();
-      const identity = readIdentity(identityPath);
+      const identity = (await loadCryptoNode()).readIdentity(identityPath);
       const buf = await this.app.vault.readBinary(file);
       const ciphertext = new Uint8Array(buf);
       const plaintext = await decryptToString(identity, ciphertext);
@@ -460,8 +459,9 @@ export class AgeFileView extends FileView {
     try {
       const recipientsPath = this.deps.getRecipientsPath();
       const identityPath = this.deps.getIdentityPath();
-      const recipients = readRecipients(recipientsPath);
-      const identity = readIdentity(identityPath);
+      const node = await loadCryptoNode();
+      const recipients = node.readRecipients(recipientsPath);
+      const identity = node.readIdentity(identityPath);
 
       // encrypt — multi-recipient capable; single-recipient is identical to v0.4
       const ciphertext = await encrypt(recipients, plaintext);

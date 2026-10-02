@@ -69,6 +69,7 @@ import {
   App,
   Modal,
   Notice,
+  Platform,
   Plugin,
   PluginSettingTab,
   Setting,
@@ -80,18 +81,14 @@ import {
   decryptToString,
   encrypt,
   parseRecipientsFile,
-  readIdentity,
-  readRecipients,
-  readRecipientsRaw,
   roundTrip,
-  statRecipientsMtime,
   validateRecipientsContent,
-  writeRecipientsRaw,
 } from "./crypto";
+// Node-only modules (crypto-node, backup, rotate-log) are loaded lazily via
+// node-loader so main.ts has no top-level fs/os/path import and loads on iOS.
+import { loadBackup, loadCryptoNode, loadRotateLog } from "./node-loader";
 import { rotateVault, recipientsChanged } from "./rotate";
 import type { RotateResult } from "./rotate";
-import { backupAgeFiles, DEFAULT_BACKUP_DIR } from "./backup";
-import { makeRotateLogWriter } from "./rotate-log";
 
 interface HalfdayObsidianRuneSettings {
   recipientsPath: string;
@@ -327,8 +324,9 @@ export default class HalfdayObsidianRune extends Plugin {
     const started = Date.now();
     const plaintext = `halfday-rune round-trip ${new Date().toISOString()}`;
     try {
-      const recipients = readRecipients(this.settings.recipientsPath);
-      const identity = readIdentity(this.settings.identityPath);
+      const node = await loadCryptoNode();
+      const recipients = node.readRecipients(this.settings.recipientsPath);
+      const identity = node.readIdentity(this.settings.identityPath);
       const decoded = await roundTrip(recipients, identity, plaintext);
       const dt = Date.now() - started;
       if (decoded === plaintext) {
@@ -389,8 +387,9 @@ export default class HalfdayObsidianRune extends Plugin {
         return;
       }
 
-      const recipients = readRecipients(this.settings.recipientsPath);
-      const identity = readIdentity(this.settings.identityPath);
+      const node = await loadCryptoNode();
+      const recipients = node.readRecipients(this.settings.recipientsPath);
+      const identity = node.readIdentity(this.settings.identityPath);
 
       // ---- encrypt ----
       const plaintext = await this.app.vault.read(file);
@@ -487,8 +486,9 @@ export default class HalfdayObsidianRune extends Plugin {
     }
 
     try {
-      const recipients = readRecipients(this.settings.recipientsPath);
-      const identity = readIdentity(this.settings.identityPath);
+      const node = await loadCryptoNode();
+      const recipients = node.readRecipients(this.settings.recipientsPath);
+      const identity = node.readIdentity(this.settings.identityPath);
 
       const emptyPlaintext = "";
       const ciphertext = await encrypt(recipients, emptyPlaintext);
@@ -545,8 +545,9 @@ export default class HalfdayObsidianRune extends Plugin {
     let recipients: string[];
     let identity: string;
     try {
-      recipients = readRecipients(this.settings.recipientsPath);
-      identity = readIdentity(this.settings.identityPath);
+      const node = await loadCryptoNode();
+      recipients = node.readRecipients(this.settings.recipientsPath);
+      identity = node.readIdentity(this.settings.identityPath);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       new Notice(`Halfday Rune: rotate aborted — ${msg}`);
@@ -587,6 +588,9 @@ export default class HalfdayObsidianRune extends Plugin {
       });
       return;
     }
+
+    const { backupAgeFiles, DEFAULT_BACKUP_DIR } = await loadBackup();
+    const { makeRotateLogWriter } = await loadRotateLog();
 
     const planned = {
       fileCount: ageFiles.length,
@@ -758,7 +762,9 @@ export default class HalfdayObsidianRune extends Plugin {
       if (mode === null) return; // user cancelled
 
       // ---- decrypt ----
-      const identity = readIdentity(this.settings.identityPath);
+      const identity = (await loadCryptoNode()).readIdentity(
+        this.settings.identityPath
+      );
       const buf = await this.app.vault.readBinary(file);
       const ciphertext = new Uint8Array(buf);
       const plaintext = await decryptToString(identity, ciphertext);
@@ -1313,7 +1319,13 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
     // above controls WHICH file this textarea operates on. We use raw
     // containerEl primitives rather than a Setting row because Obsidian's
     // standard Setting layout cramps a multi-line textarea.
-    this.renderRecipientsEditor(containerEl);
+    // Desktop only: it edits a Node-side file, loaded lazily (see node-loader).
+    if (!Platform.isDesktopApp) return;
+    loadCryptoNode()
+      .then((node) => this.renderRecipientsEditor(containerEl, node))
+      .catch((err) => {
+        console.error("[halfday-rune] recipients editor unavailable", err);
+      });
   }
 
   /**
@@ -1332,7 +1344,10 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
    *     above while the textarea still holds content from the OLD path:
    *     prepends a red warning to the status line on Save
    */
-  private renderRecipientsEditor(containerEl: HTMLElement): void {
+  private renderRecipientsEditor(
+    containerEl: HTMLElement,
+    node: typeof import("./crypto-node")
+  ): void {
     new Setting(containerEl).setName("Recipients (file content)").setHeading();
     containerEl.createEl("p", {
       text:
@@ -1371,13 +1386,13 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
     // initial load from disk
     const loadFromDisk = (announce: boolean = false): void => {
       try {
-        const result = readRecipientsRaw(
+        const result = node.readRecipientsRaw(
           this.plugin.settings.recipientsPath
         );
         textareaEl.value = result.content;
         lastLoadedFromPath = this.plugin.settings.recipientsPath;
         try {
-          lastLoadedMtime = statRecipientsMtime(
+          lastLoadedMtime = node.statRecipientsMtime(
             this.plugin.settings.recipientsPath
           );
         } catch {
@@ -1441,7 +1456,7 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
       if (pathSameAsLoaded && lastLoadedMtime !== null) {
         let currentMtime: number | null = null;
         try {
-          currentMtime = statRecipientsMtime(
+          currentMtime = node.statRecipientsMtime(
             this.plugin.settings.recipientsPath
           );
         } catch (err) {
@@ -1468,7 +1483,7 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
       // diff and surface a generic save Notice.
       let prevRecipients: string[] = [];
       try {
-        const prev = readRecipientsRaw(this.plugin.settings.recipientsPath);
+        const prev = node.readRecipientsRaw(this.plugin.settings.recipientsPath);
         if (prev.exists) {
           prevRecipients = parseRecipientsFile(prev.content);
         }
@@ -1485,7 +1500,7 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
         this.plugin.settings.recipientsPath !== lastLoadedFromPath;
 
       try {
-        writeRecipientsRaw(
+        node.writeRecipientsRaw(
           this.plugin.settings.recipientsPath,
           content
         );
@@ -1502,7 +1517,7 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
         // v0.6.3: refresh the mtime baseline so subsequent saves
         // don't see OUR write as a stale-edit conflict.
         try {
-          lastLoadedMtime = statRecipientsMtime(
+          lastLoadedMtime = node.statRecipientsMtime(
             this.plugin.settings.recipientsPath
           );
         } catch {
