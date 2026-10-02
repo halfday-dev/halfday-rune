@@ -22,6 +22,12 @@ export interface KeySource {
   isUnlocked(): boolean;
   /** Drop any held secret. Nothing to drop for a file-backed source. */
   lock(): void;
+  /**
+   * True when writes only ever go to this source's own single recipient, so
+   * a save must refuse a note whose header has other recipients (they would
+   * be silently dropped). Mobile: true. Desktop: false (recipients.txt rules).
+   */
+  readonly soleRecipientOnly?: boolean;
 }
 
 /** The two file paths FileKeySource reads; the settings object satisfies it. */
@@ -135,6 +141,7 @@ function nonNegInt(v: unknown, fallback: number): number {
  * unwrap attempt.
  */
 export class PassphraseKeySource implements KeySource {
+  readonly soleRecipientOnly = true;
   #identity: string | null = null;
   private pending: Promise<void> | null = null;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -189,10 +196,13 @@ export class PassphraseKeySource implements KeySource {
 
   /** One unlock attempt. Throws WrongPassphraseError / UnlockFileMissingError / InvalidWrappedIdentityError. */
   private async tryUnlock(passphrase: string): Promise<void> {
+    // a modal still open after unload must not be able to re-arm the key
+    if (this.disposed) throw new KeyLockedError();
     const path = this.deps.getSettings().mobileKeyPath;
     if (!(await this.deps.adapter.exists(path))) throw new UnlockFileMissingError();
     const wrapped = new Uint8Array(await this.deps.adapter.readBinary(path));
     const identity = await unwrapIdentity(wrapped, passphrase);
+    if (this.disposed) throw new KeyLockedError();
     this.#identity = identity;
     this.hiddenAt = null;
     this.touch();

@@ -87,7 +87,7 @@ Rune runs on Obsidian mobile. Your key never leaves your desktop in the clear: y
    - **Auto-lock after idle (minutes)**, default 15. `0` = never.
    - **Lock after leaving the app (seconds)**, default 60. `0` = lock the moment the app is backgrounded.
 
-Rotating the key and editing recipients stay desktop-only. The mobile copy covers your main key only.
+Rotating the key and editing recipients stay desktop-only. The mobile copy covers your main key only, and the phone enforces it: before saving, rune checks that the note on disk is encrypted to exactly your own key. A note encrypted to additional recipients is not saved from the phone (you see "This note is encrypted to more keys than your phone has — edit it on desktop") and nothing is written. Rotate and backup skip the unlock file itself. The unlock file must use a scrypt work factor of 16 to 19; rune writes 18.
 
 ### Lost your phone?
 
@@ -96,6 +96,8 @@ The unlock file in your vault is useless without its passphrase, but anyone hold
 1. **Change the passphrase.** On desktop, run `Create mobile unlock copy` again with a NEW passphrase and confirm the replacement. The old passphrase stops working on new copies of the file. This does not help against someone who already has a copy of the old file plus the old passphrase: assume that person has your key.
 2. **If the old passphrase may have leaked** (or the phone was unlocked when lost), rotate the key: create a new key, run `Rotate vault keys` to re-encrypt every note, then run `Create mobile unlock copy` again so the phone copy holds the new key.
 3. **Remove rune from the lost device's sync** if you can (sign the device out of Obsidian Sync / iCloud), and delete any stale copies of the old `_rune/identity.age`.
+
+Rotation does not reach old copies: earlier synced versions of your notes and any backups are still encrypted to the old key, so they stay readable with the old key even after a rotation.
 
 ### Usage
 

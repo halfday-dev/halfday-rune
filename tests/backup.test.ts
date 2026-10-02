@@ -166,3 +166,12 @@ describe("backupAgeFiles — failure modes", () => {
     expect(copyFileSyncMock).not.toHaveBeenCalled();
   });
 });
+
+describe("backup excludes the wrapped identity file", () => {
+  it("does not copy an excluded path (folded comparison)", async () => {
+    await backupAgeFiles("/vault", ["a.age", "_Rune/Identity.age"], "/bk", ["_rune/identity.age"]);
+    const srcs = copyFileSyncMock.mock.calls.map((c) => String(c[0]));
+    expect(srcs).toHaveLength(1);
+    expect(srcs[0]).toContain("a.age");
+  });
+});

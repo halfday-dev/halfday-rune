@@ -214,9 +214,21 @@ class UnlockModal extends Modal {
   }
 }
 
-export function makeUnlockPrompt(app: App): UnlockPrompt {
-  return (attempt) =>
+/** The prompt plus `close()`, which dismisses any unlock modal still open (plugin unload). */
+export function makeUnlockPrompt(app: App): UnlockPrompt & { close: () => void } {
+  const open = new Set<UnlockModal>();
+  const prompt: UnlockPrompt = (attempt) =>
     new Promise<boolean>((resolve) => {
-      new UnlockModal(app, attempt, resolve).open();
+      const m = new UnlockModal(app, attempt, (ok) => {
+        open.delete(m);
+        resolve(ok);
+      });
+      open.add(m);
+      m.open();
     });
+  return Object.assign(prompt, {
+    close: () => {
+      for (const m of [...open]) m.close();
+    },
+  });
 }

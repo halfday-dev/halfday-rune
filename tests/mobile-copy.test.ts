@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { generateIdentity } from "age-encryption";
+import { Encrypter, generateIdentity, identityToRecipient } from "age-encryption";
 import { unwrapIdentity } from "../src/crypto";
 import {
   createMobileCopy,
@@ -8,6 +8,8 @@ import {
   validatePassphrasePair,
   MobileCopyError,
   MOBILE_COPY_FAILED_MESSAGE,
+  inspectMobileKeyTarget,
+  MOBILE_COPY_NOT_WRAPPED_MESSAGE,
   type VaultAdapterLike,
 } from "../src/mobile-copy";
 
@@ -82,6 +84,37 @@ describe("createMobileCopy", () => {
     await createMobileCopy(a, P, id, PW, 16);
     await createMobileCopy(a, P, id, PW + "2", 16);
     expect(await unwrapIdentity(a.files.get(P)!, PW + "2")).toBe(id);
+  });
+
+  it("refuses to overwrite an ordinary encrypted note, writing nothing", async () => {
+    const a = new FakeAdapter();
+    const id = await generateIdentity();
+    const e = new Encrypter();
+    e.addRecipient(await identityToRecipient(id));
+    const note = await e.encrypt("a journal entry");
+    a.files.set(P, note.slice());
+    a.dirs.add("_rune");
+    const err = await createMobileCopy(a, P, id, PW, 16).catch((x) => x);
+    expect(err).toBeInstanceOf(MobileCopyError);
+    expect(err.message).toBe(MOBILE_COPY_NOT_WRAPPED_MESSAGE);
+    expect([...a.files.get(P)!]).toEqual([...note]);
+    expect(a.removed).toEqual([]);
+    // plain garbage is refused too
+    a.files.set(P, new Uint8Array([1, 2, 3]));
+    await expect(createMobileCopy(a, P, id, PW, 16)).rejects.toThrow(/not an unlock file|not a rune unlock/);
+    expect([...a.files.get(P)!]).toEqual([1, 2, 3]);
+  });
+
+  it("inspectMobileKeyTarget: missing / wrapped / not-wrapped", async () => {
+    const a = new FakeAdapter();
+    const id = await generateIdentity();
+    expect(await inspectMobileKeyTarget(a, P)).toBe("missing");
+    await createMobileCopy(a, P, id, PW, 16);
+    expect(await inspectMobileKeyTarget(a, P)).toBe("wrapped");
+    const e = new Encrypter();
+    e.addRecipient(await identityToRecipient(id));
+    a.files.set("n.age", await e.encrypt("x"));
+    expect(await inspectMobileKeyTarget(a, "n.age")).toBe("not-wrapped");
   });
 
   it("a failed write on a new file leaves nothing behind, fixed message", async () => {

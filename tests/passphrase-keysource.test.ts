@@ -116,6 +116,25 @@ describe("PassphraseKeySource", () => {
     }
   });
 
+  it("a modal still open after dispose() cannot re-arm the key", async () => {
+    let captured: ((pw: string) => Promise<void>) | null = null;
+    const fileMap = { [PATH]: wrapped };
+    const ks = new PassphraseKeySource({
+      adapter: {
+        exists: async (p) => p in fileMap,
+        readBinary: async (p) => (fileMap as Record<string, Uint8Array>)[p].slice().buffer as ArrayBuffer,
+      },
+      getSettings: () => ({ mobileKeyPath: PATH, autoLockMinutes: 15, backgroundLockGraceSeconds: 60 }),
+      prompt: (attempt) => new Promise<boolean>(() => { captured = attempt; }),
+    });
+    void ks.getIdentity().catch(() => {});
+    await Promise.resolve();
+    expect(captured).not.toBeNull();
+    ks.dispose();
+    await expect(captured!(PW)).rejects.toBeInstanceOf(KeyLockedError);
+    expect(ks.isUnlocked()).toBe(false);
+  });
+
   it("dispose() locks and refuses to prompt again", async () => {
     const t = make();
     await t.ks.getIdentity();

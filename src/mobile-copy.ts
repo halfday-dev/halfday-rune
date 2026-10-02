@@ -8,7 +8,7 @@
  * passphrase or the identity.
  */
 
-import { unwrapIdentity, wrapIdentity } from "./crypto";
+import { isScryptWrapped, unwrapIdentity, wrapIdentity } from "./crypto";
 
 export const DEFAULT_MOBILE_KEY_PATH = "_rune/identity.age";
 export const MIN_PASSPHRASE_LENGTH = 20;
@@ -76,6 +76,28 @@ export const MOBILE_COPY_FAILED_MESSAGE =
 export const MOBILE_COPY_RESTORE_FAILED_MESSAGE =
   "Could not create the mobile unlock copy, and the previous file could not be restored. Check the unlock file in your vault.";
 
+export const MOBILE_COPY_NOT_WRAPPED_MESSAGE =
+  "A file that is not a rune unlock file already exists at that path. Nothing was changed.";
+
+/**
+ * Is it safe to put the unlock copy at `path`? Missing is fine; an existing
+ * file must be a scrypt-wrapped (single scrypt stanza) age file, so the
+ * command and the setting can never aim at an ordinary encrypted note.
+ */
+export async function inspectMobileKeyTarget(
+  adapter: Pick<VaultAdapterLike, "exists" | "readBinary">,
+  path: string
+): Promise<"missing" | "wrapped" | "not-wrapped"> {
+  if (!(await adapter.exists(path))) return "missing";
+  try {
+    return isScryptWrapped(new Uint8Array(await adapter.readBinary(path)))
+      ? "wrapped"
+      : "not-wrapped";
+  } catch {
+    return "not-wrapped";
+  }
+}
+
 /** Fixed-message failure; the cause is deliberately not carried. */
 export class MobileCopyError extends Error {
   constructor(message: string = MOBILE_COPY_FAILED_MESSAGE) {
@@ -123,6 +145,10 @@ export async function createMobileCopy(
   try {
     if (await adapter.exists(path)) {
       previous = new Uint8Array(await adapter.readBinary(path));
+      if (!isScryptWrapped(previous)) {
+        // not ours: refuse before anything is written
+        throw new MobileCopyError(MOBILE_COPY_NOT_WRAPPED_MESSAGE);
+      }
     }
     const wrapped = await wrapIdentity(identity, passphrase, logN);
     await ensureFolder(adapter, path);
@@ -134,7 +160,8 @@ export async function createMobileCopy(
     if ((await unwrapIdentity(back, passphrase)) !== identity.trim()) {
       throw new Error("unwrap differs");
     }
-  } catch {
+  } catch (err) {
+    if (err instanceof MobileCopyError && !wrote) throw err;
     if (wrote) {
       try {
         if (previous) await adapter.writeBinary(path, toAB(previous));

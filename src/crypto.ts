@@ -169,9 +169,13 @@ export async function roundTrip(
 
 /** scrypt work factor (log2 N) used when none is given. */
 export const DEFAULT_WRAP_LOGN = 18;
-/** Accepted work-factor range; typage refuses to decrypt above 20. */
+/**
+ * Accepted work-factor range, enforced on both wrap and unwrap. Capped at 19
+ * so a synced file can never make the phone run a ~1 GiB scrypt (typage
+ * itself would allow up to 20); a file we write is always one we can open.
+ */
 export const MIN_WRAP_LOGN = 16;
-export const MAX_WRAP_LOGN = 20;
+export const MAX_WRAP_LOGN = 19;
 
 /** The passphrase did not open the wrapped identity. Fixed message, no detail. */
 export class WrongPassphraseError extends Error {
@@ -231,6 +235,64 @@ export async function wrapIdentity(
   return enc.encrypt(id);
 }
 
+export interface AgeStanza {
+  type: string;
+  args: string[];
+}
+
+/**
+ * Parse the recipient stanzas out of a binary age file's header, without
+ * decrypting anything. Throws on anything that is not a v1 age header.
+ */
+export function parseAgeHeader(bytes: Uint8Array): AgeStanza[] {
+  const MAX_HEADER = 64 * 1024;
+  const head = new TextDecoder("latin1").decode(bytes.subarray(0, MAX_HEADER));
+  const lines = head.split("\n");
+  if (lines[0] !== "age-encryption.org/v1") throw new Error("not an age file");
+  const stanzas: AgeStanza[] = [];
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.startsWith("---")) return stanzas;
+    if (line.startsWith("-> ")) {
+      const [type, ...args] = line.slice(3).split(" ");
+      stanzas.push({ type, args });
+    }
+  }
+  throw new Error("age header not terminated");
+}
+
+/** True when the file's header is exactly one scrypt (passphrase) stanza. */
+export function isScryptWrapped(bytes: Uint8Array): boolean {
+  try {
+    const st = parseAgeHeader(bytes);
+    return st.length === 1 && st[0].type === "scrypt";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Mobile writes only ever encrypt to the unlocked identity's own recipient.
+ * Before overwriting a note, check its existing header is exactly one X25519
+ * stanza that the identity opens; anything else (extra recipients, other key
+ * types, a different key) would be silently dropped by the re-encrypt.
+ */
+export async function isEncryptedOnlyToIdentity(
+  identity: string,
+  existing: Uint8Array
+): Promise<boolean> {
+  try {
+    const st = parseAgeHeader(existing);
+    if (st.length !== 1 || st[0].type !== "X25519") return false;
+    const dec = new Decrypter();
+    dec.addIdentity(identity);
+    await dec.decrypt(existing, "text");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Open a wrapped identity. Throws WrongPassphraseError for a wrong passphrase
  * and InvalidWrappedIdentityError for anything else (not an age file, damaged,
@@ -240,6 +302,18 @@ export async function unwrapIdentity(
   wrapped: Uint8Array,
   passphrase: string
 ): Promise<string> {
+  // Refuse hostile work factors BEFORE any scrypt runs: a synced file must
+  // not be able to make the phone allocate ~1 GiB.
+  try {
+    const st = parseAgeHeader(wrapped);
+    if (st.length !== 1 || st[0].type !== "scrypt") throw new Error("shape");
+    const raw = st[0].args[1];
+    if (st[0].args.length !== 2 || !/^\d{1,3}$/.test(raw ?? "")) throw new Error("logN");
+    const n = Number(raw);
+    if (n < MIN_WRAP_LOGN || n > MAX_WRAP_LOGN) throw new Error("logN range");
+  } catch {
+    throw new InvalidWrappedIdentityError();
+  }
   let text: string;
   try {
     const dec = new Decrypter();

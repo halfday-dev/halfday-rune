@@ -30,6 +30,7 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { isExcludedPath } from "./path-fold";
 
 /** Default backup directory. Override-able via `backupDir` arg. */
 export const DEFAULT_BACKUP_DIR = path.join(
@@ -68,9 +69,12 @@ export interface BackupResult {
 export async function backupAgeFiles(
   vaultBase: string,
   relPaths: string[],
-  backupDir: string = DEFAULT_BACKUP_DIR
+  backupDir: string = DEFAULT_BACKUP_DIR,
+  excludePaths: string[] = []
 ): Promise<BackupResult> {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  // never copy the wrapped identity file into a backup
+  relPaths = relPaths.filter((r) => !isExcludedPath(r, excludePaths));
 
   if (relPaths.length === 0) {
     return { path: "", count: 0, bytes: 0, timestamp };

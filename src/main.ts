@@ -94,8 +94,11 @@ import {
   createMobileCopy,
   DEFAULT_MOBILE_KEY_PATH,
   effectiveMobileKeyPath,
+  inspectMobileKeyTarget,
+  MOBILE_COPY_NOT_WRAPPED_MESSAGE,
   validateMobileKeyPath,
 } from "./mobile-copy";
+import { isExcludedPath } from "./path-fold";
 import { rotateVault, recipientsChanged } from "./rotate";
 import type { RotateResult } from "./rotate";
 
@@ -140,6 +143,7 @@ export default class HalfdayObsidianRune extends Plugin {
   /** Same object as keySource on mobile; typed for lock/visibility calls. */
   private passphraseSource: PassphraseKeySource | null = null;
   private lockStatusEl: HTMLElement | null = null;
+  private unlockPrompt: ReturnType<typeof makeUnlockPrompt> | null = null;
 
   /**
    * v0.6.0: bottom-of-workspace status-bar item. Hidden by default;
@@ -159,6 +163,7 @@ export default class HalfdayObsidianRune extends Plugin {
     } else {
       // Mobile: passphrase-unlocked, memory-only source. The identity lives
       // only inside this object; see PassphraseKeySource.
+      this.unlockPrompt = makeUnlockPrompt(this.app);
       const source = new PassphraseKeySource({
         adapter: this.app.vault.adapter,
         getSettings: () => ({
@@ -166,7 +171,7 @@ export default class HalfdayObsidianRune extends Plugin {
           autoLockMinutes: this.settings.autoLockMinutes,
           backgroundLockGraceSeconds: this.settings.backgroundLockGraceSeconds,
         }),
-        prompt: makeUnlockPrompt(this.app),
+        prompt: this.unlockPrompt,
         beforeLock: async () => {
           for (const v of this.ageViews()) await v.flushBeforeLock();
         },
@@ -316,7 +321,9 @@ export default class HalfdayObsidianRune extends Plugin {
 
   onunload(): void {
     if (this.passphraseSource) this.passphraseSource.dispose();
-    else this.keySource?.lock();
+    this.unlockPrompt?.close();
+    this.unlockPrompt = null;
+    if (!this.passphraseSource) this.keySource?.lock();
     this.keySource = null;
     this.passphraseSource = null;
     this.lockStatusEl = null;
@@ -440,7 +447,12 @@ export default class HalfdayObsidianRune extends Plugin {
     const adapter = this.app.vault.adapter;
     let exists = false;
     try {
-      exists = await adapter.exists(path);
+      const target = await inspectMobileKeyTarget(adapter, path);
+      if (target === "not-wrapped") {
+        new Notice(`Halfday Rune: ${MOBILE_COPY_NOT_WRAPPED_MESSAGE}`);
+        return;
+      }
+      exists = target === "wrapped";
     } catch {
       /* treat as not existing; createMobileCopy will fail safe */
     }
@@ -719,7 +731,10 @@ export default class HalfdayObsidianRune extends Plugin {
 
     const ageFiles = this.app.vault
       .getFiles()
-      .filter((f) => f.extension === "age");
+      // the wrapped identity file is not a note: never rotate or back it up
+      .filter(
+        (f) => f.extension === "age" && !isExcludedPath(f.path, [this.mobileKeyPath()])
+      );
 
     if (ageFiles.length === 0) {
       new Notice("Halfday Rune: no .age files in vault — nothing to rotate");
@@ -784,7 +799,8 @@ export default class HalfdayObsidianRune extends Plugin {
         const result = await backupAgeFiles(
           vaultBase,
           ageFiles.map((f) => f.path),
-          DEFAULT_BACKUP_DIR
+          DEFAULT_BACKUP_DIR,
+          [this.mobileKeyPath()]
         );
         backupNote = `backup: ${result.count} file${result.count === 1 ? "" : "s"} → ${result.path} (${result.bytes.toLocaleString()} bytes)`;
         console.log("[halfday-rune] rotate backup written", result);
@@ -822,7 +838,7 @@ export default class HalfdayObsidianRune extends Plugin {
           skip: (m) => rotateLog.file({ ok: false, ...m }),
         },
       },
-      { ageFiles, identity, recipients }
+      { ageFiles, identity, recipients, excludePaths: [this.mobileKeyPath()] }
     );
     const dt = Date.now() - startedAt;
 
@@ -1495,6 +1511,15 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
             const check = validateMobileKeyPath(v);
             text.inputEl.toggleClass("halfday-rune-invalid", !check.ok);
             if (!check.ok) return; // keep the last valid value
+            // refuse a path that already holds an ordinary encrypted note
+            let target: string = "missing";
+            try {
+              target = await inspectMobileKeyTarget(this.app.vault.adapter, v);
+            } catch {
+              /* unreadable: leave to the command's own check */
+            }
+            text.inputEl.toggleClass("halfday-rune-invalid", target === "not-wrapped");
+            if (target === "not-wrapped") return;
             this.plugin.settings.mobileKeyPath = v;
             await this.plugin.saveSettings();
           });

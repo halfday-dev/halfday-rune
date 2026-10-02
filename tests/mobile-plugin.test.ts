@@ -8,11 +8,13 @@ import { wrapIdentity } from "../src/crypto";
 
 const h = vi.hoisted(() => ({
   desktop: false,
+  closeSpy: vi.fn(),
   prompt: null as null | ((a: (pw: string) => Promise<void>) => Promise<boolean>),
 }));
 
 vi.mock("../src/mobile-modals", () => ({
-  makeUnlockPrompt: () => (a: (pw: string) => Promise<void>) => h.prompt!(a),
+  makeUnlockPrompt: () =>
+    Object.assign((a: (pw: string) => Promise<void>) => h.prompt!(a), { close: h.closeSpy }),
   CreateMobileCopyModal: class {},
 }));
 
@@ -150,6 +152,7 @@ describe("mobile plugin wiring", () => {
     const ks = p.getKeySource();
     await ks.getIdentity();
     p.onunload();
+    expect(h.closeSpy).toHaveBeenCalled();
     expect(ks.isUnlocked()).toBe(false);
     await expect(ks.getIdentity()).rejects.toThrow(/locked/);
   });

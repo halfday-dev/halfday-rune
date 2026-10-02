@@ -24,6 +24,7 @@
  */
 
 import type { TFile } from "obsidian";
+import { isExcludedPath } from "./path-fold";
 
 /**
  * The minimal Vault surface the rotator uses. Defined as a structural type
@@ -75,6 +76,8 @@ export interface RotateOpts {
   ageFiles: TFile[];
   identity: string;
   recipients: string[];
+  /** Vault paths to leave untouched (e.g. the wrapped identity file). Folded comparison. */
+  excludePaths?: string[];
   /** Optional per-file progress hook (1-indexed `i`). */
   onProgress?: (i: number, total: number, file: TFile) => void;
 }
@@ -134,9 +137,12 @@ export async function rotateVault(
   let bytesBefore = 0;
   let bytesAfter = 0;
 
-  for (let i = 0; i < opts.ageFiles.length; i++) {
-    const file = opts.ageFiles[i];
-    opts.onProgress?.(i + 1, opts.ageFiles.length, file);
+  const ageFiles = opts.ageFiles.filter(
+    (f) => !isExcludedPath(f.path, opts.excludePaths ?? [])
+  );
+  for (let i = 0; i < ageFiles.length; i++) {
+    const file = ageFiles[i];
+    opts.onProgress?.(i + 1, ageFiles.length, file);
 
     let ciphertextIn: Uint8Array;
     try {

@@ -55,6 +55,7 @@ import {
 import { halfdayInlineDecorations } from "./decorations";
 import type { KeySource } from "./keysource";
 import { KeyLockedError } from "./keysource";
+import { isEncryptedOnlyToIdentity } from "./crypto";
 
 export const VIEW_TYPE_AGE = "halfday-age-view";
 
@@ -133,6 +134,16 @@ export interface AgeFileViewDeps {
   clearStatusBar: () => void;
 }
 
+export const SOLE_RECIPIENT_NOTICE =
+  "This note is encrypted to more keys than your phone has — edit it on desktop";
+
+class SoleRecipientError extends Error {
+  constructor() {
+    super(SOLE_RECIPIENT_NOTICE);
+    this.name = "SoleRecipientError";
+  }
+}
+
 type SaveReason = "manual" | "autosave" | "unload";
 
 export class AgeFileView extends FileView {
@@ -148,6 +159,8 @@ export class AgeFileView extends FileView {
   private lastSavedAt: Date | null = null;
   /** Byte-length of the ciphertext we last successfully wrote — surfaced via the status bar. */
   private lastSavedBytes: number | null = null;
+  /** Bumped by every lock/teardown so an in-flight save can tell it was locked under it. */
+  private lockGen = 0;
 
   constructor(leaf: WorkspaceLeaf, deps: AgeFileViewDeps) {
     super(leaf);
@@ -288,10 +301,17 @@ export class AgeFileView extends FileView {
    */
   async flushBeforeLock(): Promise<void> {
     if (!this.dirty || !this.editor) return;
+    const before = this.editor.state.doc.toString();
+    let failed = false;
     try {
       await this.save("unload");
     } catch {
-      /* save() already showed a Notice; the lock must still go ahead */
+      failed = true; // save() already showed its own Notice
+    }
+    const typedDuring =
+      this.editor !== null && this.editor.state.doc.toString() !== before;
+    if (failed || typedDuring || this.dirty) {
+      new Notice("rune locked — your last edit could not be saved");
     }
   }
 
@@ -300,6 +320,7 @@ export class AgeFileView extends FileView {
    * editor, and show a locked state with an Unlock button.
    */
   showLocked(): void {
+    this.lockGen++;
     this.cancelAutosave();
     this.teardownEditor();
     this.plaintext = null;
@@ -441,6 +462,7 @@ export class AgeFileView extends FileView {
   }
 
   private teardownEditor(): void {
+    this.lockGen++;
     if (this.editor) {
       this.editor.destroy();
       this.editor = null;
@@ -498,12 +520,23 @@ export class AgeFileView extends FileView {
     const file = this.file;
     const startedAt = Date.now();
     const plaintext = this.editor.state.doc.toString();
+    const gen = this.lockGen;
     this.cancelAutosave();
 
     try {
       const keys = this.deps.getKeySource();
       const recipients = await keys.getRecipients();
       const identity = await keys.getIdentity();
+
+      // Mobile only encrypts to its own single recipient. Refuse (and write
+      // nothing) if the note on disk is encrypted to more than that, since
+      // the re-encrypt would silently drop those recipients.
+      if (keys.soleRecipientOnly) {
+        const existing = new Uint8Array(await this.app.vault.readBinary(file));
+        if (!(await isEncryptedOnlyToIdentity(identity, existing))) {
+          throw new SoleRecipientError();
+        }
+      }
 
       // encrypt — multi-recipient capable; single-recipient is identical to v0.4
       const ciphertext = await encrypt(recipients, plaintext);
@@ -525,6 +558,10 @@ export class AgeFileView extends FileView {
       ) as ArrayBuffer;
       await this.app.vault.modifyBinary(file, buffer);
 
+      // Locked (or the editor torn down) while the write was in flight: the
+      // bytes are on disk, but do not resurrect any decrypted state.
+      if (gen !== this.lockGen || !this.editor) return;
+
       this.plaintext = plaintext;
       this.dirty = false;
       this.lastSavedAt = new Date();
@@ -540,6 +577,11 @@ export class AgeFileView extends FileView {
         reason,
       });
     } catch (err) {
+      if (err instanceof SoleRecipientError) {
+        new Notice(SOLE_RECIPIENT_NOTICE);
+        this.pushStatusBar();
+        throw err;
+      }
       const msg = err instanceof Error ? err.message : String(err);
       new Notice(`Halfday Rune: save failed — ${msg}`);
       console.error("[halfday-rune] age view save failed", err);
