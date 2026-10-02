@@ -89,6 +89,13 @@ import {
 import { loadBackup, loadCryptoNode, loadRotateLog } from "./node-loader";
 import { FileKeySource } from "./keysource";
 import type { KeySource } from "./keysource";
+import { CreateMobileCopyModal } from "./mobile-modals";
+import {
+  createMobileCopy,
+  DEFAULT_MOBILE_KEY_PATH,
+  effectiveMobileKeyPath,
+  validateMobileKeyPath,
+} from "./mobile-copy";
 import { rotateVault, recipientsChanged } from "./rotate";
 import type { RotateResult } from "./rotate";
 
@@ -102,12 +109,18 @@ interface HalfdayObsidianRuneSettings {
    * Machine + offsite, etc.).
    */
   autoBackupBeforeRotate: boolean;
+  /**
+   * Vault-relative path of the passphrase-wrapped identity copy that the
+   * phone unlocks. Not a secret; the wrapped file itself lives in the vault.
+   */
+  mobileKeyPath: string;
 }
 
 const DEFAULT_SETTINGS: HalfdayObsidianRuneSettings = {
   recipientsPath: "~/.age/recipients.txt",
   identityPath: "~/.age/vault.identity",
   autoBackupBeforeRotate: true,
+  mobileKeyPath: DEFAULT_MOBILE_KEY_PATH,
 };
 
 export default class HalfdayObsidianRune extends Plugin {
@@ -201,6 +214,16 @@ export default class HalfdayObsidianRune extends Plugin {
         return true;
       },
     });
+
+    // Desktop only: make the passphrase-wrapped copy of the identity that
+    // the phone unlocks (written to the vault so it syncs).
+    if (Platform.isDesktopApp) {
+      this.addCommand({
+        id: "halfday-rune-create-mobile-unlock",
+        name: "Create mobile unlock copy",
+        callback: () => void this.createMobileUnlockCopy(),
+      });
+    }
 
     // v0.3.0: custom view + .age extension routing
     // v0.3.2: view also needs the recipient path so it can re-encrypt on save
@@ -320,6 +343,43 @@ export default class HalfdayObsidianRune extends Plugin {
       // v0.6.5 — fixed in 0.6.6).
       text: `v${this.manifest.version}`,
     });
+  }
+
+  /** The configured mobile key path, or the default if the setting is invalid. */
+  mobileKeyPath(): string {
+    return effectiveMobileKeyPath(this.settings.mobileKeyPath);
+  }
+
+  /**
+   * Desktop: wrap the current identity under a new passphrase and write it to
+   * the vault. The modal collects the passphrase; the work (and the
+   * write-then-verify) happens in createMobileCopy. Never logs the
+   * passphrase or identity.
+   */
+  private async createMobileUnlockCopy(): Promise<void> {
+    if (!Platform.isDesktopApp) return;
+    const path = this.mobileKeyPath();
+    const adapter = this.app.vault.adapter;
+    let exists = false;
+    try {
+      exists = await adapter.exists(path);
+    } catch {
+      /* treat as not existing; createMobileCopy will fail safe */
+    }
+    new CreateMobileCopyModal(this.app, { path, exists }, async (passphrase) => {
+      try {
+        const identity = await this.getKeySource().getIdentity();
+        await createMobileCopy(adapter, path, identity, passphrase);
+      } catch (err) {
+        // MobileCopyError carries a fixed message; anything else (e.g. the
+        // identity file could not be read) gets the same fixed message.
+        return err instanceof Error && err.name === "MobileCopyError"
+          ? err.message
+          : "Could not read your key or create the copy. Nothing was changed.";
+      }
+      new Notice(`Halfday Rune: mobile unlock copy saved to ${path}`);
+      return null;
+    }).open();
   }
 
   getKeySource(): KeySource {
@@ -1336,6 +1396,26 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           })
       );
+
+    new Setting(containerEl)
+      .setName("Mobile unlock file")
+      .setDesc(
+        "Vault-relative path of the passphrase-protected key copy " +
+          "(made by 'Create mobile unlock copy'). Must end in .age, not be under .obsidian."
+      )
+      .addText((text) => {
+        text
+          .setPlaceholder(DEFAULT_MOBILE_KEY_PATH)
+          .setValue(this.plugin.settings.mobileKeyPath)
+          .onChange(async (value) => {
+            const v = value.trim();
+            const check = validateMobileKeyPath(v);
+            text.inputEl.toggleClass("halfday-rune-invalid", !check.ok);
+            if (!check.ok) return; // keep the last valid value
+            this.plugin.settings.mobileKeyPath = v;
+            await this.plugin.saveSettings();
+          });
+      });
 
     // v0.5.1: in-place editor for recipients.txt content. The path field
     // above controls WHICH file this textarea operates on. We use raw
