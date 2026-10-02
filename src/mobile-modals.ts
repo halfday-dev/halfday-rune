@@ -5,6 +5,8 @@
 
 import { App, Modal } from "obsidian";
 import { validatePassphrasePair } from "./mobile-copy";
+import type { UnlockPrompt } from "./keysource";
+import { InvalidWrappedIdentityError, WrongPassphraseError } from "./crypto";
 
 /**
  * Desktop: ask for a new passphrase twice. `onSubmit` does the work and
@@ -119,4 +121,102 @@ export class CreateMobileCopyModal extends Modal {
     });
     this.contentEl.empty();
   }
+}
+
+/** Fixed user-facing text for an unlock failure; never includes any detail. */
+function unlockErrorText(err: unknown): string {
+  if (err instanceof WrongPassphraseError) return "Wrong passphrase";
+  if (err instanceof InvalidWrappedIdentityError) {
+    return "The unlock file is damaged or not an unlock file.";
+  }
+  if (err instanceof Error && err.name === "UnlockFileMissingError") {
+    return err.message; // fixed text
+  }
+  return "Could not unlock.";
+}
+
+/**
+ * Unlock modal: one password input (autocomplete=current-password so the
+ * system password manager can fill it). Wrong passphrase: fixed message,
+ * field cleared, modal stays open.
+ */
+class UnlockModal extends Modal {
+  private done = false;
+
+  constructor(
+    app: App,
+    private readonly attempt: (pw: string) => Promise<void>,
+    private readonly finish: (ok: boolean) => void
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Unlock rune" });
+    const input = contentEl.createEl("input", { type: "password" });
+    input.setAttribute("autocomplete", "current-password");
+    input.setAttribute("autocapitalize", "off");
+    input.setAttribute("spellcheck", "false");
+    input.setAttribute("placeholder", "Passphrase");
+    input.addClass("halfday-rune-prompt-input");
+    const status = contentEl.createDiv({ cls: "halfday-rune-error" });
+    const buttons = contentEl.createDiv({ cls: "halfday-rune-button-row" });
+    const cancel = buttons.createEl("button", { text: "Cancel" });
+    cancel.addEventListener("click", () => this.close());
+    const go = buttons.createEl("button", { text: "Unlock", cls: "mod-cta" });
+
+    let busy = false;
+    const submit = async (): Promise<void> => {
+      if (busy || !input.value) return;
+      busy = true;
+      go.disabled = true;
+      go.setText("Unlocking…");
+      status.setText("");
+      const pw = input.value;
+      // scrypt blocks the thread: let the label paint first
+      await new Promise<void>((r) =>
+        window.requestAnimationFrame(() => window.requestAnimationFrame(() => r()))
+      );
+      try {
+        await this.attempt(pw);
+        input.value = "";
+        this.done = true;
+        this.finish(true);
+        this.close();
+        return;
+      } catch (err) {
+        input.value = "";
+        status.setText(unlockErrorText(err));
+      }
+      busy = false;
+      go.disabled = false;
+      go.setText("Unlock");
+      input.focus();
+    };
+    go.addEventListener("click", () => void submit());
+    input.addEventListener("keydown", (e: KeyboardEvent) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        void submit();
+      }
+    });
+    window.setTimeout(() => input.focus(), 0);
+  }
+
+  onClose(): void {
+    this.contentEl.querySelectorAll("input").forEach((i) => {
+      (i as HTMLInputElement).value = "";
+    });
+    this.contentEl.empty();
+    if (!this.done) this.finish(false);
+  }
+}
+
+export function makeUnlockPrompt(app: App): UnlockPrompt {
+  return (attempt) =>
+    new Promise<boolean>((resolve) => {
+      new UnlockModal(app, attempt, resolve).open();
+    });
 }

@@ -87,9 +87,9 @@ import {
 // Node-only modules (crypto-node, backup, rotate-log) are loaded lazily via
 // node-loader so main.ts has no top-level fs/os/path import and loads on iOS.
 import { loadBackup, loadCryptoNode, loadRotateLog } from "./node-loader";
-import { FileKeySource } from "./keysource";
+import { FileKeySource, PassphraseKeySource } from "./keysource";
 import type { KeySource } from "./keysource";
-import { CreateMobileCopyModal } from "./mobile-modals";
+import { CreateMobileCopyModal, makeUnlockPrompt } from "./mobile-modals";
 import {
   createMobileCopy,
   DEFAULT_MOBILE_KEY_PATH,
@@ -114,6 +114,10 @@ interface HalfdayObsidianRuneSettings {
    * phone unlocks. Not a secret; the wrapped file itself lives in the vault.
    */
   mobileKeyPath: string;
+  /** Mobile: lock after this many idle minutes. 0 = never. */
+  autoLockMinutes: number;
+  /** Mobile: lock after this many seconds in the background. 0 = immediately. */
+  backgroundLockGraceSeconds: number;
 }
 
 const DEFAULT_SETTINGS: HalfdayObsidianRuneSettings = {
@@ -121,6 +125,8 @@ const DEFAULT_SETTINGS: HalfdayObsidianRuneSettings = {
   identityPath: "~/.age/vault.identity",
   autoBackupBeforeRotate: true,
   mobileKeyPath: DEFAULT_MOBILE_KEY_PATH,
+  autoLockMinutes: 15,
+  backgroundLockGraceSeconds: 60,
 };
 
 export default class HalfdayObsidianRune extends Plugin {
@@ -131,6 +137,9 @@ export default class HalfdayObsidianRune extends Plugin {
    * call site goes through `getKeySource()`.
    */
   private keySource: KeySource | null = null;
+  /** Same object as keySource on mobile; typed for lock/visibility calls. */
+  private passphraseSource: PassphraseKeySource | null = null;
+  private lockStatusEl: HTMLElement | null = null;
 
   /**
    * v0.6.0: bottom-of-workspace status-bar item. Hidden by default;
@@ -145,12 +154,52 @@ export default class HalfdayObsidianRune extends Plugin {
   async onload(): Promise<void> {
     await this.loadSettings();
 
-    // TODO(mobile): on iOS there is no ~/.age to read, so no key source is
-    // chosen yet. A passphrase-unlocked, memory-only source goes in the
-    // else branch (security-reviewed follow-up); until then key operations
-    // throw a clear error instead of touching Node file helpers.
     if (Platform.isDesktopApp) {
       this.keySource = new FileKeySource(() => this.settings);
+    } else {
+      // Mobile: passphrase-unlocked, memory-only source. The identity lives
+      // only inside this object; see PassphraseKeySource.
+      const source = new PassphraseKeySource({
+        adapter: this.app.vault.adapter,
+        getSettings: () => ({
+          mobileKeyPath: this.mobileKeyPath(),
+          autoLockMinutes: this.settings.autoLockMinutes,
+          backgroundLockGraceSeconds: this.settings.backgroundLockGraceSeconds,
+        }),
+        prompt: makeUnlockPrompt(this.app),
+        beforeLock: async () => {
+          for (const v of this.ageViews()) await v.flushBeforeLock();
+        },
+        onStateChange: (unlocked) => {
+          if (!unlocked) for (const v of this.ageViews()) v.showLocked();
+          this.renderLockStatus();
+        },
+      });
+      this.keySource = source;
+      this.passphraseSource = source;
+
+      this.lockStatusEl = this.addStatusBarItem();
+      this.lockStatusEl.addClass("halfday-rune-lockstatus");
+      this.lockStatusEl.addEventListener("click", () => {
+        if (source.isUnlocked()) void source.lockGracefully();
+        else void this.unlockNow();
+      });
+      this.renderLockStatus();
+
+      this.registerDomEvent(document, "visibilitychange", () =>
+        source.setBackgrounded(document.visibilityState === "hidden")
+      );
+
+      this.addCommand({
+        id: "halfday-rune-unlock",
+        name: "Unlock rune",
+        callback: () => void this.unlockNow(),
+      });
+      this.addCommand({
+        id: "halfday-rune-lock",
+        name: "Lock rune now",
+        callback: () => void source.lockGracefully(),
+      });
     }
 
     this.statusBarEl = this.addStatusBarItem();
@@ -263,8 +312,11 @@ export default class HalfdayObsidianRune extends Plugin {
   }
 
   onunload(): void {
-    this.keySource?.lock();
+    if (this.passphraseSource) this.passphraseSource.dispose();
+    else this.keySource?.lock();
     this.keySource = null;
+    this.passphraseSource = null;
+    this.lockStatusEl = null;
     // Obsidian tears down our registered view leaves on unload; detaching
     // them here would reset the user's leaf placement (community-lint
     // detach-leaves-in-onunload). The AgeFileView's own onClose() nulls
@@ -343,6 +395,29 @@ export default class HalfdayObsidianRune extends Plugin {
       // v0.6.5 — fixed in 0.6.6).
       text: `v${this.manifest.version}`,
     });
+  }
+
+  private ageViews(): AgeFileView[] {
+    return this.app.workspace
+      .getLeavesOfType(VIEW_TYPE_AGE)
+      .map((l) => l.view)
+      .filter((v): v is AgeFileView => v instanceof AgeFileView);
+  }
+
+  private renderLockStatus(): void {
+    const el = this.lockStatusEl;
+    if (!el) return;
+    const unlocked = this.passphraseSource?.isUnlocked() ?? false;
+    el.setText(unlocked ? "rune: unlocked" : "rune: locked");
+    el.setAttribute("aria-label", unlocked ? "Lock rune" : "Unlock rune");
+  }
+
+  private async unlockNow(): Promise<void> {
+    try {
+      await this.getKeySource().getIdentity();
+    } catch {
+      /* dismissed the prompt: stay locked */
+    }
   }
 
   /** The configured mobile key path, or the default if the setting is invalid. */

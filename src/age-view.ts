@@ -54,6 +54,7 @@ import {
 } from "./crypto";
 import { halfdayInlineDecorations } from "./decorations";
 import type { KeySource } from "./keysource";
+import { KeyLockedError } from "./keysource";
 
 export const VIEW_TYPE_AGE = "halfday-age-view";
 
@@ -233,6 +234,11 @@ export class AgeFileView extends FileView {
         ciphertextLen: ciphertext.byteLength,
       });
     } catch (err) {
+      if (err instanceof KeyLockedError) {
+        // the user dismissed the unlock prompt: not an error, just locked
+        this.showLocked();
+        return;
+      }
       const msg = err instanceof Error ? err.message : String(err);
       new Notice(`Halfday Rune: decrypt failed — ${msg}`);
       this.teardownEditor();
@@ -273,6 +279,45 @@ export class AgeFileView extends FileView {
     this.editorHost = null;
     this.deps.clearStatusBar();
     this.contentEl.empty();
+  }
+
+  /**
+   * Called by the plugin just BEFORE the key is dropped: write out unsaved
+   * edits while the identity is still available. Errors are surfaced by
+   * save() itself and swallowed here; the lock proceeds regardless.
+   */
+  async flushBeforeLock(): Promise<void> {
+    if (!this.dirty || !this.editor) return;
+    try {
+      await this.save("unload");
+    } catch {
+      /* save() already showed a Notice; the lock must still go ahead */
+    }
+  }
+
+  /**
+   * Called when the key has been locked: discard the decrypted text and
+   * editor, and show a locked state with an Unlock button.
+   */
+  showLocked(): void {
+    this.cancelAutosave();
+    this.teardownEditor();
+    this.plaintext = null;
+    this.dirty = false;
+    this.lastSavedAt = null;
+    this.lastSavedBytes = null;
+    this.deps.clearStatusBar();
+    this.updateTabHeader();
+    if (!this.editorHost) return;
+    const host = this.editorHost;
+    host.empty();
+    const box = host.createDiv({ cls: "halfday-age-locked" });
+    box.createEl("p", { text: "Locked. Unlock rune to read this note." });
+    const btn = box.createEl("button", { text: "Unlock", cls: "mod-cta" });
+    btn.addEventListener("click", () => {
+      const f = this.file;
+      if (f) void this.onLoadFile(f);
+    });
   }
 
   canAcceptExtension(extension: string): boolean {
