@@ -52,4 +52,10 @@ describe("plugin load path (Platform.isDesktopApp = false)", () => {
     await expect(loadBackup()).rejects.toThrow(/desktop/);
     await expect(loadRotateLog()).rejects.toThrow(/desktop/);
   });
+
+  it("has no key source off-desktop (until the mobile source lands)", async () => {
+    const mod = await import("../src/main");
+    const plugin = new (mod.default as unknown as new () => { getKeySource(): unknown })();
+    expect(() => plugin.getKeySource()).toThrow(/no key source/);
+  });
 });

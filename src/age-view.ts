@@ -53,7 +53,7 @@ import {
   encrypt,
 } from "./crypto";
 import { halfdayInlineDecorations } from "./decorations";
-import { loadCryptoNode } from "./node-loader";
+import type { KeySource } from "./keysource";
 
 export const VIEW_TYPE_AGE = "halfday-age-view";
 
@@ -126,8 +126,8 @@ export interface AgeStatusBarState {
  * view feeds it on every state change.
  */
 export interface AgeFileViewDeps {
-  getIdentityPath: () => string;
-  getRecipientsPath: () => string;
+  /** The plugin's single key source (identity + recipients). */
+  getKeySource: () => KeySource;
   updateStatusBar: (state: AgeStatusBarState) => void;
   clearStatusBar: () => void;
 }
@@ -217,8 +217,7 @@ export class AgeFileView extends FileView {
     this.lastSavedBytes = null;
 
     try {
-      const identityPath = this.deps.getIdentityPath();
-      const identity = (await loadCryptoNode()).readIdentity(identityPath);
+      const identity = await this.deps.getKeySource().getIdentity();
       const buf = await this.app.vault.readBinary(file);
       const ciphertext = new Uint8Array(buf);
       const plaintext = await decryptToString(identity, ciphertext);
@@ -457,11 +456,9 @@ export class AgeFileView extends FileView {
     this.cancelAutosave();
 
     try {
-      const recipientsPath = this.deps.getRecipientsPath();
-      const identityPath = this.deps.getIdentityPath();
-      const node = await loadCryptoNode();
-      const recipients = node.readRecipients(recipientsPath);
-      const identity = node.readIdentity(identityPath);
+      const keys = this.deps.getKeySource();
+      const recipients = await keys.getRecipients();
+      const identity = await keys.getIdentity();
 
       // encrypt — multi-recipient capable; single-recipient is identical to v0.4
       const ciphertext = await encrypt(recipients, plaintext);

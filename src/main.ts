@@ -87,6 +87,8 @@ import {
 // Node-only modules (crypto-node, backup, rotate-log) are loaded lazily via
 // node-loader so main.ts has no top-level fs/os/path import and loads on iOS.
 import { loadBackup, loadCryptoNode, loadRotateLog } from "./node-loader";
+import { FileKeySource } from "./keysource";
+import type { KeySource } from "./keysource";
 import { rotateVault, recipientsChanged } from "./rotate";
 import type { RotateResult } from "./rotate";
 
@@ -112,6 +114,12 @@ export default class HalfdayObsidianRune extends Plugin {
   settings: HalfdayObsidianRuneSettings;
 
   /**
+   * The one place identity + recipients come from. Every encrypt/decrypt
+   * call site goes through `getKeySource()`.
+   */
+  private keySource: KeySource | null = null;
+
+  /**
    * v0.6.0: bottom-of-workspace status-bar item. Hidden by default;
    * AgeFileView pushes state into it via `updateStatusBar` and clears
    * it via `clearStatusBar`. There's only ever one — Obsidian's status
@@ -123,6 +131,14 @@ export default class HalfdayObsidianRune extends Plugin {
 
   async onload(): Promise<void> {
     await this.loadSettings();
+
+    // TODO(mobile): on iOS there is no ~/.age to read, so no key source is
+    // chosen yet. A passphrase-unlocked, memory-only source goes in the
+    // else branch (security-reviewed follow-up); until then key operations
+    // throw a clear error instead of touching Node file helpers.
+    if (Platform.isDesktopApp) {
+      this.keySource = new FileKeySource(() => this.settings);
+    }
 
     this.statusBarEl = this.addStatusBarItem();
     this.statusBarEl.addClass("halfday-rune-statusbar");
@@ -192,8 +208,7 @@ export default class HalfdayObsidianRune extends Plugin {
       VIEW_TYPE_AGE,
       (leaf) =>
         new AgeFileView(leaf, {
-          getIdentityPath: () => this.settings.identityPath,
-          getRecipientsPath: () => this.settings.recipientsPath,
+          getKeySource: () => this.getKeySource(),
           updateStatusBar: (state) => this.updateAgeStatusBar(state),
           clearStatusBar: () => this.clearAgeStatusBar(),
         })
@@ -225,6 +240,8 @@ export default class HalfdayObsidianRune extends Plugin {
   }
 
   onunload(): void {
+    this.keySource?.lock();
+    this.keySource = null;
     // Obsidian tears down our registered view leaves on unload; detaching
     // them here would reset the user's leaf placement (community-lint
     // detach-leaves-in-onunload). The AgeFileView's own onClose() nulls
@@ -305,6 +322,13 @@ export default class HalfdayObsidianRune extends Plugin {
     });
   }
 
+  getKeySource(): KeySource {
+    if (!this.keySource) {
+      throw new Error("no key source available on this platform yet");
+    }
+    return this.keySource;
+  }
+
   async loadSettings(): Promise<void> {
     const loaded = (await this.loadData()) as
       | Partial<HalfdayObsidianRuneSettings>
@@ -324,9 +348,9 @@ export default class HalfdayObsidianRune extends Plugin {
     const started = Date.now();
     const plaintext = `halfday-rune round-trip ${new Date().toISOString()}`;
     try {
-      const node = await loadCryptoNode();
-      const recipients = node.readRecipients(this.settings.recipientsPath);
-      const identity = node.readIdentity(this.settings.identityPath);
+      const keys = this.getKeySource();
+      const recipients = await keys.getRecipients();
+      const identity = await keys.getIdentity();
       const decoded = await roundTrip(recipients, identity, plaintext);
       const dt = Date.now() - started;
       if (decoded === plaintext) {
@@ -387,9 +411,9 @@ export default class HalfdayObsidianRune extends Plugin {
         return;
       }
 
-      const node = await loadCryptoNode();
-      const recipients = node.readRecipients(this.settings.recipientsPath);
-      const identity = node.readIdentity(this.settings.identityPath);
+      const keys = this.getKeySource();
+      const recipients = await keys.getRecipients();
+      const identity = await keys.getIdentity();
 
       // ---- encrypt ----
       const plaintext = await this.app.vault.read(file);
@@ -486,9 +510,9 @@ export default class HalfdayObsidianRune extends Plugin {
     }
 
     try {
-      const node = await loadCryptoNode();
-      const recipients = node.readRecipients(this.settings.recipientsPath);
-      const identity = node.readIdentity(this.settings.identityPath);
+      const keys = this.getKeySource();
+      const recipients = await keys.getRecipients();
+      const identity = await keys.getIdentity();
 
       const emptyPlaintext = "";
       const ciphertext = await encrypt(recipients, emptyPlaintext);
@@ -545,9 +569,9 @@ export default class HalfdayObsidianRune extends Plugin {
     let recipients: string[];
     let identity: string;
     try {
-      const node = await loadCryptoNode();
-      recipients = node.readRecipients(this.settings.recipientsPath);
-      identity = node.readIdentity(this.settings.identityPath);
+      const keys = this.getKeySource();
+      recipients = await keys.getRecipients();
+      identity = await keys.getIdentity();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       new Notice(`Halfday Rune: rotate aborted — ${msg}`);
@@ -762,9 +786,7 @@ export default class HalfdayObsidianRune extends Plugin {
       if (mode === null) return; // user cancelled
 
       // ---- decrypt ----
-      const identity = (await loadCryptoNode()).readIdentity(
-        this.settings.identityPath
-      );
+      const identity = await this.getKeySource().getIdentity();
       const buf = await this.app.vault.readBinary(file);
       const ciphertext = new Uint8Array(buf);
       const plaintext = await decryptToString(identity, ciphertext);
