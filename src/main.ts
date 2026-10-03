@@ -92,6 +92,8 @@ import type { KeySource } from "./keysource";
 import { CreateMobileCopyModal, makeUnlockPrompt } from "./mobile-modals";
 import {
   createMobileCopy,
+  mobileCopySummary,
+  type MobileCopyResult,
   DEFAULT_MOBILE_KEY_PATH,
   effectiveMobileKeyPath,
   inspectMobileKeyTarget,
@@ -457,9 +459,12 @@ export default class HalfdayObsidianRune extends Plugin {
       /* treat as not existing; createMobileCopy will fail safe */
     }
     new CreateMobileCopyModal(this.app, { path, exists }, async (passphrase) => {
+      let result: MobileCopyResult;
       try {
-        const identity = await this.getKeySource().getIdentity();
-        await createMobileCopy(adapter, path, identity, passphrase);
+        const keys = this.getKeySource();
+        const identity = await keys.getIdentity();
+        const recipients = await keys.getRecipients();
+        result = await createMobileCopy(adapter, path, identity, recipients, passphrase);
       } catch (err) {
         // MobileCopyError carries a fixed message; anything else (e.g. the
         // identity file could not be read) gets the same fixed message.
@@ -467,7 +472,9 @@ export default class HalfdayObsidianRune extends Plugin {
           ? err.message
           : "Could not read your key or create the copy. Nothing was changed.";
       }
-      new Notice(`Halfday Rune: mobile unlock copy saved to ${path}`);
+      new Notice(
+        `Halfday Rune: mobile unlock copy saved to ${path}` + mobileCopySummary(result)
+      );
       return null;
     }).open();
   }

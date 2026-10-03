@@ -209,13 +209,68 @@ async function isWellFormedIdentity(s: string): Promise<boolean> {
   }
 }
 
+const RECIPIENT_RE = /^age1[02-9ac-hj-np-z]{58}$/;
+export const MOBILE_KEY_HEADER = "rune-mobile-key v1";
+const MAX_MOBILE_RECIPIENTS = 64;
+
+/** True when `s` is a well-formed X25519 age recipient (checksum included). */
+function isWellFormedRecipient(s: string): boolean {
+  if (!RECIPIENT_RE.test(s)) return false;
+  try {
+    new Encrypter().addRecipient(s);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export interface MobileKey {
+  identity: string;
+  /** Deduped; always includes the identity's own recipient. */
+  recipients: string[];
+}
+
 /**
- * Wrap an age identity under a passphrase (age scrypt stanza). The output is
- * a standard age file: `age -d` opens it. Pure; never logs or echoes either
- * input.
+ * Normalise the identity plus the recipients desktop encrypts to: validate
+ * every recipient, dedupe, and add the identity's own recipient if absent
+ * (`addedOwn` says so). Throws on anything malformed.
  */
-export async function wrapIdentity(
+export async function buildMobileKey(
   identity: string,
+  recipients: readonly string[]
+): Promise<MobileKey & { addedOwn: boolean }> {
+  const id = identity.trim();
+  if (!(await isWellFormedIdentity(id))) {
+    throw new Error("not a well-formed AGE-SECRET-KEY-1 identity");
+  }
+  const list: string[] = [];
+  for (const r of recipients) {
+    const t = r.trim();
+    if (!isWellFormedRecipient(t)) throw new Error("malformed recipient");
+    if (!list.includes(t)) list.push(t);
+  }
+  const own = await identityToRecipient(id);
+  const addedOwn = !list.includes(own);
+  if (addedOwn) list.push(own);
+  if (list.length > MAX_MOBILE_RECIPIENTS) throw new Error("too many recipients");
+  return { identity: id, recipients: list, addedOwn };
+}
+
+/**
+ * Wrap the mobile key payload under a passphrase (age scrypt stanza). The
+ * output is a standard age file: `age -d` opens it. The plaintext is
+ *
+ *   rune-mobile-key v1\n
+ *   identity: AGE-SECRET-KEY-1...\n
+ *   recipient: age1...\n        (one line per recipient, at least one)
+ *
+ * The recipients ride inside the passphrase-protected payload so nobody can
+ * add a key to the phone's encrypt list without the passphrase. Pure; never
+ * logs or echoes either input.
+ */
+export async function wrapMobileKey(
+  identity: string,
+  recipients: readonly string[],
   passphrase: string,
   logN: number = DEFAULT_WRAP_LOGN
 ): Promise<Uint8Array> {
@@ -225,14 +280,14 @@ export async function wrapIdentity(
     );
   }
   if (!passphrase) throw new Error("a passphrase is required");
-  const id = identity.trim();
-  if (!(await isWellFormedIdentity(id))) {
-    throw new Error("not a well-formed AGE-SECRET-KEY-1 identity");
-  }
+  const key = await buildMobileKey(identity, recipients);
   const enc = new Encrypter();
   enc.setPassphrase(passphrase);
   enc.setScryptWorkFactor(logN);
-  return enc.encrypt(id);
+  const body =
+    `${MOBILE_KEY_HEADER}\nidentity: ${key.identity}\n` +
+    key.recipients.map((r) => `recipient: ${r}\n`).join("");
+  return enc.encrypt(body);
 }
 
 export interface AgeStanza {
@@ -294,14 +349,50 @@ export async function isEncryptedOnlyToIdentity(
 }
 
 /**
- * Open a wrapped identity. Throws WrongPassphraseError for a wrong passphrase
- * and InvalidWrappedIdentityError for anything else (not an age file, damaged,
- * or the plaintext is not a well-formed identity). Messages are fixed.
+ * Check a note on disk before the phone re-encrypts it. `ok` requires that
+ * the unlocked identity opens the note's current header. `stanzas` is the
+ * number of X25519 recipient stanzas; the caller compares it with the size
+ * of the wrapped recipient list (more stanzas = a key the phone does not
+ * know about, so re-encrypting would silently drop it).
  */
-export async function unwrapIdentity(
+export async function inspectNoteForMobileSave(
+  identity: string,
+  existing: Uint8Array
+): Promise<{ ok: boolean; x25519Stanzas: number; otherStanzas: number }> {
+  try {
+    const st = parseAgeHeader(existing);
+    const x25519Stanzas = st.filter((s) => s.type === "X25519").length;
+    const otherStanzas = st.length - x25519Stanzas;
+    const dec = new Decrypter();
+    dec.addIdentity(identity);
+    await dec.decrypt(existing, "text");
+    return { ok: true, x25519Stanzas, otherStanzas };
+  } catch {
+    return { ok: false, x25519Stanzas: 0, otherStanzas: 0 };
+  }
+}
+
+export const LEGACY_WRAPPED_MESSAGE =
+  "This unlock file is from an older rune version. Re-run 'Create mobile unlock copy' on desktop.";
+
+/** The file is the old bare-identity format; fixed message, re-create it. */
+export class LegacyWrappedIdentityError extends InvalidWrappedIdentityError {
+  constructor() {
+    super();
+    this.message = LEGACY_WRAPPED_MESSAGE;
+    this.name = "LegacyWrappedIdentityError";
+  }
+}
+
+/**
+ * Open a wrapped mobile key. Throws WrongPassphraseError for a wrong
+ * passphrase and InvalidWrappedIdentityError for anything else (not an age
+ * file, damaged, unknown version, malformed payload). Messages are fixed.
+ */
+export async function unwrapMobileKey(
   wrapped: Uint8Array,
   passphrase: string
-): Promise<string> {
+): Promise<MobileKey> {
   // Refuse hostile work factors BEFORE any scrypt runs: a synced file must
   // not be able to make the phone allocate ~1 GiB.
   try {
@@ -324,7 +415,28 @@ export async function unwrapIdentity(
     if (msg.includes("no identity matched")) throw new WrongPassphraseError();
     throw new InvalidWrappedIdentityError();
   }
-  const id = text.trim();
-  if (!(await isWellFormedIdentity(id))) throw new InvalidWrappedIdentityError();
-  return id;
+  if (await isWellFormedIdentity(text.trim())) throw new LegacyWrappedIdentityError();
+  const lines = text.split("\n");
+  if (lines[lines.length - 1] === "") lines.pop();
+  if (lines.length < 3 || lines.length > 2 + MAX_MOBILE_RECIPIENTS) {
+    throw new InvalidWrappedIdentityError();
+  }
+  if (lines[0] !== MOBILE_KEY_HEADER || !lines[1].startsWith("identity: ")) {
+    throw new InvalidWrappedIdentityError();
+  }
+  const identity = lines[1].slice("identity: ".length);
+  if (!(await isWellFormedIdentity(identity))) throw new InvalidWrappedIdentityError();
+  const recipients: string[] = [];
+  for (const line of lines.slice(2)) {
+    if (!line.startsWith("recipient: ")) throw new InvalidWrappedIdentityError();
+    const r = line.slice("recipient: ".length);
+    if (!isWellFormedRecipient(r) || recipients.includes(r)) {
+      throw new InvalidWrappedIdentityError();
+    }
+    recipients.push(r);
+  }
+  if (!recipients.includes(await identityToRecipient(identity))) {
+    throw new InvalidWrappedIdentityError();
+  }
+  return { identity, recipients };
 }

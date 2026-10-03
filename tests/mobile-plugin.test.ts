@@ -4,7 +4,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { generateIdentity } from "age-encryption";
-import { wrapIdentity } from "../src/crypto";
+import { wrapMobileKey } from "../src/crypto";
 
 const h = vi.hoisted(() => ({
   desktop: false,
@@ -52,7 +52,7 @@ const PW = "a long random passphrase 98765";
 async function boot(desktop: boolean) {
   h.desktop = desktop;
   const identity = await generateIdentity();
-  const wrapped = await wrapIdentity(identity, PW, 16);
+  const wrapped = await wrapMobileKey(identity, [], PW, 16);
   const { default: Plugin } = await import("../src/main");
   const { AgeFileView } = await import("../src/age-view");
   const view = Object.create(AgeFileView.prototype) as InstanceType<typeof AgeFileView>;

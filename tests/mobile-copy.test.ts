@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { Encrypter, generateIdentity, identityToRecipient } from "age-encryption";
-import { unwrapIdentity } from "../src/crypto";
+import { unwrapMobileKey } from "../src/crypto";
 import {
   createMobileCopy,
   effectiveMobileKeyPath,
@@ -9,6 +9,7 @@ import {
   MobileCopyError,
   MOBILE_COPY_FAILED_MESSAGE,
   inspectMobileKeyTarget,
+  mobileCopySummary,
   MOBILE_COPY_NOT_WRAPPED_MESSAGE,
   type VaultAdapterLike,
 } from "../src/mobile-copy";
@@ -73,17 +74,39 @@ describe("createMobileCopy", () => {
   it("creates the folder, writes, verifies, and the file unwraps", async () => {
     const a = new FakeAdapter();
     const id = await generateIdentity();
-    await createMobileCopy(a, P, id, PW, 16);
+    await createMobileCopy(a, P, id, [], PW, 16);
     expect(a.dirs.has("_rune")).toBe(true);
-    expect(await unwrapIdentity(a.files.get(P)!, PW)).toBe(id);
+    expect((await unwrapMobileKey(a.files.get(P)!, PW)).identity).toBe(id);
+  });
+
+  it("stores the full recipients list and reports a +N / -M change", async () => {
+    const a = new FakeAdapter();
+    const id = await generateIdentity();
+    const r2 = await identityToRecipient(await generateIdentity());
+    const r3 = await identityToRecipient(await generateIdentity());
+    const first = await createMobileCopy(a, P, id, [r2], PW, 16);
+    expect(first.addedOwnRecipient).toBe(true);
+    expect(first.changes).toBeNull();
+    const own = await identityToRecipient(id);
+    expect((await unwrapMobileKey(a.files.get(P)!, PW)).recipients).toEqual([r2, own]);
+    const second = await createMobileCopy(a, P, id, [own, r3], PW, 16);
+    expect(second.addedOwnRecipient).toBe(false);
+    expect(second.changes).toEqual({ added: 1, removed: 1 });
+    expect(mobileCopySummary(second)).toContain("recipients updated: +1 / \u22121");
+    const same = await createMobileCopy(a, P, id, [own, r3], PW, 16);
+    expect(same.changes).toEqual({ added: 0, removed: 0 });
+    expect(mobileCopySummary(same)).toBe("");
+    // a different passphrase cannot open the old file: no diff, still succeeds
+    const other = await createMobileCopy(a, P, id, [own], PW + "2", 16);
+    expect(other.changes).toBeNull();
   });
 
   it("replaces an existing file", async () => {
     const a = new FakeAdapter();
     const id = await generateIdentity();
-    await createMobileCopy(a, P, id, PW, 16);
-    await createMobileCopy(a, P, id, PW + "2", 16);
-    expect(await unwrapIdentity(a.files.get(P)!, PW + "2")).toBe(id);
+    await createMobileCopy(a, P, id, [], PW, 16);
+    await createMobileCopy(a, P, id, [], PW + "2", 16);
+    expect((await unwrapMobileKey(a.files.get(P)!, PW + "2")).identity).toBe(id);
   });
 
   it("refuses to overwrite an ordinary encrypted note, writing nothing", async () => {
@@ -94,14 +117,14 @@ describe("createMobileCopy", () => {
     const note = await e.encrypt("a journal entry");
     a.files.set(P, note.slice());
     a.dirs.add("_rune");
-    const err = await createMobileCopy(a, P, id, PW, 16).catch((x) => x);
+    const err = await createMobileCopy(a, P, id, [], PW, 16).catch((x) => x);
     expect(err).toBeInstanceOf(MobileCopyError);
     expect(err.message).toBe(MOBILE_COPY_NOT_WRAPPED_MESSAGE);
     expect([...a.files.get(P)!]).toEqual([...note]);
     expect(a.removed).toEqual([]);
     // plain garbage is refused too
     a.files.set(P, new Uint8Array([1, 2, 3]));
-    await expect(createMobileCopy(a, P, id, PW, 16)).rejects.toThrow(/not an unlock file|not a rune unlock/);
+    await expect(createMobileCopy(a, P, id, [], PW, 16)).rejects.toThrow(/not an unlock file|not a rune unlock/);
     expect([...a.files.get(P)!]).toEqual([1, 2, 3]);
   });
 
@@ -109,7 +132,7 @@ describe("createMobileCopy", () => {
     const a = new FakeAdapter();
     const id = await generateIdentity();
     expect(await inspectMobileKeyTarget(a, P)).toBe("missing");
-    await createMobileCopy(a, P, id, PW, 16);
+    await createMobileCopy(a, P, id, [], PW, 16);
     expect(await inspectMobileKeyTarget(a, P)).toBe("wrapped");
     const e = new Encrypter();
     e.addRecipient(await identityToRecipient(id));
@@ -120,7 +143,7 @@ describe("createMobileCopy", () => {
   it("a failed write on a new file leaves nothing behind, fixed message", async () => {
     const a = new FakeAdapter();
     a.failWrite = true;
-    const err = await createMobileCopy(a, P, await generateIdentity(), PW, 16).catch((e) => e);
+    const err = await createMobileCopy(a, P, await generateIdentity(), [], PW, 16).catch((e) => e);
     expect(err).toBeInstanceOf(MobileCopyError);
     expect(err.message).toBe(MOBILE_COPY_FAILED_MESSAGE);
     expect(a.files.size).toBe(0);
@@ -135,7 +158,7 @@ describe("createMobileCopy", () => {
     let reads = 0;
     const orig = a.readBinary.bind(a);
     a.readBinary = async (p) => { reads++; a.corruptRead = reads > 1; return orig(p); };
-    const err = await createMobileCopy(a, P, await generateIdentity(), PW, 16).catch((e) => e);
+    const err = await createMobileCopy(a, P, await generateIdentity(), [], PW, 16).catch((e) => e);
     expect(err).toBeInstanceOf(MobileCopyError);
     expect([...a.files.get(P)!]).toEqual([...old]);
     expect(a.removed).toEqual([]);
@@ -144,7 +167,7 @@ describe("createMobileCopy", () => {
   it("failed verify on a new file removes only the file it created", async () => {
     const a = new FakeAdapter();
     a.corruptRead = true;
-    await expect(createMobileCopy(a, P, await generateIdentity(), PW, 16)).rejects.toBeInstanceOf(MobileCopyError);
+    await expect(createMobileCopy(a, P, await generateIdentity(), [], PW, 16)).rejects.toBeInstanceOf(MobileCopyError);
     expect(a.files.has(P)).toBe(false);
     expect(a.removed).toEqual([P]);
   });

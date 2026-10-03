@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { generateIdentity, identityToRecipient } from "age-encryption";
-import { wrapIdentity } from "../src/crypto";
+import { wrapMobileKey } from "../src/crypto";
 import {
   PassphraseKeySource,
   KeyLockedError,
@@ -15,7 +15,7 @@ let identity: string;
 let wrapped: Uint8Array;
 beforeEach(async () => {
   identity = await generateIdentity();
-  wrapped = await wrapIdentity(identity, PW, 16);
+  wrapped = await wrapMobileKey(identity, [], PW, 16);
 });
 
 function make(over: Partial<MobileKeySettings> = {}, files: Record<string, Uint8Array> | null = null) {

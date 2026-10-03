@@ -10,7 +10,7 @@
  */
 
 import { identityToRecipient } from "age-encryption";
-import { unwrapIdentity } from "./crypto";
+import { unwrapMobileKey } from "./crypto";
 import { loadCryptoNode } from "./node-loader";
 
 export interface KeySource {
@@ -143,6 +143,7 @@ function nonNegInt(v: unknown, fallback: number): number {
 export class PassphraseKeySource implements KeySource {
   readonly soleRecipientOnly = true;
   #identity: string | null = null;
+  #recipients: string[] = [];
   private pending: Promise<void> | null = null;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private graceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -201,9 +202,10 @@ export class PassphraseKeySource implements KeySource {
     const path = this.deps.getSettings().mobileKeyPath;
     if (!(await this.deps.adapter.exists(path))) throw new UnlockFileMissingError();
     const wrapped = new Uint8Array(await this.deps.adapter.readBinary(path));
-    const identity = await unwrapIdentity(wrapped, passphrase);
+    const key = await unwrapMobileKey(wrapped, passphrase);
     if (this.disposed) throw new KeyLockedError();
-    this.#identity = identity;
+    this.#identity = key.identity;
+    this.#recipients = key.recipients;
     this.hiddenAt = null;
     this.touch();
     this.deps.onStateChange?.(true);
@@ -282,6 +284,7 @@ export class PassphraseKeySource implements KeySource {
     this.hiddenAt = null;
     if (this.#identity === null) return;
     this.#identity = null;
+    this.#recipients = [];
     this.deps.onStateChange?.(false);
   }
 }
