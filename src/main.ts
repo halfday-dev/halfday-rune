@@ -102,6 +102,8 @@ import {
 } from "./mobile-copy";
 import { isExcludedPath } from "./path-fold";
 import { rotateVault, recipientsChanged } from "./rotate";
+import { addedToMainFile, confirmRecipientsSave } from "./recipients-guard";
+import { ConfirmMainRecipientsModal } from "./recipients-modal";
 import type { RotateResult } from "./rotate";
 
 interface HalfdayObsidianRuneSettings {
@@ -1746,82 +1748,114 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
         // and we'll still surface the rotate-keys hint. Acceptable.
       }
 
-      // v0.5.2: path-drift detection. Done BEFORE write because the write
-      // commits to the (possibly drifted) path regardless — this just
-      // makes the swap visible.
-      const drifted =
-        this.plugin.settings.recipientsPath !== lastLoadedFromPath;
+      const doWrite = (): void => {
+        // v0.5.2: path-drift detection. Done BEFORE write because the write
+        // commits to the (possibly drifted) path regardless — this just
+        // makes the swap visible.
+        const drifted =
+          this.plugin.settings.recipientsPath !== lastLoadedFromPath;
 
+        try {
+          node.writeRecipientsRaw(
+            this.plugin.settings.recipientsPath,
+            content
+          );
+
+          const driftPrefix = drifted
+            ? `⚠ recipients file path was changed since load (${lastLoadedFromPath} → ${this.plugin.settings.recipientsPath}) — saved to the NEW path with the editor's contents. `
+            : "";
+          setStatus(
+            `${driftPrefix}✓ saved ${content.length.toLocaleString()} bytes to ${this.plugin.settings.recipientsPath}`,
+            /*isError*/ drifted
+          );
+          // textarea now reflects what's on disk at the new path
+          lastLoadedFromPath = this.plugin.settings.recipientsPath;
+          // v0.6.3: refresh the mtime baseline so subsequent saves
+          // don't see OUR write as a stale-edit conflict.
+          try {
+            lastLoadedMtime = node.statRecipientsMtime(
+              this.plugin.settings.recipientsPath
+            );
+          } catch {
+            lastLoadedMtime = null;
+          }
+
+          // v0.5.2: on-save Notice for recipient list changes. Diff against
+          // the pre-write disk content (parseRecipientsFile already did
+          // dedup + comment stripping). Surfaces additions AND removals —
+          // a removed recipient is security-relevant (existing .age headers
+          // still encode it; rotation is the only way to drop it
+          // everywhere).
+          let newRecipients: string[] = [];
+          try {
+            newRecipients = parseRecipientsFile(content);
+          } catch {
+            // shouldn't happen — validateRecipientsContent already passed.
+          }
+          const diff = recipientsChanged(prevRecipients, newRecipients);
+          const addedAny = diff.added.length > 0;
+          const removedAny = diff.removed.length > 0;
+          if (addedAny && removedAny) {
+            new Notice(
+              "Halfday Rune: recipient list changed (added + removed). Existing sealed files reflect the OLD list — run 'Rotate vault keys' to sync.",
+              10_000
+            );
+          } else if (addedAny) {
+            new Notice(
+              "Halfday Rune: recipient added. Existing sealed files don't include it yet — run 'Rotate vault keys' to add it everywhere.",
+              10_000
+            );
+          } else if (removedAny) {
+            new Notice(
+              "Halfday Rune: recipient removed from list. Existing sealed files still contain it in their header — run 'Rotate vault keys' to drop it.",
+              10_000
+            );
+          } else {
+            new Notice("Halfday Rune: recipients saved");
+          }
+          console.log("[halfday-rune] recipients saved", {
+            path: this.plugin.settings.recipientsPath,
+            bytes: content.length,
+            added: diff.added,
+            removed: diff.removed,
+            drifted,
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          setStatus(`✗ write failed: ${msg}`, /*isError*/ true);
+          console.error("[halfday-rune] recipients write failed", err);
+        }
+      };
+
+      // Adding a key to the default main recipients file widens access to
+      // every note and backup: ask first. Removals / no-op saves go straight.
+      let prevContent: string | null = null;
       try {
-        node.writeRecipientsRaw(
-          this.plugin.settings.recipientsPath,
-          content
-        );
-
-        const driftPrefix = drifted
-          ? `⚠ recipients file path was changed since load (${lastLoadedFromPath} → ${this.plugin.settings.recipientsPath}) — saved to the NEW path with the editor's contents. `
-          : "";
-        setStatus(
-          `${driftPrefix}✓ saved ${content.length.toLocaleString()} bytes to ${this.plugin.settings.recipientsPath}`,
-          /*isError*/ drifted
-        );
-        // textarea now reflects what's on disk at the new path
-        lastLoadedFromPath = this.plugin.settings.recipientsPath;
-        // v0.6.3: refresh the mtime baseline so subsequent saves
-        // don't see OUR write as a stale-edit conflict.
-        try {
-          lastLoadedMtime = node.statRecipientsMtime(
-            this.plugin.settings.recipientsPath
-          );
-        } catch {
-          lastLoadedMtime = null;
-        }
-
-        // v0.5.2: on-save Notice for recipient list changes. Diff against
-        // the pre-write disk content (parseRecipientsFile already did
-        // dedup + comment stripping). Surfaces additions AND removals —
-        // a removed recipient is security-relevant (existing .age headers
-        // still encode it; rotation is the only way to drop it
-        // everywhere).
-        let newRecipients: string[] = [];
-        try {
-          newRecipients = parseRecipientsFile(content);
-        } catch {
-          // shouldn't happen — validateRecipientsContent already passed.
-        }
-        const diff = recipientsChanged(prevRecipients, newRecipients);
-        const addedAny = diff.added.length > 0;
-        const removedAny = diff.removed.length > 0;
-        if (addedAny && removedAny) {
-          new Notice(
-            "Halfday Rune: recipient list changed (added + removed). Existing sealed files reflect the OLD list — run 'Rotate vault keys' to sync.",
-            10_000
-          );
-        } else if (addedAny) {
-          new Notice(
-            "Halfday Rune: recipient added. Existing sealed files don't include it yet — run 'Rotate vault keys' to add it everywhere.",
-            10_000
-          );
-        } else if (removedAny) {
-          new Notice(
-            "Halfday Rune: recipient removed from list. Existing sealed files still contain it in their header — run 'Rotate vault keys' to drop it.",
-            10_000
-          );
-        } else {
-          new Notice("Halfday Rune: recipients saved");
-        }
-        console.log("[halfday-rune] recipients saved", {
-          path: this.plugin.settings.recipientsPath,
-          bytes: content.length,
-          added: diff.added,
-          removed: diff.removed,
-          drifted,
-        });
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        setStatus(`✗ write failed: ${msg}`, /*isError*/ true);
-        console.error("[halfday-rune] recipients write failed", err);
+        const prev = node.readRecipientsRaw(this.plugin.settings.recipientsPath);
+        if (prev.exists) prevContent = prev.content;
+      } catch {
+        /* unreadable: treated as empty, so every key reads as added */
       }
+      const guardOpts = {
+        configuredPath: this.plugin.settings.recipientsPath,
+        expand: node.expandHome,
+        prevContent,
+        newContent: content,
+      };
+      if (addedToMainFile(guardOpts).length === 0) {
+        doWrite();
+        return;
+      }
+      void confirmRecipientsSave(
+        guardOpts,
+        (path, added) =>
+          new Promise<boolean>((resolve) =>
+            new ConfirmMainRecipientsModal(this.app, path, added, resolve).open()
+          )
+      ).then((ok) => {
+        if (ok) doWrite();
+        else setStatus("Save cancelled \u2014 the main recipients file was not changed.");
+      });
     });
 
     const reloadBtn = buttonsEl.createEl("button", {
