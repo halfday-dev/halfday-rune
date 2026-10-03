@@ -197,9 +197,12 @@ export default class HalfdayObsidianRune extends Plugin {
       });
       this.renderLockStatus();
 
-      this.registerDomEvent(document, "visibilitychange", () =>
-        source.setBackgrounded(document.visibilityState === "hidden")
-      );
+      this.registerDomEvent(document, "visibilitychange", () => {
+        const hidden = document.visibilityState === "hidden";
+        // save dirty edits right away, not only at the grace-lock
+        if (hidden) for (const v of this.ageViews()) void v.flushIfDirty("background");
+        source.setBackgrounded(hidden);
+      });
 
       this.addCommand({
         id: "halfday-rune-unlock",
@@ -297,6 +300,10 @@ export default class HalfdayObsidianRune extends Plugin {
           getKeySource: () => this.getKeySource(),
           updateStatusBar: (state) => this.updateAgeStatusBar(state),
           clearStatusBar: () => this.clearAgeStatusBar(),
+          // iOS can kill a backgrounded app before any long timer fires:
+          // save sooner and when focus leaves the editor.
+          autosaveDelayMs: Platform.isMobile ? 5_000 : undefined,
+          flushOnBlur: Platform.isMobile,
         })
     );
     this.registerExtensions(["age"], VIEW_TYPE_AGE);

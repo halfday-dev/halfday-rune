@@ -154,3 +154,67 @@ describe("mobile wrapped-recipient-list guard", () => {
     expect(notices).toEqual([]);
   });
 });
+
+describe("flush on close / unload / background", () => {
+  const prep = async () => {
+    const t = await setup({ sole: false });
+    t.view.contentEl = { empty() {} };
+    const run = async (fn: () => Promise<void>) => {
+      const p = fn();
+      await vi.waitFor(() => expect(t.modify).toHaveBeenCalled());
+      t.gate.release();
+      await p;
+    };
+    return { ...t, run };
+  };
+
+  it("onClose with a dirty edit writes ciphertext that decrypts to the edit", async () => {
+    const t = await prep();
+    await t.run(() => t.view.onClose());
+    expect(t.modify).toHaveBeenCalledTimes(1);
+    expect(await decryptToString(t.identity, t.getDisk())).toBe("new text");
+    expect(t.view.editor).toBeNull();
+  });
+
+  it("onClose then onUnloadFile saves exactly once", async () => {
+    const t = await prep();
+    await t.run(() => t.view.onClose());
+    await t.view.onUnloadFile({} as never);
+    expect(t.modify).toHaveBeenCalledTimes(1);
+  });
+
+  it("onUnloadFile then onClose saves exactly once", async () => {
+    const t = await prep();
+    await t.run(() => t.view.onUnloadFile({} as never));
+    await t.view.onClose();
+    expect(t.modify).toHaveBeenCalledTimes(1);
+    expect(await decryptToString(t.identity, t.getDisk())).toBe("new text");
+  });
+
+  it("onClose and onUnloadFile running concurrently save once", async () => {
+    const t = await prep();
+    await t.run(async () => {
+      const a = t.view.onClose();
+      const b = t.view.onUnloadFile({} as never);
+      await Promise.all([a, b]).then(() => {});
+    });
+    expect(t.modify).toHaveBeenCalledTimes(1);
+  });
+
+  it("a failed save on close shows the Notice, does not throw, and still closes", async () => {
+    const t = await prep();
+    t.modify.mockImplementationOnce(async () => { throw new Error("disk"); });
+    await expect(t.view.onClose()).resolves.toBeUndefined();
+    expect(notices.some((n) => n.includes("save failed"))).toBe(true);
+    expect(t.view.editor).toBeNull();
+  });
+
+  it("flushIfDirty (background / blur) saves without tearing down, and a clean view is a no-op", async () => {
+    const t = await prep();
+    await t.run(() => t.view.flushIfDirty("background"));
+    expect(await decryptToString(t.identity, t.getDisk())).toBe("new text");
+    expect(t.view.editor).not.toBeNull();
+    await t.view.flushIfDirty("background");
+    expect(t.modify).toHaveBeenCalledTimes(1);
+  });
+});

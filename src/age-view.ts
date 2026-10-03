@@ -132,6 +132,10 @@ export interface AgeFileViewDeps {
   getKeySource: () => KeySource;
   updateStatusBar: (state: AgeStatusBarState) => void;
   clearStatusBar: () => void;
+  /** Autosave debounce; defaults to 30 s (mobile passes a shorter one). */
+  autosaveDelayMs?: number;
+  /** Flush dirty edits when the editor loses focus (mobile). */
+  flushOnBlur?: boolean;
 }
 
 export const UNKNOWN_RECIPIENTS_NOTICE =
@@ -146,7 +150,7 @@ class RecipientListError extends Error {
   }
 }
 
-type SaveReason = "manual" | "autosave" | "unload";
+type SaveReason = "manual" | "autosave" | "unload" | "background";
 
 export class AgeFileView extends FileView {
   private deps: AgeFileViewDeps;
@@ -158,6 +162,8 @@ export class AgeFileView extends FileView {
   private dirty = false;
   private autosaveTimer: number | null = null;
   private inFlightSave: Promise<void> | null = null;
+  /** One shared flush, so close + unload (in either order) save once. */
+  private flushing: Promise<void> | null = null;
   private lastSavedAt: Date | null = null;
   /** Byte-length of the ciphertext we last successfully wrote — surfaced via the status bar. */
   private lastSavedBytes: number | null = null;
@@ -265,19 +271,33 @@ export class AgeFileView extends FileView {
     }
   }
 
+  /**
+   * Write out unsaved edits if there are any. Safe to call from any trigger
+   * (close, unload, backgrounding, blur): concurrent callers share one
+   * flush, and a clean view is a no-op. A failed save shows its own Notice
+   * (from save()) and is swallowed here so callers always continue.
+   */
+  async flushIfDirty(reason: SaveReason = "unload"): Promise<void> {
+    if (this.flushing) return this.flushing;
+    if (!this.dirty || !this.editor) return;
+    this.flushing = (async () => {
+      try {
+        await this.save(reason);
+      } catch (err) {
+        console.error("[halfday-rune] flush failed", err);
+      } finally {
+        this.flushing = null;
+      }
+    })();
+    return this.flushing;
+  }
+
   async onUnloadFile(_file: TFile): Promise<void> {
     // flush unsaved edits before dropping plaintext. we await rather than
     // fire-and-forget so the encrypted bytes land before the plugin or
     // workspace unwinds further. If save throws, we surface it via Notice
-    // (save() already does that) and still complete the unload — keeping
-    // the view open would block Obsidian's own state transitions.
-    if (this.dirty) {
-      try {
-        await this.save("unload");
-      } catch (err) {
-        console.error("[halfday-rune] flush-on-unload failed", err);
-      }
-    }
+    // (save() already does that) and still complete the unload.
+    await this.flushIfDirty();
     this.cancelAutosave();
     this.teardownEditor();
     this.plaintext = null;
@@ -288,6 +308,9 @@ export class AgeFileView extends FileView {
   }
 
   async onClose(): Promise<void> {
+    // leaving a note on mobile (and closing a tab on desktop) goes through
+    // here, possibly without onUnloadFile: flush BEFORE tearing down.
+    await this.flushIfDirty();
     this.cancelAutosave();
     this.teardownEditor();
     this.plaintext = null;
@@ -398,6 +421,12 @@ export class AgeFileView extends FileView {
         ]),
         // track dirty state — every docChanged flips us dirty and (re)arms
         // the 30s autosave timer.
+        EditorView.domEventHandlers({
+          blur: () => {
+            if (this.deps.flushOnBlur) void this.flushIfDirty("background");
+            return false;
+          },
+        }),
         EditorView.updateListener.of((update) => {
           if (update.docChanged) {
             this.markDirty();
@@ -485,7 +514,7 @@ export class AgeFileView extends FileView {
     this.autosaveTimer = window.setTimeout(() => {
       this.autosaveTimer = null;
       void this.save("autosave");
-    }, AUTOSAVE_DELAY_MS);
+    }, this.deps.autosaveDelayMs ?? AUTOSAVE_DELAY_MS);
   }
 
   private cancelAutosave(): void {

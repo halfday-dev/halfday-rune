@@ -58,7 +58,8 @@ async function boot(desktop: boolean) {
   const view = Object.create(AgeFileView.prototype) as InstanceType<typeof AgeFileView>;
   const showLocked = vi.fn();
   const flush = vi.fn(async () => {});
-  Object.assign(view, { showLocked, flushBeforeLock: flush });
+  const flushIfDirty = vi.fn(async () => {});
+  Object.assign(view, { showLocked, flushBeforeLock: flush, flushIfDirty });
   const p = new (Plugin as unknown as new () => Record<string, any>)();
   p.app = {
     vault: {
@@ -74,7 +75,7 @@ async function boot(desktop: boolean) {
   };
   vi.stubGlobal("document", { visibilityState: "visible" }); // after CodeMirror loaded
   await p.onload();
-  return { p, identity, view, showLocked, flush };
+  return { p, identity, view, showLocked, flush, flushIfDirty };
 }
 
 let storageWrites: string[];
@@ -145,6 +146,19 @@ describe("mobile plugin wiring", () => {
     await new Promise((r) => setTimeout(r, 10));
     expect(p.getKeySource().isUnlocked()).toBe(false);
     expect(showLocked).toHaveBeenCalled();
+  });
+
+  it("document hidden flushes dirty edits immediately, even with a long grace period", async () => {
+    const { p, flushIfDirty, showLocked } = await boot(false);
+    p.settings.backgroundLockGraceSeconds = 600;
+    await p.getKeySource().getIdentity();
+    (document as { visibilityState: string }).visibilityState = "hidden";
+    p.domListeners["visibilitychange"]();
+    expect(flushIfDirty).toHaveBeenCalledTimes(1);
+    expect(showLocked).not.toHaveBeenCalled();
+    (document as { visibilityState: string }).visibilityState = "visible";
+    p.domListeners["visibilitychange"]();
+    expect(flushIfDirty).toHaveBeenCalledTimes(1);
   });
 
   it("onunload locks and does not prompt again", async () => {
