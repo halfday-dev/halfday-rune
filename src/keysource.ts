@@ -9,7 +9,6 @@
  * helpers through the lazy loader (crypto-node, desktop only).
  */
 
-import { identityToRecipient } from "age-encryption";
 import { unwrapMobileKey } from "./crypto";
 import { loadCryptoNode } from "./node-loader";
 
@@ -23,11 +22,12 @@ export interface KeySource {
   /** Drop any held secret. Nothing to drop for a file-backed source. */
   lock(): void;
   /**
-   * True when writes only ever go to this source's own single recipient, so
-   * a save must refuse a note whose header has other recipients (they would
-   * be silently dropped). Mobile: true. Desktop: false (recipients.txt rules).
+   * True when the recipient list is fixed by something other than
+   * recipients.txt (mobile: the passphrase-protected wrapped list), so a save
+   * must check the note on disk has no recipient the list lacks (they would
+   * be silently dropped). Desktop: false (recipients.txt rules).
    */
-  readonly soleRecipientOnly?: boolean;
+  readonly fixedRecipientList?: boolean;
 }
 
 /** The two file paths FileKeySource reads; the settings object satisfies it. */
@@ -141,7 +141,7 @@ function nonNegInt(v: unknown, fallback: number): number {
  * unwrap attempt.
  */
 export class PassphraseKeySource implements KeySource {
-  readonly soleRecipientOnly = true;
+  readonly fixedRecipientList = true;
   #identity: string | null = null;
   #recipients: string[] = [];
   private pending: Promise<void> | null = null;
@@ -176,7 +176,7 @@ export class PassphraseKeySource implements KeySource {
 
   async getRecipients(): Promise<string[]> {
     const id = await this.getIdentity();
-    return [await identityToRecipient(id)];
+    return [...this.#recipients];
   }
 
   private async ensureUnlocked(): Promise<void> {

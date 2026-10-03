@@ -327,28 +327,6 @@ export function isScryptWrapped(bytes: Uint8Array): boolean {
 }
 
 /**
- * Mobile writes only ever encrypt to the unlocked identity's own recipient.
- * Before overwriting a note, check its existing header is exactly one X25519
- * stanza that the identity opens; anything else (extra recipients, other key
- * types, a different key) would be silently dropped by the re-encrypt.
- */
-export async function isEncryptedOnlyToIdentity(
-  identity: string,
-  existing: Uint8Array
-): Promise<boolean> {
-  try {
-    const st = parseAgeHeader(existing);
-    if (st.length !== 1 || st[0].type !== "X25519") return false;
-    const dec = new Decrypter();
-    dec.addIdentity(identity);
-    await dec.decrypt(existing, "text");
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
  * Check a note on disk before the phone re-encrypts it. `ok` requires that
  * the unlocked identity opens the note's current header. `stanzas` is the
  * number of X25519 recipient stanzas; the caller compares it with the size

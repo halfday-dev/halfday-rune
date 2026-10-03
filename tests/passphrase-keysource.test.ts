@@ -55,6 +55,18 @@ function make(over: Partial<MobileKeySettings> = {}, files: Record<string, Uint8
 }
 
 describe("PassphraseKeySource", () => {
+  it("getRecipients returns the wrapped list (3 keys), cleared on lock", async () => {
+    const own = await identityToRecipient(identity);
+    const r2 = await identityToRecipient(await generateIdentity());
+    const r3 = await identityToRecipient(await generateIdentity());
+    const w3 = await wrapMobileKey(identity, [r2, own, r3], PW, 16);
+    const t = make({}, { [PATH]: w3 });
+    expect(await t.ks.getRecipients()).toEqual([r2, own, r3]);
+    expect(t.ks.fixedRecipientList).toBe(true);
+    t.ks.lock();
+    expect(t.ks.isUnlocked()).toBe(false);
+  });
+
   it("is locked, then unlocks on demand and derives the recipient", async () => {
     const { ks, state } = make();
     expect(ks.isUnlocked()).toBe(false);

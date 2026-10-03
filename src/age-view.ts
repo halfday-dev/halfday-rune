@@ -55,7 +55,7 @@ import {
 import { halfdayInlineDecorations } from "./decorations";
 import type { KeySource } from "./keysource";
 import { KeyLockedError } from "./keysource";
-import { isEncryptedOnlyToIdentity } from "./crypto";
+import { inspectNoteForMobileSave } from "./crypto";
 
 export const VIEW_TYPE_AGE = "halfday-age-view";
 
@@ -134,13 +134,15 @@ export interface AgeFileViewDeps {
   clearStatusBar: () => void;
 }
 
-export const SOLE_RECIPIENT_NOTICE =
-  "This note is encrypted to more keys than your phone has — edit it on desktop";
+export const UNKNOWN_RECIPIENTS_NOTICE =
+  "This note is encrypted to keys your phone doesn't know about \u2014 edit it on desktop, or re-run Create mobile unlock copy";
+export const NOT_YOUR_KEY_NOTICE =
+  "This note isn't encrypted to your unlocked key \u2014 edit it on desktop";
 
-class SoleRecipientError extends Error {
-  constructor() {
-    super(SOLE_RECIPIENT_NOTICE);
-    this.name = "SoleRecipientError";
+class RecipientListError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RecipientListError";
   }
 }
 
@@ -528,13 +530,17 @@ export class AgeFileView extends FileView {
       const recipients = await keys.getRecipients();
       const identity = await keys.getIdentity();
 
-      // Mobile only encrypts to its own single recipient. Refuse (and write
-      // nothing) if the note on disk is encrypted to more than that, since
-      // the re-encrypt would silently drop those recipients.
-      if (keys.soleRecipientOnly) {
+      // Mobile encrypts to the wrapped recipient list. Before overwriting
+      // an existing note, require that our key opens it and that it has no
+      // more recipient stanzas than the list has entries; otherwise a
+      // recipient added on desktop since the copy was made would be silently
+      // dropped. Refuse (and write nothing).
+      if (keys.fixedRecipientList) {
         const existing = new Uint8Array(await this.app.vault.readBinary(file));
-        if (!(await isEncryptedOnlyToIdentity(identity, existing))) {
-          throw new SoleRecipientError();
+        const note = await inspectNoteForMobileSave(identity, existing);
+        if (!note.ok) throw new RecipientListError(NOT_YOUR_KEY_NOTICE);
+        if (note.x25519Stanzas + note.otherStanzas > recipients.length) {
+          throw new RecipientListError(UNKNOWN_RECIPIENTS_NOTICE);
         }
       }
 
@@ -577,8 +583,8 @@ export class AgeFileView extends FileView {
         reason,
       });
     } catch (err) {
-      if (err instanceof SoleRecipientError) {
-        new Notice(SOLE_RECIPIENT_NOTICE);
+      if (err instanceof RecipientListError) {
+        new Notice(err.message);
         this.pushStatusBar();
         throw err;
       }

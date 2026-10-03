@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { Encrypter, generateIdentity, identityToRecipient } from "age-encryption";
-import { parseAgeHeader, isScryptWrapped, isEncryptedOnlyToIdentity } from "../src/crypto";
+import { parseAgeHeader, isScryptWrapped, inspectNoteForMobileSave } from "../src/crypto";
 import {
   wrapMobileKey,
   buildMobileKey,
@@ -211,7 +211,7 @@ describe("header helpers", () => {
     expect(isScryptWrapped(new Uint8Array([1, 2, 3]))).toBe(false);
   });
 
-  it("isEncryptedOnlyToIdentity: one own X25519 stanza only", async () => {
+  it("inspectNoteForMobileSave: needs our key to open it, counts stanzas", async () => {
     const { identityToRecipient } = await import("age-encryption");
     const id = await generateIdentity();
     const other = await generateIdentity();
@@ -222,11 +222,11 @@ describe("header helpers", () => {
     };
     const mine = await identityToRecipient(id);
     const theirs = await identityToRecipient(other);
-    expect(await isEncryptedOnlyToIdentity(id, await mk([mine]))).toBe(true);
-    expect(await isEncryptedOnlyToIdentity(id, await mk([mine, theirs]))).toBe(false);
-    expect(await isEncryptedOnlyToIdentity(id, await mk([theirs]))).toBe(false);
-    expect(await isEncryptedOnlyToIdentity(id, new Uint8Array([1]))).toBe(false);
+    expect(await inspectNoteForMobileSave(id, await mk([mine]))).toEqual({ ok: true, x25519Stanzas: 1, otherStanzas: 0 });
+    expect(await inspectNoteForMobileSave(id, await mk([mine, theirs]))).toEqual({ ok: true, x25519Stanzas: 2, otherStanzas: 0 });
+    expect((await inspectNoteForMobileSave(id, await mk([theirs]))).ok).toBe(false);
+    expect((await inspectNoteForMobileSave(id, new Uint8Array([1]))).ok).toBe(false);
     const w = await wrapMobileKey(id, [], PW, 16);
-    expect(await isEncryptedOnlyToIdentity(id, w)).toBe(false);
+    expect((await inspectNoteForMobileSave(id, w)).ok).toBe(false);
   });
 });
