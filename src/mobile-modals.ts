@@ -6,7 +6,12 @@
 import { App, Modal } from "obsidian";
 import { validatePassphrasePair } from "./mobile-copy";
 import type { UnlockPrompt } from "./keysource";
-import { InvalidWrappedIdentityError, WrongPassphraseError } from "./crypto";
+import {
+  InvalidWrappedIdentityError,
+  LegacyWrappedIdentityError,
+  LEGACY_WRAPPED_MESSAGE,
+  WrongPassphraseError,
+} from "./crypto";
 
 /**
  * Desktop: ask for a new passphrase twice. `onSubmit` does the work and
@@ -124,8 +129,10 @@ export class CreateMobileCopyModal extends Modal {
 }
 
 /** Fixed user-facing text for an unlock failure; never includes any detail. */
-function unlockErrorText(err: unknown): string {
+export function unlockErrorText(err: unknown): string {
   if (err instanceof WrongPassphraseError) return "Wrong passphrase";
+  // the legacy error is a subclass, so it must be checked first
+  if (err instanceof LegacyWrappedIdentityError) return LEGACY_WRAPPED_MESSAGE;
   if (err instanceof InvalidWrappedIdentityError) {
     return "The unlock file is damaged or not an unlock file.";
   }

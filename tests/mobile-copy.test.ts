@@ -10,6 +10,10 @@ import {
   MOBILE_COPY_FAILED_MESSAGE,
   inspectMobileKeyTarget,
   mobileCopySummary,
+  mobileCopyWarning,
+  recipientsFingerprint,
+  fingerprintSidecarPath,
+  STALE_COPY_WARNING,
   MOBILE_COPY_NOT_WRAPPED_MESSAGE,
   type VaultAdapterLike,
 } from "../src/mobile-copy";
@@ -180,5 +184,65 @@ describe("createMobileCopy", () => {
     expect(err).toBeInstanceOf(MobileCopyError);
     expect(err.message).not.toContain(PW);
     expect(a.files.size + a.dirs.size).toBe(0);
+  });
+});
+
+describe("stale-copy fingerprint sidecar", () => {
+  it("is written beside the wrapped file; order and dupes do not matter", async () => {
+    expect(fingerprintSidecarPath(P)).toBe("_rune/identity.recipients.sha256");
+    const a = await identityToRecipient(await generateIdentity());
+    const b = await identityToRecipient(await generateIdentity());
+    expect(await recipientsFingerprint([a, b])).toBe(await recipientsFingerprint([b, a, a]));
+    expect(await recipientsFingerprint([a])).not.toBe(await recipientsFingerprint([a, b]));
+    expect(await recipientsFingerprint([a])).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("no warning when fresh; warns after a swap, when the sidecar is missing or edited; none without an unlock file", async () => {
+    const ad = new FakeAdapter();
+    const id = await generateIdentity();
+    const own = await identityToRecipient(id);
+    const old = await identityToRecipient(await generateIdentity());
+    const fresh = await identityToRecipient(await generateIdentity());
+    expect(await mobileCopyWarning(ad, P, [own, old])).toBeNull(); // no unlock file
+    await createMobileCopy(ad, P, id, [old], PW, 16);
+    expect(ad.files.has("_rune/identity.recipients.sha256")).toBe(true);
+    expect(await mobileCopyWarning(ad, P, [old, own])).toBeNull();
+    expect(await mobileCopyWarning(ad, P, [fresh, own])).toBe(STALE_COPY_WARNING);
+    ad.files.set("_rune/identity.recipients.sha256", new TextEncoder().encode("deadbeef\n"));
+    expect(await mobileCopyWarning(ad, P, [old, own])).toBe(STALE_COPY_WARNING);
+    ad.files.delete("_rune/identity.recipients.sha256");
+    expect(await mobileCopyWarning(ad, P, [old, own])).toBe(STALE_COPY_WARNING);
+    // the sidecar never changes what is wrapped
+    expect((await unwrapMobileKey(ad.files.get(P)!, PW)).recipients).toEqual([old, own]);
+  });
+
+  it("a failed sidecar write rolls the whole copy back", async () => {
+    const ad = new FakeAdapter();
+    const id = await generateIdentity();
+    await createMobileCopy(ad, P, id, [], PW, 16);
+    const before = ad.files.get(P)!.slice();
+    const sideBefore = ad.files.get("_rune/identity.recipients.sha256")!.slice();
+    const orig = ad.writeBinary.bind(ad);
+    ad.writeBinary = async (p, d) => {
+      if (p.endsWith(".sha256")) throw new Error("disk full");
+      return orig(p, d);
+    };
+    const other = await identityToRecipient(await generateIdentity());
+    await expect(createMobileCopy(ad, P, id, [other], PW, 16)).rejects.toBeInstanceOf(MobileCopyError);
+    expect([...ad.files.get(P)!]).toEqual([...before]);
+    expect([...ad.files.get("_rune/identity.recipients.sha256")!]).toEqual([...sideBefore]);
+  });
+});
+
+describe("malformed recipient message", () => {
+  it("names the position and writes nothing", async () => {
+    const ad = new FakeAdapter();
+    const id = await generateIdentity();
+    const good = await identityToRecipient(await generateIdentity());
+    const err = await createMobileCopy(ad, P, id, [good, "age1plugin1abc"], PW, 16).catch((e) => e);
+    expect(err).toBeInstanceOf(MobileCopyError);
+    expect(err.message).toContain("Recipient 2");
+    expect(err.message).toContain("not a plain age1 key");
+    expect(ad.files.size).toBe(0);
   });
 });

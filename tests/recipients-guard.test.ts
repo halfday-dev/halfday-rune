@@ -1,4 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
 import { generateIdentity, identityToRecipient } from "age-encryption";
 import {
   addedToMainFile,
@@ -76,5 +79,38 @@ describe("main recipients file guard", () => {
     const confirm = vi.fn(async () => false);
     expect(await confirmRecipientsSave({ configuredPath: "/tmp/test/recipients.txt", expand, prevContent: "", newContent: `${a}\n` }, confirm)).toBe(true);
     expect(confirm).not.toHaveBeenCalled();
+  });
+});
+
+describe("symlinked spellings of the main file", () => {
+  it("a symlink to the main file (and via a symlinked dir) still prompts", async () => {
+    const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rune-guard-")));
+    try {
+      const home = path.join(tmp, "home");
+      fs.mkdirSync(path.join(home, ".age"), { recursive: true });
+      const main = path.join(home, ".age", "recipients.txt");
+      fs.writeFileSync(main, "");
+      const link = path.join(tmp, "link.txt");
+      fs.symlinkSync(main, link);
+      const dirLink = path.join(tmp, "agelink");
+      fs.symlinkSync(path.join(home, ".age"), dirLink);
+      const other = path.join(tmp, "other.txt");
+      fs.writeFileSync(other, "");
+      const ex = (p: string) => (p.startsWith("~/") ? path.join(home, p.slice(2)) : p);
+      const r = fs.realpathSync;
+      expect(isMainRecipientsFile(link, ex)).toBe(false); // text alone misses it
+      expect(isMainRecipientsFile(link, ex, r)).toBe(true);
+      expect(isMainRecipientsFile(path.join(dirLink, "recipients.txt"), ex, r)).toBe(true);
+      expect(isMainRecipientsFile(other, ex, r)).toBe(false);
+      const a = await identityToRecipient(await generateIdentity());
+      const confirm = vi.fn(async () => true);
+      await confirmRecipientsSave(
+        { configuredPath: link, expand: ex, realpath: r, prevContent: "", newContent: `${a}\n` },
+        confirm
+      );
+      expect(confirm).toHaveBeenCalledTimes(1);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 });

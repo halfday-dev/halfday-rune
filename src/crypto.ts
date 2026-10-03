@@ -224,6 +224,14 @@ function isWellFormedRecipient(s: string): boolean {
   }
 }
 
+/** A recipient is not a plain X25519 age1 key. `position` is 1-based in the list. */
+export class MalformedRecipientError extends Error {
+  constructor(public readonly position: number) {
+    super(`recipient ${position} is not a plain age1 key`);
+    this.name = "MalformedRecipientError";
+  }
+}
+
 export interface MobileKey {
   identity: string;
   /** Deduped; always includes the identity's own recipient. */
@@ -244,9 +252,9 @@ export async function buildMobileKey(
     throw new Error("not a well-formed AGE-SECRET-KEY-1 identity");
   }
   const list: string[] = [];
-  for (const r of recipients) {
+  for (const [i, r] of recipients.entries()) {
     const t = r.trim();
-    if (!isWellFormedRecipient(t)) throw new Error("malformed recipient");
+    if (!isWellFormedRecipient(t)) throw new MalformedRecipientError(i + 1);
     if (!list.includes(t)) list.push(t);
   }
   const own = await identityToRecipient(id);

@@ -8,7 +8,7 @@
  * passphrase or the identity.
  */
 
-import { buildMobileKey, isScryptWrapped, unwrapMobileKey, wrapMobileKey } from "./crypto";
+import { buildMobileKey, MalformedRecipientError, isScryptWrapped, unwrapMobileKey, wrapMobileKey } from "./crypto";
 
 export const DEFAULT_MOBILE_KEY_PATH = "_rune/identity.age";
 export const MIN_PASSPHRASE_LENGTH = 20;
@@ -98,6 +98,52 @@ export async function inspectMobileKeyTarget(
   }
 }
 
+/**
+ * Public fingerprint of the recipients list wrapped into the unlock file
+ * (sorted, deduped, own recipient included), stored beside it as a plain
+ * sidecar. Desktop compares it with the current list to warn when the phone
+ * copy is stale. It is public information and NOT a security control:
+ * editing or deleting the sidecar can only suppress or trigger the warning;
+ * the phone's encryption always uses the list inside the passphrase-protected
+ * file, never the sidecar.
+ */
+export async function recipientsFingerprint(recipients: readonly string[]): Promise<string> {
+  const list = [...new Set(recipients.map((r) => r.trim()))].sort();
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(list.join("\n")));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** `_rune/identity.age` -> `_rune/identity.recipients.sha256`. */
+export function fingerprintSidecarPath(keyPath: string): string {
+  return keyPath.replace(/\.age$/i, "") + ".recipients.sha256";
+}
+
+export const STALE_COPY_WARNING =
+  "Your phone's rune unlock copy uses an older recipients list. Re-run 'Create mobile unlock copy', or phone edits will be encrypted to the old keys.";
+
+/**
+ * Desktop check: null when there is nothing to warn about, else the warning.
+ * No unlock file = nothing to warn about; an unlock file with a missing or
+ * different sidecar = warn.
+ */
+export async function mobileCopyWarning(
+  adapter: Pick<VaultAdapterLike, "exists" | "readBinary">,
+  keyPath: string,
+  currentRecipients: readonly string[]
+): Promise<string | null> {
+  if (!(await adapter.exists(keyPath))) return null;
+  const side = fingerprintSidecarPath(keyPath);
+  let stored = "";
+  try {
+    if (await adapter.exists(side)) {
+      stored = new TextDecoder().decode(await adapter.readBinary(side)).trim().toLowerCase();
+    }
+  } catch {
+    stored = "";
+  }
+  return stored === (await recipientsFingerprint(currentRecipients)) ? null : STALE_COPY_WARNING;
+}
+
 /** Fixed-message failure; the cause is deliberately not carried. */
 export class MobileCopyError extends Error {
   constructor(message: string = MOBILE_COPY_FAILED_MESSAGE) {
@@ -155,6 +201,9 @@ export async function createMobileCopy(
 
   let previous: Uint8Array | null = null;
   let wrote = false;
+  let previousSide: Uint8Array | null = null;
+  let sideWrote = false;
+  const side = fingerprintSidecarPath(path);
   try {
     if (await adapter.exists(path)) {
       previous = new Uint8Array(await adapter.readBinary(path));
@@ -163,7 +212,18 @@ export async function createMobileCopy(
         throw new MobileCopyError(MOBILE_COPY_NOT_WRAPPED_MESSAGE);
       }
     }
-    const key = await buildMobileKey(identity, recipients);
+    let key;
+    try {
+      key = await buildMobileKey(identity, recipients);
+    } catch (e) {
+      if (e instanceof MalformedRecipientError) {
+        throw new MobileCopyError(
+          `Recipient ${e.position} in your recipients list is not a plain age1 key (plugin and SSH recipients cannot be used on the phone). Nothing was changed.`
+        );
+      }
+      throw e;
+    }
+    if (await adapter.exists(side)) previousSide = new Uint8Array(await adapter.readBinary(side));
     const wrapped = await wrapMobileKey(key.identity, key.recipients, passphrase, logN);
 
     let changes: MobileCopyResult["changes"] = null;
@@ -193,6 +253,11 @@ export async function createMobileCopy(
     ) {
       throw new Error("unwrap differs");
     }
+    sideWrote = true;
+    await adapter.writeBinary(
+      side,
+      toAB(new TextEncoder().encode((await recipientsFingerprint(key.recipients)) + "\n"))
+    );
     return { addedOwnRecipient: key.addedOwn, changes };
   } catch (err) {
     if (err instanceof MobileCopyError && !wrote) throw err;
@@ -200,6 +265,10 @@ export async function createMobileCopy(
       try {
         if (previous) await adapter.writeBinary(path, toAB(previous));
         else await adapter.remove(path);
+        if (sideWrote) {
+          if (previousSide) await adapter.writeBinary(side, toAB(previousSide));
+          else await adapter.remove(side);
+        }
       } catch {
         throw new MobileCopyError(MOBILE_COPY_RESTORE_FAILED_MESSAGE);
       }

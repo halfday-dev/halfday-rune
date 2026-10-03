@@ -87,6 +87,7 @@ import {
 // Node-only modules (crypto-node, backup, rotate-log) are loaded lazily via
 // node-loader so main.ts has no top-level fs/os/path import and loads on iOS.
 import { loadBackup, loadCryptoNode, loadRotateLog } from "./node-loader";
+import { buildMobileKey } from "./crypto";
 import { FileKeySource, PassphraseKeySource } from "./keysource";
 import type { KeySource } from "./keysource";
 import type { MobileCopyResult } from "./mobile-copy";
@@ -94,6 +95,7 @@ import { CreateMobileCopyModal, makeUnlockPrompt } from "./mobile-modals";
 import {
   createMobileCopy,
   mobileCopySummary,
+  mobileCopyWarning,
   DEFAULT_MOBILE_KEY_PATH,
   effectiveMobileKeyPath,
   inspectMobileKeyTarget,
@@ -320,6 +322,8 @@ export default class HalfdayObsidianRune extends Plugin {
 
     this.addSettingTab(new HalfdayRuneSettingTab(this.app, this));
 
+    void this.checkMobileCopyFreshness();
+
     console.log("[halfday-rune] loaded");
   }
 
@@ -477,8 +481,35 @@ export default class HalfdayObsidianRune extends Plugin {
       new Notice(
         `Halfday Rune: mobile unlock copy saved to ${path}` + mobileCopySummary(result)
       );
+      void this.checkMobileCopyFreshness();
       return null;
     }).open();
+  }
+
+  private staleCopyNotice: Notice | null = null;
+
+  /**
+   * Desktop: warn (persistently) when the phone's unlock copy was made from a
+   * different recipients list than the current one. Advisory only: the
+   * sidecar it reads cannot change what gets encrypted. Never throws.
+   */
+  async checkMobileCopyFreshness(): Promise<void> {
+    if (!Platform.isDesktopApp || !this.keySource) return;
+    try {
+      const keys = this.keySource;
+      const current = (
+        await buildMobileKey(await keys.getIdentity(), await keys.getRecipients())
+      ).recipients;
+      const warning = await mobileCopyWarning(
+        this.app.vault.adapter,
+        this.mobileKeyPath(),
+        current
+      );
+      this.staleCopyNotice?.hide();
+      this.staleCopyNotice = warning ? new Notice(`Halfday Rune: ${warning}`, 0) : null;
+    } catch {
+      /* identity or recipients unreadable: nothing to compare */
+    }
   }
 
   getKeySource(): KeySource {
@@ -1813,7 +1844,8 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
           } else {
             new Notice("Halfday Rune: recipients saved");
           }
-          console.log("[halfday-rune] recipients saved", {
+          void this.plugin.checkMobileCopyFreshness();
+        console.log("[halfday-rune] recipients saved", {
             path: this.plugin.settings.recipientsPath,
             bytes: content.length,
             added: diff.added,
@@ -1839,6 +1871,7 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
       const guardOpts = {
         configuredPath: this.plugin.settings.recipientsPath,
         expand: node.expandHome,
+        realpath: node.realpath,
         prevContent,
         newContent: content,
       };

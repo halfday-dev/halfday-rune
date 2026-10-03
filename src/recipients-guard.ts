@@ -20,13 +20,41 @@ function normalizePosix(p: string): string {
   return "/" + out.join("/");
 }
 
-/** Does `configured` expand to the default main recipients file? */
+/**
+ * realpath of `p`, or of its parent plus the file name when the file itself
+ * does not exist yet; null when neither resolves.
+ */
+function resolveReal(p: string, realpath: (p: string) => string): string | null {
+  try {
+    return realpath(p);
+  } catch {
+    /* fall through to the parent */
+  }
+  const i = p.lastIndexOf("/");
+  if (i <= 0) return null;
+  try {
+    return realpath(p.slice(0, i)) + p.slice(i);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Does `configured` expand to the default main recipients file? Compared by
+ * folded text, and (when `realpath` is given) also by real path, so a
+ * symlinked spelling of the file still counts.
+ */
 export function isMainRecipientsFile(
   configured: string,
-  expand: (p: string) => string
+  expand: (p: string) => string,
+  realpath?: (p: string) => string
 ): boolean {
   const norm = (p: string): string => foldPath(normalizePosix(expand(p.trim())));
-  return norm(configured) === norm(MAIN_RECIPIENTS_PATH);
+  if (norm(configured) === norm(MAIN_RECIPIENTS_PATH)) return true;
+  if (!realpath) return false;
+  const a = resolveReal(expand(configured.trim()), realpath);
+  const b = resolveReal(expand(MAIN_RECIPIENTS_PATH), realpath);
+  return a !== null && b !== null && foldPath(a) === foldPath(b);
 }
 
 /**
@@ -38,10 +66,12 @@ export function isMainRecipientsFile(
 export function addedToMainFile(opts: {
   configuredPath: string;
   expand: (p: string) => string;
+  /** Optional fs.realpathSync-like; desktop passes it, tests may inject. */
+  realpath?: (p: string) => string;
   prevContent: string | null;
   newContent: string;
 }): string[] {
-  if (!isMainRecipientsFile(opts.configuredPath, opts.expand)) return [];
+  if (!isMainRecipientsFile(opts.configuredPath, opts.expand, opts.realpath)) return [];
   let prev: string[] = [];
   try {
     if (opts.prevContent !== null) prev = parseRecipientsFile(opts.prevContent);

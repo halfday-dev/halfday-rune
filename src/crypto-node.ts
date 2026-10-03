@@ -21,6 +21,11 @@ export function expandHome(p: string): string {
   return p;
 }
 
+/** fs.realpathSync, for the main-recipients-file guard (follows symlinks). */
+export function realpath(p: string): string {
+  return fs.realpathSync(p);
+}
+
 /**
  * v0.5.0: Read a recipients.txt file from disk and return the list of
  * age1... pubkeys it contains. Throws on missing file or any parser error.
