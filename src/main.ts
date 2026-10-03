@@ -304,6 +304,7 @@ export default class HalfdayObsidianRune extends Plugin {
           // save sooner and when focus leaves the editor.
           autosaveDelayMs: Platform.isMobile ? 5_000 : undefined,
           flushOnBlur: Platform.isMobile,
+          remeasureOnViewport: Platform.isMobile,
         })
     );
     this.registerExtensions(["age"], VIEW_TYPE_AGE);

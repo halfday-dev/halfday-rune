@@ -136,6 +136,11 @@ export interface AgeFileViewDeps {
   autosaveDelayMs?: number;
   /** Flush dirty edits when the editor loses focus (mobile). */
   flushOnBlur?: boolean;
+  /**
+   * Re-measure the editor when the (iOS) visual viewport or the workspace
+   * resizes, e.g. when the on-screen keyboard opens. Mobile only.
+   */
+  remeasureOnViewport?: boolean;
 }
 
 export const UNKNOWN_RECIPIENTS_NOTICE =
@@ -169,6 +174,8 @@ export class AgeFileView extends FileView {
   private lastSavedBytes: number | null = null;
   /** Bumped by every lock/teardown so an in-flight save can tell it was locked under it. */
   private lockGen = 0;
+  /** Removes the viewport/workspace resize listeners (mobile). */
+  private detachViewport: (() => void) | null = null;
 
   constructor(leaf: WorkspaceLeaf, deps: AgeFileViewDeps) {
     super(leaf);
@@ -460,6 +467,8 @@ export class AgeFileView extends FileView {
             lineHeight: "calc(var(--line-height-normal, 1.6) * 1.15)",
           },
           ".cm-scroller": {
+            // the editor itself is the scroll container
+            overflow: "auto",
             fontFamily: "inherit",
             lineHeight: "inherit",
           },
@@ -490,10 +499,36 @@ export class AgeFileView extends FileView {
     });
 
     this.editor = new EditorView({ state, parent: this.editorHost });
+    this.attachViewportListeners();
+  }
+
+  /**
+   * CM6 only renders the lines inside its measured viewport. When the iOS
+   * keyboard opens, the visual viewport shrinks; if CM measures while the
+   * layout is mid-resize it can settle on a tiny viewport and leave the rest
+   * blank. Ask it to re-measure on every viewport / workspace resize. This
+   * only re-renders; the document is untouched.
+   */
+  attachViewportListeners(): void {
+    this.detachViewport?.();
+    this.detachViewport = null;
+    if (!this.deps.remeasureOnViewport) return;
+    const remeasure = (): void => this.editor?.requestMeasure();
+    const vv = typeof window !== "undefined" ? window.visualViewport : null;
+    vv?.addEventListener("resize", remeasure);
+    vv?.addEventListener("scroll", remeasure);
+    const ref = this.app?.workspace?.on("resize", remeasure);
+    this.detachViewport = () => {
+      vv?.removeEventListener("resize", remeasure);
+      vv?.removeEventListener("scroll", remeasure);
+      if (ref) this.app.workspace.offref(ref);
+    };
   }
 
   private teardownEditor(): void {
     this.lockGen++;
+    this.detachViewport?.();
+    this.detachViewport = null;
     if (this.editor) {
       this.editor.destroy();
       this.editor = null;

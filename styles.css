@@ -63,13 +63,15 @@
   display: flex;
   flex-direction: column;
   height: 100%;
+  min-height: 0;
   box-sizing: border-box;
 }
 
 .halfday-age-editor {
-  flex: 1 1 auto;
+  flex: 1 1 0;
   min-height: 0; /* let the CM6 scroller own overflow instead of the flex parent */
   overflow: hidden;
+  position: relative;
   background: var(--background-primary);
 }
 
@@ -77,6 +79,20 @@
    so the editor can size correctly inside our flex column. */
 .halfday-age-editor .cm-editor {
   height: 100%;
+}
+/* The scroller is the scroll container. A percentage height on .cm-editor can
+   resolve against an indefinite flex height on iOS WebKit (keyboard resize)
+   and collapse CM6's measured viewport to a couple of lines; pinning the
+   editor to the host's box with absolute insets does not depend on that. */
+@media (hover: none) and (pointer: coarse) {
+  .halfday-age-editor .cm-editor {
+    position: absolute;
+    inset: 0;
+    height: auto;
+  }
+}
+.halfday-age-editor .cm-scroller {
+  overflow: auto;
 }
 .halfday-age-editor .cm-editor.cm-focused {
   outline: none;
