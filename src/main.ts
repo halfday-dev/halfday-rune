@@ -89,11 +89,11 @@ import {
 import { loadBackup, loadCryptoNode, loadRotateLog } from "./node-loader";
 import { FileKeySource, PassphraseKeySource } from "./keysource";
 import type { KeySource } from "./keysource";
+import type { MobileCopyResult } from "./mobile-copy";
 import { CreateMobileCopyModal, makeUnlockPrompt } from "./mobile-modals";
 import {
   createMobileCopy,
   mobileCopySummary,
-  type MobileCopyResult,
   DEFAULT_MOBILE_KEY_PATH,
   effectiveMobileKeyPath,
   inspectMobileKeyTarget,
