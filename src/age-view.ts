@@ -504,49 +504,100 @@ export class AgeFileView extends FileView {
   }
 
   /**
-   * CM6 only renders the lines inside its measured viewport. When the iOS
-   * keyboard opens, the visual viewport shrinks; if CM measures while the
-   * layout is mid-resize it can settle on a tiny viewport and leave the rest
-   * blank. Ask it to re-measure on every viewport / workspace resize. This
-   * only re-renders; the document is untouched.
+   * CM6 only renders the lines inside its measured viewport, and iOS WebKit
+   * can lay lines out yet not paint them after the keyboard changes the
+   * layout. Obsidian iOS (Capacitor) may not fire visualViewport events for
+   * the keyboard, so listen to everything that could signal it: visualViewport
+   * resize/scroll, window resize, the workspace and this view's own resize
+   * hook, editor focus, and body class changes. Every signal re-measures and
+   * schedules repaint nudges. Only re-renders; the document is untouched.
    */
   attachViewportListeners(): void {
     this.detachViewport?.();
     this.detachViewport = null;
     if (!this.deps.remeasureOnViewport) return;
-    let nudgeTimers: ReturnType<typeof setTimeout>[] = [];
-    let debugTimer: ReturnType<typeof setTimeout> | null = null;
-    const remeasure = (): void => {
-      this.editor?.requestMeasure();
-      // iOS WebKit can lay lines out (the caret has a position there) yet not
-      // paint them after the keyboard resizes the viewport: nudge a repaint
-      // once the resize settles.
-      nudgeTimers.forEach(clearTimeout);
-      nudgeTimers = [120, 450].map((ms) => setTimeout(() => this.forceRepaint(), ms));
-    };
-    const vv = typeof window !== "undefined" ? window.visualViewport : null;
-    vv?.addEventListener("resize", remeasure);
-    vv?.addEventListener("scroll", remeasure);
-    const ref = this.app?.workspace?.on("resize", remeasure);
-    const debugOnResize = (): void => {
-      if (debugTimer !== null) clearTimeout(debugTimer);
-      debugTimer = setTimeout(() => {
-        // __RUNE_LAYOUT_DEBUG__ is a build-time constant: this whole call is removed
-        // from release bundles.
-        if (typeof __RUNE_LAYOUT_DEBUG__ !== "undefined" && __RUNE_LAYOUT_DEBUG__ === true && this.editor && this.editorHost) {
-          void writeLayoutDebug(this.editor, this.editorHost, this.app.vault.adapter);
-        }
-      }, 800);
-    };
-    if (typeof __RUNE_LAYOUT_DEBUG__ !== "undefined" && __RUNE_LAYOUT_DEBUG__ === true) vv?.addEventListener("resize", debugOnResize);
+    const win = typeof window !== "undefined" ? window : null;
+    const vv = win ? win.visualViewport : null;
+    const on = (label: string, nudge: number[] = [120, 450]) => () => this.viewportSignal(label, nudge);
+    const vvResize = on("visualViewport resize");
+    const vvScroll = on("visualViewport scroll");
+    const winResize = on("window resize");
+    const focusIn = on("editor focus", [300, 800]);
+    vv?.addEventListener("resize", vvResize);
+    vv?.addEventListener("scroll", vvScroll);
+    win?.addEventListener?.("resize", winResize);
+    this.editor?.dom?.addEventListener?.("focusin", focusIn);
+    const ref = this.app?.workspace?.on("resize", on("workspace resize"));
+    let mo: MutationObserver | null = null;
+    if (typeof MutationObserver !== "undefined" && typeof document !== "undefined" && document.body) {
+      // a body class toggled by the app (keyboard open/close on mobile)
+      mo = new MutationObserver(on("body class change"));
+      mo.observe(document.body, { attributes: true, attributeFilter: ["class"] });
+    }
+    // test builds only: also report on focus at +300 ms and +1500 ms
+    if (typeof __RUNE_LAYOUT_DEBUG__ !== "undefined" && __RUNE_LAYOUT_DEBUG__ === true) {
+      this.debugFocusDelays = [300, 1500];
+    }
     this.detachViewport = () => {
-      nudgeTimers.forEach(clearTimeout);
-      if (debugTimer !== null) clearTimeout(debugTimer);
-      if (typeof __RUNE_LAYOUT_DEBUG__ !== "undefined" && __RUNE_LAYOUT_DEBUG__ === true) vv?.removeEventListener("resize", debugOnResize);
-      vv?.removeEventListener("resize", remeasure);
-      vv?.removeEventListener("scroll", remeasure);
+      this.clearViewportTimers();
+      vv?.removeEventListener("resize", vvResize);
+      vv?.removeEventListener("scroll", vvScroll);
+      win?.removeEventListener?.("resize", winResize);
+      this.editor?.dom?.removeEventListener?.("focusin", focusIn);
+      mo?.disconnect();
       if (ref) this.app.workspace.offref(ref);
     };
+  }
+
+  private nudgeTimers: ReturnType<typeof setTimeout>[] = [];
+  private debugTimers = new Map<string, ReturnType<typeof setTimeout>[]>();
+  private debugFocusDelays: number[] = [];
+
+  private clearViewportTimers(): void {
+    this.nudgeTimers.forEach(clearTimeout);
+    this.nudgeTimers = [];
+    this.debugTimers.forEach((ts) => ts.forEach(clearTimeout));
+    this.debugTimers.clear();
+  }
+
+  /** One layout-affecting signal: re-measure now, repaint-nudge later. */
+  private viewportSignal(label: string, nudge: number[]): void {
+    this.editor?.requestMeasure();
+    this.nudgeTimers.forEach(clearTimeout);
+    this.nudgeTimers = nudge.map((ms) => setTimeout(() => this.forceRepaint(), ms));
+    // __RUNE_LAYOUT_DEBUG__ is a build-time constant: this is removed from
+    // release bundles.
+    if (typeof __RUNE_LAYOUT_DEBUG__ !== "undefined" && __RUNE_LAYOUT_DEBUG__ === true) {
+      const delays = label === "editor focus" ? this.debugFocusDelays : [300];
+      this.scheduleDebugReport(label, delays);
+    }
+  }
+
+  /** Obsidian calls this when the pane's size changes (also on mobile). */
+  onResize(): void {
+    if (this.deps.remeasureOnViewport && this.editor) this.viewportSignal("view onResize", [120, 450]);
+  }
+
+  /** Test builds: write the layout report now (command palette, keyboard closed). */
+  writeLayoutDebugNow(label: string): Promise<void> {
+    if (typeof __RUNE_LAYOUT_DEBUG__ !== "undefined" && __RUNE_LAYOUT_DEBUG__ === true) {
+      if (this.editor && this.editorHost) {
+        return writeLayoutDebug(this.editor, this.editorHost, this.app.vault.adapter, label);
+      }
+    }
+    return Promise.resolve();
+  }
+
+  private scheduleDebugReport(label: string, delays: number[]): void {
+    // coalesce bursts (e.g. visualViewport scroll): one pending set per label
+    if (this.debugTimers.has(label)) return;
+    const timers = delays.map((ms, i) =>
+      setTimeout(() => {
+        if (i === delays.length - 1) this.debugTimers.delete(label);
+        void this.writeLayoutDebugNow(`${label} +${ms}ms`);
+      }, ms)
+    );
+    this.debugTimers.set(label, timers);
   }
 
   /**
@@ -573,6 +624,7 @@ export class AgeFileView extends FileView {
     this.lockGen++;
     this.detachViewport?.();
     this.detachViewport = null;
+    this.clearViewportTimers();
     if (this.editor) {
       this.editor.destroy();
       this.editor = null;

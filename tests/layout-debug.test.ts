@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { collectLayoutDebug, LAYOUT_DEBUG, type ElLike } from "../src/layout-debug";
+import { collectLayoutDebug, appendCapped, LAYOUT_DEBUG, type ElLike } from "../src/layout-debug";
 
 const SECRET = "SECRET-paragraph-text-xyz";
 
@@ -43,6 +43,12 @@ describe("layout debug output", () => {
       lines,
       visualViewport: { width: 390, height: 420, offsetTop: 0 },
       innerHeight: 844,
+      label: "editor focus +300ms",
+      time: "2026-10-04T10:00:00.000Z",
+      outerHeight: 852,
+      docClientHeight: 420,
+      bodyClasses: "is-mobile is-ios keyboard-open",
+      contentIsActive: true,
       getComputedStyle: () => ({
         getPropertyValue: (p: string) => (p === "color" ? "rgb(220, 221, 222)" : p === "opacity" ? "1" : "visible"),
       }),
@@ -52,6 +58,10 @@ describe("layout debug output", () => {
     for (const want of [
       "visualViewport w=390 h=420 offsetTop=0",
       "window.innerHeight=844",
+      "window.outerHeight=852 documentElement.clientHeight=420",
+      "body.classes=[is-mobile is-ios keyboard-open]",
+      "cm-content is document.activeElement=yes",
+      "## editor focus +300ms @ 2026-10-04T10:00:00.000Z",
       ".cm-scroller:",
       "scrollHeight=400",
       "cm viewport=0-40 contentHeight=480 doc.lines=6",
@@ -62,5 +72,20 @@ describe("layout debug output", () => {
     ]) {
       expect(out, want).toContain(want);
     }
+  });
+});
+
+describe("appendCapped", () => {
+  it("appends sections under one title and keeps the newest when over the cap", () => {
+    let f = "";
+    for (let i = 0; i < 50; i++) f = appendCapped(f, `## trigger ${i} @ t\n${"x".repeat(100)}\n`, 1000);
+    expect(f.startsWith("# rune layout debug")).toBe(true);
+    expect(f.length).toBeLessThanOrEqual(1000);
+    expect(f).toContain("## trigger 49 @ t");
+    expect(f).not.toContain("## trigger 0 @ t");
+    expect(f.match(/# rune layout debug/g)).toHaveLength(1);
+    const small = appendCapped(appendCapped("", "## a\n"), "## b\n");
+    expect(small).toContain("## a");
+    expect(small).toContain("## b");
   });
 });

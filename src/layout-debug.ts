@@ -41,6 +41,15 @@ export interface LayoutDebugInput {
   visualViewport: { width: number; height: number; offsetTop: number } | null;
   innerHeight: number;
   getComputedStyle(el: ElLike): { getPropertyValue(name: string): string };
+  /** What fired this report, and when (ISO). */
+  label: string;
+  time: string;
+  outerHeight: number;
+  docClientHeight: number;
+  /** document.body.className (class names only). */
+  bodyClasses: string;
+  /** Is .cm-content the document's active element? */
+  contentIsActive: boolean;
 }
 
 const n = (v: unknown): string =>
@@ -48,7 +57,7 @@ const n = (v: unknown): string =>
 
 /** CSS values and class names only; strip anything that is not plain token text. */
 const tok = (v: string | undefined): string =>
-  (v ?? "").replace(/[^A-Za-z0-9 _.,:%()#\-/]/g, "").slice(0, 80);
+  (v ?? "").replace(/[^A-Za-z0-9 _.,:%()#+\-/]/g, "").slice(0, 80);
 
 function rect(el: ElLike): string {
   const r = el.getBoundingClientRect();
@@ -64,9 +73,12 @@ const BOX_PROPS = ["overflow", "position", "transform", "will-change", "opacity"
 const LINE_PROPS = ["color", "opacity", "visibility", "display"];
 
 export function collectLayoutDebug(input: LayoutDebugInput): string {
-  const out: string[] = ["# rune layout debug", "", "```"];
+  const out: string[] = [`## ${tok(input.label)} @ ${tok(input.time)}`, "", "```"];
   const vv = input.visualViewport;
   out.push(
+    `window.outerHeight=${n(input.outerHeight)} documentElement.clientHeight=${n(input.docClientHeight)}`,
+    `body.classes=[${tok(input.bodyClasses)}]`,
+    `cm-content is document.activeElement=${input.contentIsActive ? "yes" : "no"}`,
     `visualViewport w=${n(vv?.width)} h=${n(vv?.height)} offsetTop=${n(vv?.offsetTop)}`,
     `window.innerHeight=${n(input.innerHeight)}`,
     ""
@@ -101,18 +113,41 @@ export function collectLayoutDebug(input: LayoutDebugInput): string {
   return out.join("\n");
 }
 
-/** Collect from a live CM6 view and overwrite `_rune/layout-debug.md`. Never throws. */
+export const LAYOUT_DEBUG_MAX_BYTES = 200 * 1024;
+
+/**
+ * Append a section to the report, keeping the file under ~200 KB by dropping
+ * the OLDEST sections (the newest are kept). Pure.
+ */
+export function appendCapped(existing: string, section: string, max = LAYOUT_DEBUG_MAX_BYTES): string {
+  const title = "# rune layout debug\n\n";
+  let body = existing.startsWith(title) ? existing.slice(title.length) : existing;
+  body += (body && !body.endsWith("\n") ? "\n" : "") + section;
+  while (body.length + title.length > max) {
+    const next = body.indexOf("\n## ", 1);
+    if (next < 0) {
+      body = body.slice(body.length - (max - title.length));
+      break;
+    }
+    body = body.slice(next + 1);
+  }
+  return title + body;
+}
+
+/** Collect from a live CM6 view and append to `_rune/layout-debug.md`. Never throws. */
 export async function writeLayoutDebug(
   ed: import("@codemirror/view").EditorView,
   host: HTMLElement,
   adapter: {
     exists(p: string): Promise<boolean>;
     mkdir(p: string): Promise<void>;
+    read(p: string): Promise<string>;
     write(p: string, data: string): Promise<void>;
-  }
+  },
+  label: string
 ): Promise<void> {
   try {
-    const text = collectLayoutDebug({
+    const section = collectLayoutDebug({
       host: host as unknown as ElLike,
       editorDom: ed.dom as unknown as ElLike,
       scroller: ed.scrollDOM as unknown as ElLike,
@@ -122,9 +157,16 @@ export async function writeLayoutDebug(
       visualViewport: window.visualViewport,
       innerHeight: window.innerHeight,
       getComputedStyle: (el) => window.getComputedStyle(el as unknown as Element),
+      label,
+      time: new Date().toISOString(),
+      outerHeight: window.outerHeight,
+      docClientHeight: document.documentElement.clientHeight,
+      bodyClasses: document.body.className,
+      contentIsActive: document.activeElement === ed.contentDOM,
     });
     if (!(await adapter.exists("_rune"))) await adapter.mkdir("_rune");
-    await adapter.write(LAYOUT_DEBUG_PATH, text);
+    const prev = (await adapter.exists(LAYOUT_DEBUG_PATH)) ? await adapter.read(LAYOUT_DEBUG_PATH) : "";
+    await adapter.write(LAYOUT_DEBUG_PATH, appendCapped(prev, section + "\n"));
   } catch {
     /* diagnostic only */
   }

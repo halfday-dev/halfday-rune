@@ -29,7 +29,13 @@ function mkView(opts: { remeasure: boolean }) {
     addEventListener: (e: string, f: () => void) => listeners[e].add(f),
     removeEventListener: (e: string, f: () => void) => listeners[e].delete(f),
   };
-  vi.stubGlobal("window", { visualViewport: vv });
+  const winL: Record<string, Set<() => void>> = { resize: new Set() };
+  vi.stubGlobal("window", {
+    visualViewport: vv,
+    addEventListener: (e: string, f: () => void) => winL[e].add(f),
+    removeEventListener: (e: string, f: () => void) => winL[e].delete(f),
+  });
+  const focusL = new Set<() => void>();
   const wsHandlers = new Set<() => void>();
   const requestMeasure = vi.fn();
   const view = new (AgeFileView as unknown as new (l: unknown, d: unknown) => any)(
@@ -42,9 +48,9 @@ function mkView(opts: { remeasure: boolean }) {
       offref: (f: () => void) => wsHandlers.delete(f),
     },
   };
-  view.editor = { requestMeasure, destroy() {}, state: { doc: { toString: () => PLAIN } } };
+  view.editor = { requestMeasure, destroy() {}, dom: { addEventListener: (_e: string, f: () => void) => focusL.add(f), removeEventListener: (_e: string, f: () => void) => focusL.delete(f) }, state: { doc: { toString: () => PLAIN } } };
   view.editorHost = { empty() {} };
-  return { view, listeners, wsHandlers, requestMeasure };
+  return { view, listeners, wsHandlers, requestMeasure, winL, focusL };
 }
 
 describe("viewport re-measure (mobile)", () => {
@@ -60,6 +66,20 @@ describe("viewport re-measure (mobile)", () => {
     expect(t.requestMeasure).toHaveBeenCalledTimes(3);
     // the document is untouched by resizes
     expect(t.view.editor.state.doc.toString()).toBe(PLAIN);
+  });
+
+  it("window resize, editor focus and the view's onResize also re-measure", () => {
+    const t = mkView({ remeasure: true });
+    t.view.attachViewportListeners();
+    expect(t.winL.resize.size).toBe(1);
+    expect(t.focusL.size).toBe(1);
+    t.winL.resize.forEach((f) => f());
+    t.focusL.forEach((f) => f());
+    t.view.onResize();
+    expect(t.requestMeasure).toHaveBeenCalledTimes(3);
+    t.view.teardownEditor();
+    expect(t.winL.resize.size).toBe(0);
+    expect(t.focusL.size).toBe(0);
   });
 
   it("listeners are removed on teardown and not double-added", () => {

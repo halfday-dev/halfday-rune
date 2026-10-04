@@ -216,6 +216,25 @@ export default class HalfdayObsidianRune extends Plugin {
       });
     }
 
+    // Test builds only (constant folded away in release): write a layout
+    // report on demand, e.g. with the keyboard closed for a baseline.
+    if (typeof __RUNE_LAYOUT_DEBUG__ !== "undefined" && __RUNE_LAYOUT_DEBUG__ === true) {
+      this.addCommand({
+        id: "halfday-rune-layout-debug",
+        name: "rune: write layout debug report",
+        callback: () => {
+          const v = this.ageViews()[0];
+          if (!v) {
+            new Notice("Halfday Rune: open an encrypted note first");
+            return;
+          }
+          void v.writeLayoutDebugNow("command").then(() =>
+            new Notice("Halfday Rune: layout report written to _rune/layout-debug.md")
+          );
+        },
+      });
+    }
+
     this.statusBarEl = this.addStatusBarItem();
     this.statusBarEl.addClass("halfday-rune-statusbar");
     this.statusBarEl.addClass("halfday-rune-hidden");
