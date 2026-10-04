@@ -73,6 +73,18 @@ describe("viewport re-measure (mobile)", () => {
     expect(t.wsHandlers.size).toBe(0);
   });
 
+  it("forceRepaint flips scroller opacity without hiding anything, then restores it", async () => {
+    const t = mkView({ remeasure: true });
+    const style = { opacity: "" };
+    t.view.editor.scrollDOM = { style };
+    t.view.editor.contentDOM = { offsetHeight: 10 };
+    t.view.forceRepaint();
+    expect(style.opacity).toBe("0.999");
+    await new Promise((r) => setTimeout(r, 40));
+    expect(style.opacity).toBe("");
+    expect(t.requestMeasure).toHaveBeenCalled();
+  });
+
   it("desktop (flag off) attaches nothing", () => {
     const t = mkView({ remeasure: false });
     t.view.attachViewportListeners();

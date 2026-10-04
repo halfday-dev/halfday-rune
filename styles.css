@@ -70,8 +70,7 @@
 .halfday-age-editor {
   flex: 1 1 0;
   min-height: 0; /* let the CM6 scroller own overflow instead of the flex parent */
-  overflow: hidden;
-  position: relative;
+  overflow: visible;
   background: var(--background-primary);
 }
 
@@ -80,16 +79,18 @@
 .halfday-age-editor .cm-editor {
   height: 100%;
 }
-/* The scroller is the scroll container. A percentage height on .cm-editor can
-   resolve against an indefinite flex height on iOS WebKit (keyboard resize)
-   and collapse CM6's measured viewport to a couple of lines; pinning the
-   editor to the host's box with absolute insets does not depend on that. */
-@media (hover: none) and (pointer: coarse) {
-  .halfday-age-editor .cm-editor {
-    position: absolute;
-    inset: 0;
-    height: auto;
-  }
+/* iOS: after the keyboard resizes the viewport WebKit can lay lines out
+   (the caret has a position) yet not paint their text. Keep every ancestor
+   of the scroller free of anything that makes its own layer or clips paint:
+   no transform / will-change / containment, no absolute positioning, and no
+   overflow clipping on the host (the scroller owns overflow). */
+.halfday-age-view,
+.halfday-age-editor,
+.halfday-age-editor .cm-editor,
+.halfday-age-editor .cm-scroller {
+  transform: none;
+  will-change: auto;
+  contain: none;
 }
 .halfday-age-editor .cm-scroller {
   overflow: auto;

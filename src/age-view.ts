@@ -56,6 +56,7 @@ import { halfdayInlineDecorations } from "./decorations";
 import type { KeySource } from "./keysource";
 import { KeyLockedError } from "./keysource";
 import { inspectNoteForMobileSave } from "./crypto";
+import { writeLayoutDebug } from "./layout-debug";
 
 export const VIEW_TYPE_AGE = "halfday-age-view";
 
@@ -513,16 +514,59 @@ export class AgeFileView extends FileView {
     this.detachViewport?.();
     this.detachViewport = null;
     if (!this.deps.remeasureOnViewport) return;
-    const remeasure = (): void => this.editor?.requestMeasure();
+    let nudgeTimers: ReturnType<typeof setTimeout>[] = [];
+    let debugTimer: ReturnType<typeof setTimeout> | null = null;
+    const remeasure = (): void => {
+      this.editor?.requestMeasure();
+      // iOS WebKit can lay lines out (the caret has a position there) yet not
+      // paint them after the keyboard resizes the viewport: nudge a repaint
+      // once the resize settles.
+      nudgeTimers.forEach(clearTimeout);
+      nudgeTimers = [120, 450].map((ms) => setTimeout(() => this.forceRepaint(), ms));
+    };
     const vv = typeof window !== "undefined" ? window.visualViewport : null;
     vv?.addEventListener("resize", remeasure);
     vv?.addEventListener("scroll", remeasure);
     const ref = this.app?.workspace?.on("resize", remeasure);
+    const debugOnResize = (): void => {
+      if (debugTimer !== null) clearTimeout(debugTimer);
+      debugTimer = setTimeout(() => {
+        // __RUNE_LAYOUT_DEBUG__ is a build-time constant: this whole call is removed
+        // from release bundles.
+        if (typeof __RUNE_LAYOUT_DEBUG__ !== "undefined" && __RUNE_LAYOUT_DEBUG__ === true && this.editor && this.editorHost) {
+          void writeLayoutDebug(this.editor, this.editorHost, this.app.vault.adapter);
+        }
+      }, 800);
+    };
+    if (typeof __RUNE_LAYOUT_DEBUG__ !== "undefined" && __RUNE_LAYOUT_DEBUG__ === true) vv?.addEventListener("resize", debugOnResize);
     this.detachViewport = () => {
+      nudgeTimers.forEach(clearTimeout);
+      if (debugTimer !== null) clearTimeout(debugTimer);
+      if (typeof __RUNE_LAYOUT_DEBUG__ !== "undefined" && __RUNE_LAYOUT_DEBUG__ === true) vv?.removeEventListener("resize", debugOnResize);
       vv?.removeEventListener("resize", remeasure);
       vv?.removeEventListener("scroll", remeasure);
       if (ref) this.app.workspace.offref(ref);
     };
+  }
+
+  /**
+   * Repaint without touching focus (hiding the editor would drop the iOS
+   * keyboard): re-measure, force a reflow, and flip the scroller's opacity
+   * for one frame so WebKit repaints its tiles.
+   */
+  private forceRepaint(): void {
+    const ed = this.editor;
+    if (!ed) return;
+    ed.requestMeasure();
+    const sc = ed.scrollDOM as HTMLElement | undefined;
+    if (!sc?.style) return;
+    void (ed.contentDOM as HTMLElement | undefined)?.offsetHeight;
+    sc.style.opacity = "0.999";
+    const restore = (): void => {
+      sc.style.opacity = "";
+    };
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(restore);
+    else setTimeout(restore, 16);
   }
 
   private teardownEditor(): void {
