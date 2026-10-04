@@ -310,3 +310,28 @@
   text-align: center;
   color: var(--text-muted);
 }
+
+/* Mobile (class set from the view when running on a phone): the editor sizes
+ * to its content and Obsidian's .view-content scrolls, instead of a
+ * fixed-height CM scroller. iOS shrinks the view to a sliver when the
+ * keyboard opens, and a clipping scroller then shows only the first lines. */
+.halfday-age-view.halfday-age-mobile {
+  display: block;
+  height: 100%;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.halfday-age-mobile .halfday-age-editor {
+  flex: none;
+  height: auto;
+  min-height: 0;
+  overflow: visible;
+}
+.halfday-age-mobile .halfday-age-editor .cm-editor {
+  height: auto;
+  overflow: visible;
+}
+.halfday-age-mobile .halfday-age-editor .cm-scroller {
+  height: auto;
+  overflow: visible;
+}

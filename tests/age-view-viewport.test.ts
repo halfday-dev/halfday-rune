@@ -1,13 +1,15 @@
 /** iOS keyboard: CM6 re-measure hooks, and the doc is never truncated. */
 import { describe, it, expect, vi, afterEach } from "vitest";
+import * as fs from "fs";
 import { EditorState } from "@codemirror/state";
 import { generateIdentity, identityToRecipient } from "age-encryption";
 import { encrypt, decryptToString } from "../src/crypto";
 
 vi.mock("obsidian", () => {
   class Stub {}
+  class ScopeStub { register() {} }
   class Notice { constructor(_m: string) {} }
-  return { FileView: Stub, Notice, Scope: Stub, TFile: Stub, WorkspaceLeaf: Stub };
+  return { FileView: Stub, Notice, Scope: ScopeStub, TFile: Stub, WorkspaceLeaf: Stub };
 });
 
 import { AgeFileView } from "../src/age-view";
@@ -93,18 +95,6 @@ describe("viewport re-measure (mobile)", () => {
     expect(t.wsHandlers.size).toBe(0);
   });
 
-  it("forceRepaint flips scroller opacity without hiding anything, then restores it", async () => {
-    const t = mkView({ remeasure: true });
-    const style = { opacity: "" };
-    t.view.editor.scrollDOM = { style };
-    t.view.editor.contentDOM = { offsetHeight: 10 };
-    t.view.forceRepaint();
-    expect(style.opacity).toBe("0.999");
-    await new Promise((r) => setTimeout(r, 40));
-    expect(style.opacity).toBe("");
-    expect(t.requestMeasure).toHaveBeenCalled();
-  });
-
   it("desktop (flag off) attaches nothing", () => {
     const t = mkView({ remeasure: false });
     t.view.attachViewportListeners();
@@ -151,5 +141,73 @@ describe("the document is never truncated", () => {
     view.dirty = true;
     await view.save("manual");
     expect(await decryptToString(id, disk)).toBe("EDIT " + PLAIN);
+  });
+});
+
+describe("mobile layout: the editor does not clip", () => {
+  const mkOpen = (mobile: boolean) => {
+    const classes: string[] = [];
+    const view = new (AgeFileView as unknown as new (l: unknown, d: unknown) => any)(
+      {},
+      { remeasureOnViewport: mobile, getKeySource: () => ({}), updateStatusBar() {}, clearStatusBar() {} }
+    );
+    view.app = { scope: {} };
+    view.contentEl = { empty() {}, addClass: (c: string) => classes.push(c), createDiv: () => ({}) };
+    return { view, classes };
+  };
+
+  it("onOpen adds the mobile class only on mobile", async () => {
+    const m = mkOpen(true);
+    await m.view.onOpen();
+    expect(m.classes).toEqual(["halfday-age-view", "halfday-age-mobile"]);
+    const d = mkOpen(false);
+    await d.view.onOpen();
+    expect(d.classes).toEqual(["halfday-age-view"]);
+  });
+
+  it("stylesheet: the mobile class makes the scroller non-clipping and the view the scroller; desktop rules are unchanged", () => {
+    const css = fs.readFileSync("styles.css", "utf8");
+    const rule = (sel: string): string => {
+      const i = css.indexOf(sel + " {");
+      expect(i, sel).toBeGreaterThanOrEqual(0);
+      return css.slice(i, css.indexOf("}", i));
+    };
+    expect(rule(".halfday-age-view.halfday-age-mobile")).toMatch(/overflow-y:\s*auto/);
+    expect(rule(".halfday-age-mobile .halfday-age-editor .cm-scroller")).toMatch(/overflow:\s*visible/);
+    expect(rule(".halfday-age-mobile .halfday-age-editor .cm-scroller")).toMatch(/height:\s*auto/);
+    expect(rule(".halfday-age-mobile .halfday-age-editor .cm-editor")).toMatch(/height:\s*auto/);
+    expect(rule(".halfday-age-mobile .halfday-age-editor")).toMatch(/flex:\s*none/);
+    // desktop: the original sizing is still there
+    expect(css).toMatch(/\n\.halfday-age-editor \.cm-scroller \{\s*overflow:\s*auto/);
+    expect(css).toMatch(/\n\.halfday-age-editor \.cm-editor \{\s*height:\s*100%/);
+  });
+
+  it("typing scrolls the caret into view on mobile (and not on desktop)", async () => {
+    for (const mobile of [true, false]) {
+      const m = mkOpen(mobile);
+      const dispatch = vi.fn();
+      const scrollIntoView = vi.fn();
+      m.view.editor = {
+        hasFocus: true,
+        dispatch,
+        state: { selection: { main: { head: 7 } } },
+        dom: { querySelector: () => ({ scrollIntoView }) },
+      };
+      m.view.keepCaretVisible();
+      await Promise.resolve();
+      await Promise.resolve();
+      if (mobile) {
+        expect(dispatch).toHaveBeenCalledTimes(1);
+        expect(dispatch.mock.calls[0][0].effects).toBeTruthy();
+        expect(scrollIntoView).toHaveBeenCalledWith({ block: "nearest" });
+      } else {
+        expect(dispatch).not.toHaveBeenCalled();
+      }
+    }
+  });
+
+  it("the editor update listener calls keepCaretVisible on doc and selection changes", () => {
+    const src = fs.readFileSync("src/age-view.ts", "utf8");
+    expect(src).toMatch(/update\.docChanged \|\| update\.selectionSet\) this\.keepCaretVisible\(\)/);
   });
 });

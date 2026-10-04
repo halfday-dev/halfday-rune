@@ -31,6 +31,7 @@ describe("layout debug output", () => {
     const lines = [el({ cls: "cm-line halfday-md-h1" }), el({ cls: "cm-line" }), el({ cls: "cm-line cm-activeLine" })];
     const out = collectLayoutDebug({
       host: el(),
+      viewContent: el({ cls: "view-content" }),
       editorDom: el(),
       scroller: el(),
       content: el(),
@@ -63,6 +64,7 @@ describe("layout debug output", () => {
       "cm-content is document.activeElement=yes",
       "## editor focus +300ms @ 2026-10-04T10:00:00.000Z",
       ".cm-scroller:",
+      "view-content:",
       "scrollHeight=400",
       "cm viewport=0-40 contentHeight=480 doc.lines=6",
       "rendered .cm-line count=3",

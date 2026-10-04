@@ -27,6 +27,8 @@ export interface ElLike {
 
 export interface LayoutDebugInput {
   host: ElLike;
+  /** Obsidian's .view-content (our contentEl). */
+  viewContent: ElLike;
   editorDom: ElLike;
   scroller: ElLike;
   content: ElLike;
@@ -69,7 +71,7 @@ function styleOf(input: LayoutDebugInput, el: ElLike, props: string[]): string {
   return props.map((p) => `${p}=${tok(cs.getPropertyValue(p))}`).join(" ");
 }
 
-const BOX_PROPS = ["overflow", "position", "transform", "will-change", "opacity", "visibility", "contain"];
+const BOX_PROPS = ["overflow", "overflow-y", "position", "transform", "will-change", "opacity", "visibility", "contain"];
 const LINE_PROPS = ["color", "opacity", "visibility", "display"];
 
 export function collectLayoutDebug(input: LayoutDebugInput): string {
@@ -84,6 +86,7 @@ export function collectLayoutDebug(input: LayoutDebugInput): string {
     ""
   );
   const boxes: [string, ElLike][] = [
+    ["view-content", input.viewContent],
     ["host", input.host],
     [".cm-editor", input.editorDom],
     [".cm-scroller", input.scroller],
@@ -144,11 +147,13 @@ export async function writeLayoutDebug(
     read(p: string): Promise<string>;
     write(p: string, data: string): Promise<void>;
   },
-  label: string
+  label: string,
+  viewContent: HTMLElement
 ): Promise<void> {
   try {
     const section = collectLayoutDebug({
       host: host as unknown as ElLike,
+      viewContent: viewContent as unknown as ElLike,
       editorDom: ed.dom as unknown as ElLike,
       scroller: ed.scrollDOM as unknown as ElLike,
       content: ed.contentDOM as unknown as ElLike,

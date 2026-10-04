@@ -220,6 +220,12 @@ export class AgeFileView extends FileView {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("halfday-age-view");
+    // Mobile: do not make the CM scroller a fixed-height clipping box. When
+    // the keyboard opens Obsidian squeezes the view to a sliver, and a
+    // clipping scroller then shows only the first lines. Size the editor to
+    // its content and let the view's own container scroll (like Obsidian's
+    // native markdown view).
+    if (this.deps.remeasureOnViewport) contentEl.addClass("halfday-age-mobile");
 
     // v0.6.0: no more inline status banner. The editor host fills the
     // whole content area; metadata lives in the bottom status bar.
@@ -439,6 +445,7 @@ export class AgeFileView extends FileView {
           if (update.docChanged) {
             this.markDirty();
           }
+          if (update.docChanged || update.selectionSet) this.keepCaretVisible();
         }),
         // v0.6.0: full theme inheritance from Obsidian CSS vars. Nothing
         // hardcoded — light/dark + community themes adapt without a
@@ -504,13 +511,11 @@ export class AgeFileView extends FileView {
   }
 
   /**
-   * CM6 only renders the lines inside its measured viewport, and iOS WebKit
-   * can lay lines out yet not paint them after the keyboard changes the
-   * layout. Obsidian iOS (Capacitor) may not fire visualViewport events for
-   * the keyboard, so listen to everything that could signal it: visualViewport
-   * resize/scroll, window resize, the workspace and this view's own resize
-   * hook, editor focus, and body class changes. Every signal re-measures and
-   * schedules repaint nudges. Only re-renders; the document is untouched.
+   * Obsidian iOS shrinks the view (not the visual viewport) when the
+   * keyboard opens, so listen to everything that could signal a layout
+   * change: visualViewport resize/scroll, window resize, the workspace and
+   * this view's own resize hook, editor focus, and body class changes. Every
+   * signal re-measures. Only re-renders; the document is untouched.
    */
   attachViewportListeners(): void {
     this.detachViewport?.();
@@ -518,11 +523,11 @@ export class AgeFileView extends FileView {
     if (!this.deps.remeasureOnViewport) return;
     const win = typeof window !== "undefined" ? window : null;
     const vv = win ? win.visualViewport : null;
-    const on = (label: string, nudge: number[] = [120, 450]) => () => this.viewportSignal(label, nudge);
+    const on = (label: string) => () => this.viewportSignal(label);
     const vvResize = on("visualViewport resize");
     const vvScroll = on("visualViewport scroll");
     const winResize = on("window resize");
-    const focusIn = on("editor focus", [300, 800]);
+    const focusIn = on("editor focus");
     vv?.addEventListener("resize", vvResize);
     vv?.addEventListener("scroll", vvScroll);
     win?.addEventListener?.("resize", winResize);
@@ -549,22 +554,17 @@ export class AgeFileView extends FileView {
     };
   }
 
-  private nudgeTimers: ReturnType<typeof setTimeout>[] = [];
   private debugTimers = new Map<string, ReturnType<typeof setTimeout>[]>();
   private debugFocusDelays: number[] = [];
 
   private clearViewportTimers(): void {
-    this.nudgeTimers.forEach(clearTimeout);
-    this.nudgeTimers = [];
     this.debugTimers.forEach((ts) => ts.forEach(clearTimeout));
     this.debugTimers.clear();
   }
 
-  /** One layout-affecting signal: re-measure now, repaint-nudge later. */
-  private viewportSignal(label: string, nudge: number[]): void {
+  /** One layout-affecting signal: re-measure now. */
+  private viewportSignal(label: string): void {
     this.editor?.requestMeasure();
-    this.nudgeTimers.forEach(clearTimeout);
-    this.nudgeTimers = nudge.map((ms) => setTimeout(() => this.forceRepaint(), ms));
     // __RUNE_LAYOUT_DEBUG__ is a build-time constant: this is removed from
     // release bundles.
     if (typeof __RUNE_LAYOUT_DEBUG__ !== "undefined" && __RUNE_LAYOUT_DEBUG__ === true) {
@@ -573,16 +573,36 @@ export class AgeFileView extends FileView {
     }
   }
 
+  /**
+   * Mobile: with the outer view container scrolling, keep the caret in view
+   * while typing near the bottom. Deferred a microtask because dispatching
+   * inside an update listener is not allowed.
+   */
+  keepCaretVisible(): void {
+    if (!this.deps.remeasureOnViewport) return;
+    void Promise.resolve().then(() => {
+      const ed = this.editor;
+      if (!ed || !ed.hasFocus) return;
+      ed.dispatch({
+        effects: EditorView.scrollIntoView(ed.state.selection.main.head, { y: "nearest", yMargin: 48 }),
+      });
+      // CM scrolls ancestors itself; also nudge the cursor element in case
+      // the browser container did not follow.
+      const cursor = ed.dom?.querySelector?.(".cm-cursor-primary, .cm-cursor") as HTMLElement | null;
+      cursor?.scrollIntoView?.({ block: "nearest" });
+    });
+  }
+
   /** Obsidian calls this when the pane's size changes (also on mobile). */
   onResize(): void {
-    if (this.deps.remeasureOnViewport && this.editor) this.viewportSignal("view onResize", [120, 450]);
+    if (this.deps.remeasureOnViewport && this.editor) this.viewportSignal("view onResize");
   }
 
   /** Test builds: write the layout report now (command palette, keyboard closed). */
   writeLayoutDebugNow(label: string): Promise<void> {
     if (typeof __RUNE_LAYOUT_DEBUG__ !== "undefined" && __RUNE_LAYOUT_DEBUG__ === true) {
       if (this.editor && this.editorHost) {
-        return writeLayoutDebug(this.editor, this.editorHost, this.app.vault.adapter, label);
+        return writeLayoutDebug(this.editor, this.editorHost, this.app.vault.adapter, label, this.contentEl);
       }
     }
     return Promise.resolve();
@@ -598,26 +618,6 @@ export class AgeFileView extends FileView {
       }, ms)
     );
     this.debugTimers.set(label, timers);
-  }
-
-  /**
-   * Repaint without touching focus (hiding the editor would drop the iOS
-   * keyboard): re-measure, force a reflow, and flip the scroller's opacity
-   * for one frame so WebKit repaints its tiles.
-   */
-  private forceRepaint(): void {
-    const ed = this.editor;
-    if (!ed) return;
-    ed.requestMeasure();
-    const sc = ed.scrollDOM as HTMLElement | undefined;
-    if (!sc?.style) return;
-    void (ed.contentDOM as HTMLElement | undefined)?.offsetHeight;
-    sc.style.opacity = "0.999";
-    const restore = (): void => {
-      sc.style.opacity = "";
-    };
-    if (typeof requestAnimationFrame === "function") requestAnimationFrame(restore);
-    else setTimeout(restore, 16);
   }
 
   private teardownEditor(): void {
