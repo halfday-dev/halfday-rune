@@ -8,6 +8,7 @@ import { wrapMobileKey } from "../src/crypto";
 
 const h = vi.hoisted(() => ({
   desktop: false,
+  data: null as unknown,
   closeSpy: vi.fn(),
   prompt: null as null | ((a: (pw: string) => Promise<void>) => Promise<boolean>),
 }));
@@ -26,7 +27,7 @@ vi.mock("obsidian", () => {
     saved: string[] = [];
     commands: { id: string }[] = [];
     domListeners: Record<string, () => void> = {};
-    async loadData() { return null; }
+    async loadData() { return h.data; }
     async saveData(d: unknown) { this.saved.push(JSON.stringify(d)); }
     addCommand(c: { id: string }) { this.commands.push(c); }
     addStatusBarItem() {
@@ -80,6 +81,7 @@ async function boot(desktop: boolean) {
 
 let storageWrites: string[];
 beforeEach(() => {
+  h.data = null;
   storageWrites = [];
   const store = {
     setItem: (k: string, v: string) => storageWrites.push(`${k}=${v}`),
@@ -121,7 +123,7 @@ describe("mobile plugin wiring", () => {
     expect(storageWrites).toEqual([]);
     expect(Object.keys(JSON.parse(p.saved[0])).sort()).toEqual([
       "autoBackupBeforeRotate", "autoLockMinutes", "backgroundLockGraceSeconds",
-      "identityPath", "mobileKeyPath", "recipientsPath",
+      "desktopKeyMode", "identityPath", "mobileKeyPath", "recipientsPath",
     ]);
   });
 
@@ -169,5 +171,73 @@ describe("mobile plugin wiring", () => {
     expect(h.closeSpy).toHaveBeenCalled();
     expect(ks.isUnlocked()).toBe(false);
     await expect(ks.getIdentity()).rejects.toThrow(/locked/);
+  });
+});
+
+
+describe("desktop passphrase mode (#110)", () => {
+  it("defaults to the key file", async () => {
+    const { p } = await boot(true);
+    expect(p.settings.desktopKeyMode).toBe("file");
+    expect(p.usesPassphrase()).toBe(false);
+  });
+
+  it("opted in: passphrase source, lock commands, no rotate / create-copy", async () => {
+    h.data = { desktopKeyMode: "passphrase" };
+    const { p } = await boot(true);
+    expect(p.getKeySource().constructor.name).toBe("PassphraseKeySource");
+    const ids = p.commands.map((c: { id: string }) => c.id);
+    expect(ids).toContain("halfday-rune-lock");
+    expect(ids).toContain("halfday-rune-unlock");
+    expect(ids).not.toContain("halfday-rune-rotate-keys");
+    expect(ids).not.toContain("halfday-rune-create-mobile-unlock");
+    expect(ids).not.toContain("halfday-rune-use-passphrase");
+  });
+
+  it("key file mode offers the switch command", async () => {
+    const { p } = await boot(true);
+    expect(p.commands.map((c: { id: string }) => c.id)).toContain("halfday-rune-use-passphrase");
+  });
+
+  it("startup does not prompt for the passphrase in passphrase mode", async () => {
+    h.data = { desktopKeyMode: "passphrase" };
+    const prompted = vi.fn();
+    h.prompt = async (a) => (prompted(), await a(PW), true);
+    const { p } = await boot(true);
+    await p.checkMobileCopyFreshness();
+    expect(prompted).not.toHaveBeenCalled();
+    expect(p.getKeySource().isUnlocked()).toBe(false);
+  });
+
+  it("unlocks from the wrapped copy and never touches data.json or storage with the key", async () => {
+    h.data = { desktopKeyMode: "passphrase" };
+    const { p, identity } = await boot(true);
+    expect(await p.getKeySource().getIdentity()).toBe(identity);
+    await p.saveSettings();
+    for (const payload of p.saved) expect(payload).not.toContain("AGE-SECRET-KEY");
+    expect(storageWrites).toEqual([]);
+  });
+
+  it("switching refuses when there is no unlock copy, and changes nothing", async () => {
+    const { p } = await boot(true);
+    p.app.vault.adapter.exists = async () => false;
+    const before = p.saved.length;
+    await p.switchToPassphrase();
+    expect(p.settings.desktopKeyMode).toBe("file");
+    expect(p.saved.length).toBe(before);
+  });
+
+  it("switching with a dismissed prompt changes nothing", async () => {
+    const { p } = await boot(true);
+    h.prompt = async () => false;
+    await p.switchToPassphrase();
+    expect(p.settings.desktopKeyMode).toBe("file");
+  });
+
+  it("switching back to key file records the mode", async () => {
+    h.data = { desktopKeyMode: "passphrase" };
+    const { p } = await boot(true);
+    await p.switchToKeyFile();
+    expect(p.settings.desktopKeyMode).toBe("file");
   });
 });

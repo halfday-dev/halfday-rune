@@ -127,6 +127,14 @@ interface HalfdayObsidianRuneSettings {
   autoLockMinutes: number;
   /** Mobile: lock after this many seconds in the background. 0 = immediately. */
   backgroundLockGraceSeconds: number;
+  /**
+   * Desktop only. "file" (default, unchanged since 0.x): read the identity from
+   * `identityPath` on each use. "passphrase": unlock from the wrapped copy at
+   * `mobileKeyPath` like the phone does; the key is held in memory only and the
+   * plaintext identity file can be deleted. Opt-in so existing installs keep
+   * working. Takes effect after the plugin reloads.
+   */
+  desktopKeyMode: "file" | "passphrase";
 }
 
 const DEFAULT_SETTINGS: HalfdayObsidianRuneSettings = {
@@ -136,6 +144,7 @@ const DEFAULT_SETTINGS: HalfdayObsidianRuneSettings = {
   mobileKeyPath: DEFAULT_MOBILE_KEY_PATH,
   autoLockMinutes: 15,
   backgroundLockGraceSeconds: 60,
+  desktopKeyMode: "file",
 };
 
 export default class HalfdayObsidianRune extends Plugin {
@@ -164,10 +173,10 @@ export default class HalfdayObsidianRune extends Plugin {
   async onload(): Promise<void> {
     await this.loadSettings();
 
-    if (Platform.isDesktopApp) {
+    if (!this.usesPassphrase()) {
       this.keySource = new FileKeySource(() => this.settings);
     } else {
-      // Mobile: passphrase-unlocked, memory-only source. The identity lives
+      // Mobile, or desktop in passphrase mode: passphrase-unlocked, memory-only source. The identity lives
       // only inside this object; see PassphraseKeySource.
       this.unlockPrompt = makeUnlockPrompt(this.app);
       const source = new PassphraseKeySource({
@@ -276,7 +285,7 @@ export default class HalfdayObsidianRune extends Plugin {
     // backup copy are intentional friction — this is the most destructive
     // plugin operation we ship.
     // Desktop only: reads the vault's base path and writes backups/logs.
-    if (Platform.isDesktopApp) {
+    if (Platform.isDesktopApp && !this.usesPassphrase()) {
       this.addCommand({
         id: "halfday-rune-rotate-keys",
         name: "Rotate vault keys",
@@ -302,11 +311,16 @@ export default class HalfdayObsidianRune extends Plugin {
 
     // Desktop only: make the passphrase-wrapped copy of the identity that
     // the phone unlocks (written to the vault so it syncs).
-    if (Platform.isDesktopApp) {
+    if (Platform.isDesktopApp && !this.usesPassphrase()) {
       this.addCommand({
         id: "halfday-rune-create-mobile-unlock",
         name: "Create mobile unlock copy",
         callback: () => void this.createMobileUnlockCopy(),
+      });
+      this.addCommand({
+        id: "halfday-rune-use-passphrase",
+        name: "Use passphrase unlock on this computer",
+        callback: () => void this.switchToPassphrase(),
       });
     }
 
@@ -465,6 +479,74 @@ export default class HalfdayObsidianRune extends Plugin {
     }
   }
 
+  /** True on mobile, and on desktop when the owner opted into passphrase unlock. */
+  usesPassphrase(): boolean {
+    return !Platform.isDesktopApp || this.settings.desktopKeyMode === "passphrase";
+  }
+
+  /**
+   * Desktop: move this computer from the plaintext identity file to passphrase
+   * unlock. Refuses unless the wrapped copy exists, unwraps with the passphrase
+   * you type now, and was made for the CURRENT recipients. Only then does it
+   * record the mode. It never reads, moves or deletes the identity file: that is
+   * the owner's step, after the next start works.
+   */
+  async switchToPassphrase(): Promise<void> {
+    if (!Platform.isDesktopApp || this.usesPassphrase()) return;
+    const path = this.mobileKeyPath();
+    let target: string = "missing";
+    try {
+      target = await inspectMobileKeyTarget(this.app.vault.adapter, path);
+    } catch {
+      /* treated as missing */
+    }
+    if (target !== "wrapped") {
+      new Notice(
+        `Halfday Rune: no unlock copy at ${path}. Run 'Create mobile unlock copy' first. Nothing changed.`,
+        10_000
+      );
+      return;
+    }
+    const prompt = makeUnlockPrompt(this.app);
+    const probe = new PassphraseKeySource({
+      adapter: this.app.vault.adapter,
+      getSettings: () => ({ mobileKeyPath: path, autoLockMinutes: 0, backgroundLockGraceSeconds: 0 }),
+      prompt,
+    });
+    try {
+      await probe.getRecipients(); // prompts; proves the passphrase works
+      const file = await this.keySource?.getRecipients();
+      const warning = file
+        ? await mobileCopyWarning(this.app.vault.adapter, path, file)
+        : null;
+      if (warning) {
+        new Notice(`Halfday Rune: ${warning} Nothing changed.`, 10_000);
+        return;
+      }
+    } catch {
+      new Notice("Halfday Rune: unlock did not complete. Nothing changed.");
+      return;
+    } finally {
+      probe.dispose();
+      prompt.close();
+    }
+    this.settings.desktopKeyMode = "passphrase";
+    await this.saveSettings();
+    new Notice(
+      "Halfday Rune: passphrase unlock is set. Reload Obsidian, open a note to check it unlocks, " +
+        "then delete your identity file yourself. The plugin never deletes it.",
+      0
+    );
+  }
+
+  /** Desktop: go back to reading the identity file. Takes effect after reload. */
+  async switchToKeyFile(): Promise<void> {
+    if (!Platform.isDesktopApp) return;
+    this.settings.desktopKeyMode = "file";
+    await this.saveSettings();
+    new Notice("Halfday Rune: key file mode is set. Reload Obsidian to apply.");
+  }
+
   /** The configured mobile key path, or the default if the setting is invalid. */
   mobileKeyPath(): string {
     return effectiveMobileKeyPath(this.settings.mobileKeyPath);
@@ -521,7 +603,8 @@ export default class HalfdayObsidianRune extends Plugin {
    * sidecar it reads cannot change what gets encrypted. Never throws.
    */
   async checkMobileCopyFreshness(): Promise<void> {
-    if (!Platform.isDesktopApp || !this.keySource) return;
+    // In passphrase mode this would prompt for the passphrase at every start.
+    if (!Platform.isDesktopApp || !this.keySource || this.usesPassphrase()) return;
     try {
       const keys = this.keySource;
       const current = (
@@ -782,6 +865,15 @@ export default class HalfdayObsidianRune extends Plugin {
    * src/rotate.ts so the loop is unit-testable without Obsidian.
    */
   async rotateKeys(): Promise<void> {
+    if (this.usesPassphrase()) {
+      // The passphrase source's recipient list is fixed inside the wrapped copy,
+      // so a rotation could not add or drop a key.
+      new Notice(
+        "Halfday Rune: rotate needs key file mode (the unlock copy has a fixed recipient list). Nothing changed.",
+        10_000
+      );
+      return;
+    }
     // ---- preflight: collect inputs and fail loud if anything's broken ----
     let recipients: string[];
     let identity: string;
@@ -1512,6 +1604,26 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
     });
 
     if (Platform.isDesktopApp) {
+      const pass = this.plugin.usesPassphrase();
+      new Setting(containerEl)
+        .setName("Unlock method")
+        .setDesc(
+          pass
+            ? "Passphrase: the key is held in memory only and locks on idle. Your identity file is not read. " +
+                "If you are switching back, the change applies after Obsidian reloads."
+            : "Key file: the identity is read from the path below, as plain text on disk. " +
+                "Safer: make the unlock copy, then switch to passphrase unlock and delete the identity file."
+        )
+        .addButton((b) =>
+          b
+            .setButtonText(pass ? "Use key file again" : "Switch to passphrase")
+            .onClick(async () => {
+              if (pass) await this.plugin.switchToKeyFile();
+              else await this.plugin.switchToPassphrase();
+              this.display();
+            })
+        );
+
       new Setting(containerEl)
         .setName("Recipients file path")
         .setDesc(
