@@ -100,6 +100,8 @@ import {
   effectiveMobileKeyPath,
   inspectMobileKeyTarget,
   MOBILE_COPY_NOT_WRAPPED_MESSAGE,
+  recipientsFingerprint,
+  STALE_COPY_WARNING,
   validateMobileKeyPath,
 } from "./mobile-copy";
 import { isExcludedPath } from "./path-fold";
@@ -487,9 +489,12 @@ export default class HalfdayObsidianRune extends Plugin {
   /**
    * Desktop: move this computer from the plaintext identity file to passphrase
    * unlock. Refuses unless the wrapped copy exists, unwraps with the passphrase
-   * you type now, and was made for the CURRENT recipients. Only then does it
-   * record the mode. It never reads, moves or deletes the identity file: that is
-   * the owner's step, after the next start works.
+   * you type now, and the recipient list INSIDE the copy equals the current
+   * list normalised the way the copy is made (recipients.txt plus your own
+   * recipient, deduped). The plain sidecar plays no part: any same-user process
+   * can write it. Only then does it record the mode. It reads the identity
+   * file (to normalise) but never moves or deletes it: that is the owner's
+   * step, after the next start works.
    */
   async switchToPassphrase(): Promise<void> {
     if (!Platform.isDesktopApp || this.usesPassphrase()) return;
@@ -507,22 +512,27 @@ export default class HalfdayObsidianRune extends Plugin {
       );
       return;
     }
+    let current: string[];
+    try {
+      const keys = this.getKeySource();
+      current = (await buildMobileKey(await keys.getIdentity(), await keys.getRecipients()))
+        .recipients;
+    } catch {
+      new Notice(
+        "Halfday Rune: could not read your identity file and recipients list to compare with the unlock copy. Nothing changed.",
+        10_000
+      );
+      return;
+    }
     const prompt = makeUnlockPrompt(this.app);
     const probe = new PassphraseKeySource({
       adapter: this.app.vault.adapter,
       getSettings: () => ({ mobileKeyPath: path, autoLockMinutes: 0, backgroundLockGraceSeconds: 0 }),
       prompt,
     });
+    let unwrapped: string[];
     try {
-      await probe.getRecipients(); // prompts; proves the passphrase works
-      const file = await this.keySource?.getRecipients();
-      const warning = file
-        ? await mobileCopyWarning(this.app.vault.adapter, path, file)
-        : null;
-      if (warning) {
-        new Notice(`Halfday Rune: ${warning} Nothing changed.`, 10_000);
-        return;
-      }
+      unwrapped = await probe.getRecipients(); // prompts; the list inside the copy
     } catch {
       new Notice("Halfday Rune: unlock did not complete. Nothing changed.");
       return;
@@ -530,10 +540,17 @@ export default class HalfdayObsidianRune extends Plugin {
       probe.dispose();
       prompt.close();
     }
+    const fingerprint = await recipientsFingerprint(unwrapped);
+    if (fingerprint !== (await recipientsFingerprint(current))) {
+      new Notice(`Halfday Rune: ${STALE_COPY_WARNING} Nothing changed.`, 10_000);
+      return;
+    }
     this.settings.desktopKeyMode = "passphrase";
     await this.saveSettings();
     new Notice(
-      "Halfday Rune: passphrase unlock is set. Reload Obsidian, open a note to check it unlocks, " +
+      `Halfday Rune: passphrase unlock is set. Notes will be encrypted to the ${unwrapped.length} ` +
+        `recipient(s) in the unlock copy (fingerprint ${fingerprint}). ` +
+        "Reload Obsidian, open a note to check it unlocks, " +
         "then delete your identity file yourself. The plugin never deletes it.",
       0
     );
