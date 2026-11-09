@@ -20,6 +20,24 @@
   margin-top: 1rem;
 }
 
+/* ConfirmRecipientSetModal key rows: every key shown whole, wrapped on a
+ * phone, so a look-alike can't hide behind a cut-off line. */
+.halfday-rune-key-row {
+  margin: 0.25rem 0;
+}
+.halfday-rune-key {
+  font-family: var(--font-monospace);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.halfday-rune-key-own {
+  font-weight: var(--font-semibold);
+}
+.halfday-rune-key-other {
+  color: var(--text-warning, #e0a800);
+  font-weight: var(--font-semibold);
+}
+
 /* Left-aligned button row used by the recipients editor (Save / Reload). */
 .halfday-rune-button-row-left {
   display: flex;

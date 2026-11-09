@@ -136,7 +136,10 @@ export function unlockErrorText(err: unknown): string {
   if (err instanceof InvalidWrappedIdentityError) {
     return "The unlock file is damaged or not an unlock file.";
   }
-  if (err instanceof Error && err.name === "UnlockFileMissingError") {
+  if (
+    err instanceof Error &&
+    (err.name === "UnlockFileMissingError" || err.name === "RecipientPinError")
+  ) {
     return err.message; // fixed text
   }
   return "Could not unlock.";

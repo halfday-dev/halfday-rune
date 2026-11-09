@@ -11,6 +11,8 @@
 
 import { unwrapMobileKey } from "./crypto";
 import { loadCryptoNode } from "./node-loader";
+import { assertPinned } from "./recipient-pin";
+import type { PinStore } from "./recipient-pin";
 
 export interface KeySource {
   /** The AGE-SECRET-KEY-1... string. Rejects if it can't be provided. */
@@ -40,12 +42,15 @@ export interface KeyFilePaths {
  * Desktop source: reads `identityPath` / `recipientsPath` from disk on every
  * call, exactly as the call sites did before (nothing cached, same paths,
  * same errors). Paths come from a getter so a settings change is picked up
- * on the next read.
+ * on the next read. With a `pin` store, getRecipients() also checks the list
+ * against the owner-confirmed set (see recipient-pin) and throws on any
+ * difference; the plugin always passes one.
  */
 export class FileKeySource implements KeySource {
   constructor(
     private getPaths: () => KeyFilePaths,
-    private loadNode: typeof loadCryptoNode = loadCryptoNode
+    private loadNode: typeof loadCryptoNode = loadCryptoNode,
+    private pin?: PinStore
   ) {}
 
   async getIdentity(): Promise<string> {
@@ -55,7 +60,25 @@ export class FileKeySource implements KeySource {
 
   async getRecipients(): Promise<string[]> {
     const node = await this.loadNode();
-    return node.readRecipients(this.getPaths().recipientsPath);
+    const recipients = node.readRecipients(this.getPaths().recipientsPath);
+    if (this.pin) {
+      await assertPinned(this.pin, node.readIdentity(this.getPaths().identityPath), recipients);
+    }
+    return recipients;
+  }
+
+  /**
+   * Both files as they are on disk, NOT checked against the pin. Only for
+   * comparing (the unlock-copy switch, the stale-copy warning) and for the
+   * owner's 'Confirm recipient set'; never encrypt to this list.
+   */
+  async readUnpinned(): Promise<{ identity: string; recipients: string[] }> {
+    const node = await this.loadNode();
+    const paths = this.getPaths();
+    return {
+      identity: node.readIdentity(paths.identityPath),
+      recipients: node.readRecipients(paths.recipientsPath),
+    };
   }
 
   isUnlocked(): boolean {
@@ -125,6 +148,13 @@ export interface PassphraseKeySourceDeps {
    * swallowed so a failure can never keep the identity in memory.
    */
   beforeLock?: () => Promise<void>;
+  /**
+   * The owner-confirmed recipient set. When given, an unlock whose wrapped
+   * list differs is refused (the identity is never held), and every
+   * getRecipients() checks again. The plugin always passes one; a probe that
+   * only compares (the desktop switch) does not.
+   */
+  pin?: PinStore;
   now?: () => number;
 }
 
@@ -176,7 +206,9 @@ export class PassphraseKeySource implements KeySource {
 
   async getRecipients(): Promise<string[]> {
     const id = await this.getIdentity();
-    return [...this.#recipients];
+    const recipients = [...this.#recipients];
+    if (this.deps.pin) await assertPinned(this.deps.pin, id, recipients, "copy");
+    return recipients;
   }
 
   private async ensureUnlocked(): Promise<void> {
@@ -195,7 +227,11 @@ export class PassphraseKeySource implements KeySource {
     return this.pending;
   }
 
-  /** One unlock attempt. Throws WrongPassphraseError / UnlockFileMissingError / InvalidWrappedIdentityError. */
+  /**
+   * One unlock attempt. Throws WrongPassphraseError / UnlockFileMissingError /
+   * InvalidWrappedIdentityError, or RecipientPinError when the wrapped list is
+   * not the confirmed set (an older copy swapped in, say).
+   */
   private async tryUnlock(passphrase: string): Promise<void> {
     // a modal still open after unload must not be able to re-arm the key
     if (this.disposed) throw new KeyLockedError();
@@ -203,6 +239,8 @@ export class PassphraseKeySource implements KeySource {
     if (!(await this.deps.adapter.exists(path))) throw new UnlockFileMissingError();
     const wrapped = new Uint8Array(await this.deps.adapter.readBinary(path));
     const key = await unwrapMobileKey(wrapped, passphrase);
+    if (this.disposed) throw new KeyLockedError();
+    if (this.deps.pin) await assertPinned(this.deps.pin, key.identity, key.recipients, "copy");
     if (this.disposed) throw new KeyLockedError();
     this.#identity = key.identity;
     this.#recipients = key.recipients;
