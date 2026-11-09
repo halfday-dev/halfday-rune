@@ -109,7 +109,7 @@ import { rotateVault, recipientsChanged } from "./rotate";
 import { addedToMainFile, confirmRecipientsSave } from "./recipients-guard";
 import { ConfirmMainRecipientsModal, ConfirmRecipientSetModal } from "./recipients-modal";
 import type { RecipientSetPrompt } from "./recipients-modal";
-import { checkPin, makePin } from "./recipient-pin";
+import { evaluatePin, makePin, normalizeRecord, ownRecipient } from "./recipient-pin";
 import type { PinCheck, PinStore, RecipientPin } from "./recipient-pin";
 import type { RotateResult } from "./rotate";
 
@@ -146,6 +146,13 @@ interface HalfdayObsidianRuneSettings {
    */
   recipientPin?: RecipientPin;
 }
+
+/** Local-storage key of this device's confirmed-set record (see recipient-pin). */
+const PIN_RECORD_KEY = "halfday-rune-pin-record";
+
+const MODE_REVERTED_MESSAGE =
+  "Halfday Rune: this computer was switched to passphrase unlock, but the settings now say key file " +
+  "(they were reset or replaced). Nothing was encrypted. If you switched back yourself, run 'Confirm recipient set'.";
 
 const DEFAULT_SETTINGS: HalfdayObsidianRuneSettings = {
   recipientsPath: "~/.age/recipients.txt",
@@ -569,20 +576,35 @@ export default class HalfdayObsidianRune extends Plugin {
       new Notice("Halfday Rune: the unlock copy could not be read. Nothing changed.", 10_000);
       return;
     }
-    if (current !== null) {
-      if (fingerprint !== (await recipientsFingerprint(current))) {
-        new Notice(`Halfday Rune: ${STALE_COPY_WARNING} Nothing changed.`, 10_000);
-        return;
-      }
-    } else {
-      const check = await checkPin(this.settings.recipientPin, got.identity, unwrapped);
+    if (current !== null && fingerprint !== (await recipientsFingerprint(current))) {
+      new Notice(`Halfday Rune: ${STALE_COPY_WARNING} Nothing changed.`, 10_000);
+      return;
+    }
+    // Never replace a confirmed set without the owner seeing the difference:
+    // recipients.txt may have been edited to match an older copy. With no
+    // identity file there is nothing to compare, so always ask.
+    const check = await evaluatePin(
+      this.settings.recipientPin,
+      this.localRecord().recipients,
+      got.identity,
+      unwrapped
+    );
+    if (current === null || check.status !== "ok") {
+      const described = this.describeCheck(check);
       const ok = await this.askRecipientSet({
         recipients: pin.recipients,
+        own: await ownRecipient(got.identity),
         fingerprint,
-        diff: check.status === "changed" ? { added: check.added, removed: check.removed } : null,
-        note:
-          "There is no identity file on this computer, so rune cannot check the unlock copy against it. " +
+        diff: described.diff,
+        note: [
+          current === null
+            ? "There is no identity file on this computer, so rune cannot check the unlock copy against it."
+            : null,
           "The keys inside the copy become the set rune encrypts to.",
+          described.note ?? null,
+        ]
+          .filter((s) => s !== null)
+          .join(" "),
       });
       if (!ok) {
         new Notice("Halfday Rune: recipient set not confirmed. Nothing changed.");
@@ -592,6 +614,7 @@ export default class HalfdayObsidianRune extends Plugin {
     this.settings.recipientPin = pin;
     this.settings.desktopKeyMode = "passphrase";
     await this.saveSettings();
+    this.writeLocalRecord(pin.recipients, "passphrase");
     new Notice(
       `Halfday Rune: passphrase unlock is set. Notes will be encrypted to the ${unwrapped.length} ` +
         `recipient(s) in the unlock copy (fingerprint ${fingerprint}), and rune refuses any other set. ` +
@@ -642,6 +665,80 @@ export default class HalfdayObsidianRune extends Plugin {
    */
   private firstUseAnswers = new Map<string, Promise<boolean>>();
 
+  /**
+   * This device's record of the last confirmed set and key mode, in Obsidian's
+   * per-vault local storage (not synced, not in data.json). See recipient-pin
+   * for why. Public keys only.
+   */
+  private localRecord(): { recipients: string[] | null; keyMode: "file" | "passphrase" | null } {
+    let raw: unknown = null;
+    try {
+      raw =
+        typeof this.app.loadLocalStorage === "function"
+          ? this.app.loadLocalStorage(PIN_RECORD_KEY)
+          : JSON.parse(localStorage.getItem(this.legacyRecordKey()) ?? "null");
+    } catch {
+      raw = null;
+    }
+    const o = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
+    return {
+      recipients: normalizeRecord(o.recipients),
+      keyMode: o.keyMode === "file" || o.keyMode === "passphrase" ? o.keyMode : null,
+    };
+  }
+
+  private writeLocalRecord(recipients: string[] | null, keyMode: "file" | "passphrase"): void {
+    const data = { recipients, keyMode };
+    if (typeof this.app.loadLocalStorage === "function") {
+      this.app.saveLocalStorage(PIN_RECORD_KEY, data);
+    } else {
+      // Obsidian before 1.8.7: plain localStorage, keyed by vault
+      localStorage.setItem(this.legacyRecordKey(), JSON.stringify(data));
+    }
+  }
+
+  private legacyRecordKey(): string {
+    return `${PIN_RECORD_KEY}:${this.app.vault.getName()}`;
+  }
+
+  /**
+   * Desktop: this computer was switched to passphrase unlock, but the settings
+   * now say key file (data.json reset or replaced). A planted identity file
+   * and recipients.txt must not get a first-use prompt, so encrypting refuses
+   * until the owner confirms through 'Confirm recipient set'.
+   */
+  private modeReverted(): boolean {
+    return (
+      Platform.isDesktopApp &&
+      this.settings.desktopKeyMode !== "passphrase" &&
+      this.localRecord().keyMode === "passphrase"
+    );
+  }
+
+  /** The confirm modal's diff and note for an evaluatePin result. */
+  private describeCheck(check: PinCheck): { diff: RecipientSetPrompt["diff"]; note?: string } {
+    switch (check.status) {
+      case "changed":
+        return { diff: { added: check.added, removed: check.removed } };
+      case "removed":
+        return {
+          diff: { added: check.added, removed: check.removed },
+          note:
+            "Your confirmed set on this device was removed or replaced. " +
+            "Keys marked new are not in the set you last confirmed here.",
+        };
+      case "unverified":
+        return {
+          diff: null,
+          note: "Your previous confirmed set could not be verified with your key, so nothing is marked as new. Check every key.",
+        };
+      case "missing":
+        return { diff: null, note: "rune has no confirmed recipient set yet." };
+      default:
+        return { diff: null };
+    }
+  }
+
   /** Where the owner-confirmed recipient set is read and written. */
   private pinStore(): PinStore {
     return {
@@ -649,14 +746,18 @@ export default class HalfdayObsidianRune extends Plugin {
       save: async (pin) => {
         this.settings.recipientPin = pin;
         await this.saveSettings();
+        this.writeLocalRecord(pin.recipients, this.settings.desktopKeyMode);
       },
-      confirmFirst: (recipients) => {
+      record: () => this.localRecord().recipients,
+      blocked: () => (this.modeReverted() ? MODE_REVERTED_MESSAGE : null),
+      confirmFirst: (recipients, own) => {
         const key = JSON.stringify(recipients);
         let answer = this.firstUseAnswers.get(key);
         if (!answer) {
           answer = (async () =>
             this.askRecipientSet({
               recipients,
+              own,
               fingerprint: await recipientsFingerprint(recipients),
               diff: null,
               note: "rune has no confirmed recipient set yet.",
@@ -719,32 +820,45 @@ export default class HalfdayObsidianRune extends Plugin {
     }
     let check: PinCheck;
     let pin: RecipientPin;
+    let own: string;
     try {
-      check = await checkPin(this.settings.recipientPin, got.identity, got.recipients);
+      check = await evaluatePin(
+        this.settings.recipientPin,
+        this.localRecord().recipients,
+        got.identity,
+        got.recipients
+      );
       pin = await makePin(got.identity, got.recipients);
+      own = await ownRecipient(got.identity);
     } catch {
       new Notice("Halfday Rune: your key could not be read. Nothing changed.", 10_000);
       return;
     }
-    if (check.status === "ok") {
+    const reverted = this.modeReverted();
+    if (check.status === "ok" && !reverted) {
       if (!opts.afterEdit) new Notice("Halfday Rune: this recipient set is already confirmed.");
       return;
     }
-    if (opts.afterEdit && check.status === "changed" && check.added.length === 0) {
+    if (opts.afterEdit && !reverted && check.status === "changed" && check.added.length === 0) {
       await this.pinStore().save(pin);
       return;
     }
     const fingerprint = await recipientsFingerprint(pin.recipients);
+    const described = this.describeCheck(check);
     const ok = await this.askRecipientSet({
       recipients: pin.recipients,
+      own,
       fingerprint,
-      diff: check.status === "changed" ? { added: check.added, removed: check.removed } : null,
+      diff: described.diff,
       note:
-        check.status === "unverified"
-          ? "Your previous confirmed set could not be verified with your key, so nothing is marked as new. Check every key."
-          : check.status === "missing"
-            ? "rune has no confirmed recipient set yet."
-            : undefined,
+        [
+          reverted
+            ? "This computer was switched to passphrase unlock, but the settings now say key file. Confirm only if you switched back yourself."
+            : null,
+          described.note ?? null,
+        ]
+          .filter((s) => s !== null)
+          .join(" ") || undefined,
     });
     if (!ok) {
       new Notice(
@@ -763,6 +877,7 @@ export default class HalfdayObsidianRune extends Plugin {
     if (!Platform.isDesktopApp) return;
     this.settings.desktopKeyMode = "file";
     await this.saveSettings();
+    this.writeLocalRecord(this.localRecord().recipients, "file");
     new Notice("Halfday Rune: key file mode is set. Reload Obsidian to apply.");
   }
 

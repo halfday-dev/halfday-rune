@@ -48,8 +48,10 @@ export class ConfirmMainRecipientsModal extends Modal {
 export interface RecipientSetPrompt {
   /** The full set to confirm (sorted, own recipient included). */
   recipients: string[];
+  /** The identity's own recipient, labelled "your key"; every other key is marked. */
+  own: string;
   fingerprint: string;
-  /** Change since the last VERIFIED confirmed set; null when there is none. */
+  /** Change since the last trusted confirmed set; null when there is none. */
   diff: { added: string[]; removed: string[] } | null;
   /** Extra line above the list (why we are asking). */
   note?: string;
@@ -83,16 +85,29 @@ export class ConfirmRecipientSetModal extends Modal {
         `(fingerprint ${this.p.fingerprint}) and refuse any other set until you confirm again. ` +
         "If you do not recognise every key, cancel.",
     });
+    // One row per key, labelled, wrapped so a whole key shows on a phone:
+    // a look-alike can't hide behind a cut-off line.
+    const keyList = (keys: readonly string[]): void => {
+      const list = contentEl.createDiv({ cls: "halfday-rune-key-list" });
+      for (const k of keys) {
+        const row = list.createDiv({ cls: "halfday-rune-key-row" });
+        row.createSpan({
+          cls: k === this.p.own ? "halfday-rune-key-own" : "halfday-rune-key-other",
+          text: k === this.p.own ? "your key: " : "other key: ",
+        });
+        row.createSpan({ cls: "halfday-rune-key", text: k });
+      }
+    };
     if (this.p.diff && this.p.diff.added.length > 0) {
       contentEl.createEl("p", { text: "New since you last confirmed:" });
-      contentEl.createEl("pre").setText(this.p.diff.added.join("\n"));
+      keyList(this.p.diff.added);
     }
     if (this.p.diff && this.p.diff.removed.length > 0) {
       contentEl.createEl("p", { text: "Removed since you last confirmed:" });
-      contentEl.createEl("pre").setText(this.p.diff.removed.join("\n"));
+      keyList(this.p.diff.removed);
     }
     contentEl.createEl("p", { text: "The full set:" });
-    contentEl.createEl("pre").setText(this.p.recipients.join("\n"));
+    keyList(this.p.recipients);
     const buttons = contentEl.createDiv({ cls: "halfday-rune-button-row" });
     const cancel = buttons.createEl("button", { text: "Cancel", cls: "mod-cta" });
     cancel.addEventListener("click", () => this.close());

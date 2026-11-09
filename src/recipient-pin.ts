@@ -9,9 +9,17 @@
  * process, so the list alone would be no stronger than recipients.txt; the
  * MAC means a valid pin can only be made by something holding the identity,
  * the same secret the pin protects. Once the identity file is deleted, that
- * is only rune itself, after the owner unlocked with the passphrase. What it
- * cannot stop: restoring an older data.json together with an older unlock
- * copy (both made by the owner) brings back an older confirmed set.
+ * is only rune itself, after the owner unlocked with the passphrase.
+ *
+ * A pin that is simply gone must not read as "first use": deleting it (or
+ * all of data.json) and restoring an older genuine unlock copy would then
+ * take one click to re-pin an old set. So each device also keeps a local
+ * record (Obsidian's per-vault local storage, never synced) of the set it
+ * last confirmed and its key mode. When that record exists, a missing,
+ * unverifiable or different pin is refused as "removed or replaced", and
+ * Confirm shows the difference against the record. First use is offered
+ * only when there is no record at all. What remains: removing the record as
+ * well (Obsidian's local storage, not a plain file) brings first use back.
  *
  * The set compared is the recipients plus the identity's own recipient,
  * sorted and deduped, so desktop (recipients.txt) and the unlock copy (which
@@ -33,12 +41,18 @@ export interface RecipientPin {
 /** Reads and writes the pin and asks the owner on first use. */
 export interface PinStore {
   get(): unknown;
+  /** Saves the pin and this device's local record of it. */
   save(pin: RecipientPin): Promise<void>;
+  /** This device's local record of the last confirmed set; null when none. */
+  record(): string[] | null;
+  /** A fixed refusal that applies before any set is compared, else null. */
+  blocked?(): string | null;
   /**
    * Trust on first use: show `recipients` (the full set, count and
-   * fingerprint) and resolve true only if the owner confirms them.
+   * fingerprint; `own` is the identity's own recipient) and resolve true only
+   * if the owner confirms them.
    */
-  confirmFirst(recipients: string[]): Promise<boolean>;
+  confirmFirst(recipients: string[], own: string): Promise<boolean>;
 }
 
 export type PinCheck =
@@ -47,7 +61,12 @@ export type PinCheck =
   /** The pin is not valid for this identity (edited, or a different key). */
   | { status: "unverified" }
   /** The pin is valid but the set differs. */
-  | { status: "changed"; added: string[]; removed: string[] };
+  | { status: "changed"; added: string[]; removed: string[] }
+  /**
+   * This device has a record, and the pin is missing, does not verify, or
+   * does not match it. added / removed are against the record.
+   */
+  | { status: "removed"; added: string[]; removed: string[] };
 
 const MAC_CONTEXT = "halfday-rune recipient pin v1\n";
 
@@ -119,6 +138,46 @@ export async function checkPin(
   return { status: "changed", added, removed };
 }
 
+/** The identity's own recipient. */
+export async function ownRecipient(identity: string): Promise<string> {
+  return identityToRecipient(identity.trim());
+}
+
+/** A stored record list, normalised; null when it is not a list of strings. */
+export function normalizeRecord(r: unknown): string[] | null {
+  if (!Array.isArray(r) || !r.every((x) => typeof x === "string")) return null;
+  return [...new Set(r.map((x: string) => x.trim()))].sort();
+}
+
+const sameSet = (a: readonly string[], b: readonly string[]): boolean =>
+  a.length === b.length && a.every((x) => b.includes(x));
+
+/**
+ * checkPin, plus this device's local record. With no record it is checkPin.
+ * With one, the pin only counts if it verifies AND holds the recorded set;
+ * otherwise it is "removed" (added / removed against the record), so a
+ * deleted, forged or rolled-back pin never reads as first use.
+ */
+export async function evaluatePin(
+  pin: unknown,
+  record: readonly string[] | null,
+  identity: string,
+  recipients: readonly string[]
+): Promise<PinCheck> {
+  const base = await checkPin(pin, identity, recipients);
+  if (record === null) return base;
+  const trusted =
+    (base.status === "ok" || base.status === "changed") &&
+    sameSet((pin as RecipientPin).recipients, record);
+  if (trusted) return base;
+  const set = await effectiveSet(identity, recipients);
+  return {
+    status: "removed",
+    added: set.filter((r) => !record.includes(r)),
+    removed: record.filter((r) => !set.includes(r)),
+  };
+}
+
 export const PIN_NOT_CONFIRMED_MESSAGE =
   "Halfday Rune: the recipient set was not confirmed, so nothing was encrypted. Run 'Confirm recipient set' to review it.";
 export const PIN_UNVERIFIED_MESSAGE =
@@ -128,6 +187,22 @@ export function pinChangedMessage(added: number, removed: number): string {
   return (
     `Halfday Rune: your recipients differ from the set you confirmed (+${added} added, −${removed} removed). ` +
     "Nothing was encrypted or unlocked. If you made this change, run 'Confirm recipient set'."
+  );
+}
+
+/** The unlock copy holds keys the confirmed set dropped, and lacks none. */
+export function copyOlderMessage(extra: number): string {
+  return (
+    `Halfday Rune: this unlock copy is older than your confirmed set (it still has ${extra} key(s) you removed). ` +
+    "Nothing was unlocked. Make a new unlock copy on desktop."
+  );
+}
+
+export function pinRemovedMessage(added: number, removed: number): string {
+  return (
+    "Halfday Rune: your confirmed recipient set was removed or replaced " +
+    `(+${added} / −${removed} against the set you last confirmed on this device). ` +
+    "Nothing was encrypted or unlocked. Run 'Confirm recipient set' to review it."
   );
 }
 
@@ -144,20 +219,39 @@ export class RecipientPinError extends Error {
  * (trust on first use) and save the confirmed set. A pin that does not
  * verify, or a different set, throws RecipientPinError: changing a confirmed
  * set takes the deliberate 'Confirm recipient set' command, never an inline
- * prompt in the middle of a save.
+ * prompt in the middle of a save. First use is offered only when this device
+ * has no record of a confirmed set (see evaluatePin). `context` "copy": the
+ * list came from the unlock copy, so a copy that only has extra keys is
+ * reported as an old copy.
  */
 export async function assertPinned(
   store: PinStore,
   identity: string,
-  recipients: readonly string[]
+  recipients: readonly string[],
+  context: "file" | "copy" = "file"
 ): Promise<void> {
-  const r = await checkPin(store.get(), identity, recipients);
-  if (r.status === "ok") return;
-  if (r.status === "unverified") throw new RecipientPinError(PIN_UNVERIFIED_MESSAGE);
-  if (r.status === "changed") {
-    throw new RecipientPinError(pinChangedMessage(r.added.length, r.removed.length));
+  const blocked = store.blocked?.() ?? null;
+  if (blocked !== null) throw new RecipientPinError(blocked);
+  const record = store.record();
+  const r = await evaluatePin(store.get(), record, identity, recipients);
+  if (r.status === "ok") {
+    // a valid pin synced from another device: record it here
+    if (record === null) await store.save(store.get() as RecipientPin);
+    return;
   }
-  if (!(await store.confirmFirst(await effectiveSet(identity, recipients)))) {
+  if (r.status === "unverified") throw new RecipientPinError(PIN_UNVERIFIED_MESSAGE);
+  if (r.status === "removed") {
+    throw new RecipientPinError(pinRemovedMessage(r.added.length, r.removed.length));
+  }
+  if (r.status === "changed") {
+    throw new RecipientPinError(
+      context === "copy" && r.removed.length === 0
+        ? copyOlderMessage(r.added.length)
+        : pinChangedMessage(r.added.length, r.removed.length)
+    );
+  }
+  const set = await effectiveSet(identity, recipients);
+  if (!(await store.confirmFirst(set, await ownRecipient(identity)))) {
     throw new RecipientPinError(PIN_NOT_CONFIRMED_MESSAGE);
   }
   await store.save(await makePin(identity, recipients));

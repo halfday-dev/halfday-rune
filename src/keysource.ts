@@ -207,7 +207,7 @@ export class PassphraseKeySource implements KeySource {
   async getRecipients(): Promise<string[]> {
     const id = await this.getIdentity();
     const recipients = [...this.#recipients];
-    if (this.deps.pin) await assertPinned(this.deps.pin, id, recipients);
+    if (this.deps.pin) await assertPinned(this.deps.pin, id, recipients, "copy");
     return recipients;
   }
 
@@ -240,7 +240,7 @@ export class PassphraseKeySource implements KeySource {
     const wrapped = new Uint8Array(await this.deps.adapter.readBinary(path));
     const key = await unwrapMobileKey(wrapped, passphrase);
     if (this.disposed) throw new KeyLockedError();
-    if (this.deps.pin) await assertPinned(this.deps.pin, key.identity, key.recipients);
+    if (this.deps.pin) await assertPinned(this.deps.pin, key.identity, key.recipients, "copy");
     if (this.disposed) throw new KeyLockedError();
     this.#identity = key.identity;
     this.#recipients = key.recipients;

@@ -21,6 +21,12 @@ const h = vi.hoisted(() => ({
   noIdentityFile: false,
   /** The confirm-set modal: what it was shown, and the owner's answer. */
   confirmSet: vi.fn(async (_p: unknown) => true),
+  /** Obsidian's per-vault local storage (app.load/saveLocalStorage). */
+  local: {} as Record<string, unknown>,
+  /** Called with every plain obsidian Modal that is opened (FilenamePromptModal). */
+  onModalOpen: null as null | ((m: any) => void),
+  /** The create-copy modal's submit: called with the passphrase, resolves to its error text or null. */
+  copySubmit: null as null | Promise<string | null>,
   loadCryptoNode: vi.fn(),
   loadBackup: vi.fn(),
   loadRotateLog: vi.fn(),
@@ -52,8 +58,14 @@ vi.mock("../src/node-loader", () => ({
 vi.mock("../src/mobile-modals", () => ({
   makeUnlockPrompt: () =>
     Object.assign((a: (pw: string) => Promise<void>) => h.prompt!(a), { close: h.closeSpy }),
-  CreateMobileCopyModal: class {},
+  CreateMobileCopyModal: class {
+    constructor(_app: unknown, _o: unknown, private submit: (pw: string) => Promise<string | null>) {}
+    open() {
+      h.copySubmit = this.submit(PW_FOR_MOCK);
+    }
+  },
 }));
+const PW_FOR_MOCK = "a long random passphrase 98765";
 
 vi.mock("../src/recipients-modal", () => ({
   ConfirmMainRecipientsModal: class {},
@@ -91,9 +103,14 @@ vi.mock("obsidian", () => {
     registerView() {} registerExtensions() {} registerEvent() {} addSettingTab() {}
     registerDomEvent(_t: unknown, ev: string, cb: () => void) { this.domListeners[ev] = cb; }
   }
+  class Modal {
+    constructor(public app: unknown) {}
+    open() { h.onModalOpen?.(this); }
+    close() {}
+  }
   return {
     get Platform() { return { isDesktopApp: h.desktop, isMobile: !h.desktop }; },
-    App: Stub, Modal: Stub, Notice, Plugin, PluginSettingTab: Stub, Setting: Stub,
+    App: Stub, Modal, Notice, Plugin, PluginSettingTab: Stub, Setting: Stub,
     TFile: Stub, FileView: Stub, Scope: Stub, WorkspaceLeaf: Stub,
   };
 });
@@ -130,7 +147,12 @@ async function boot(
   Object.assign(view, { showLocked, flushBeforeLock: flush, flushIfDirty });
   const p = new (Plugin as unknown as new () => Record<string, any>)();
   p.app = {
+    loadLocalStorage: (k: string) => (k in h.local ? JSON.parse(JSON.stringify(h.local[k])) : null),
+    saveLocalStorage: (k: string, v: unknown) => {
+      h.local[k] = v;
+    },
     vault: {
+      getName: () => "test-vault",
       adapter: {
         exists: async (path: string) => (files ? path in files : true),
         readBinary: async (path: string) => {
@@ -157,6 +179,9 @@ beforeEach(() => {
   h.fileIdentity = "";
   h.fileRecipients = [];
   h.noIdentityFile = false;
+  h.local = {};
+  h.onModalOpen = null;
+  h.copySubmit = null;
   h.confirmSet.mockReset();
   h.confirmSet.mockImplementation(async () => true);
   h.loadCryptoNode.mockClear();
@@ -471,7 +496,8 @@ describe("desktop passphrase mode (#110)", () => {
     expect(p.saved.length).toBe(before + 1);
     const saved = JSON.parse(p.saved.at(-1));
     expect(await checkPin(saved.recipientPin, identity, [own, other])).toEqual({ status: "ok" });
-    expect(h.confirmSet).not.toHaveBeenCalled(); // compared against the identity file instead
+    // no confirmed set yet: even a copy that matches the identity file is shown first (F2)
+    expect(h.confirmSet).toHaveBeenCalledTimes(1);
   });
 
   it("enrols a Mac with no identity file by trust on first use: shows count + fingerprint + keys, then pins them (#2 §3)", async () => {
@@ -625,7 +651,7 @@ describe("recipient pin wiring (#2)", () => {
     h.data = { desktopKeyMode: "passphrase", recipientPin: await makePin(identity, [own]) };
     // an older copy under the same passphrase that still lists a revoked key
     const { p } = await boot(true, { identity, copyRecipients: [revoked] });
-    await expect(p.getKeySource().getIdentity()).rejects.toThrow(/\+1 added/);
+    await expect(p.getKeySource().getIdentity()).rejects.toThrow(/older than your confirmed set/);
     expect(p.getKeySource().isUnlocked()).toBe(false);
     expect(h.confirmSet).not.toHaveBeenCalled();
   });
@@ -636,10 +662,246 @@ describe("recipient pin wiring (#2)", () => {
     const added = await identityToRecipient(await generateIdentity());
     h.data = { recipientPin: await makePin(identity, [own]) };
     const { p } = await boot(false, { identity, copyRecipients: [added] });
-    await expect(p.getKeySource().getIdentity()).rejects.toThrow(/added/);
+    await expect(p.getKeySource().getIdentity()).rejects.toThrow(/older than your confirmed set/);
     await p.confirmRecipientSet();
     expect((h.confirmSet.mock.calls[0][0] as { diff: { added: string[] } }).diff.added).toEqual([added]);
     expect(await p.getKeySource().getIdentity()).toBe(identity);
     expect(h.loadCryptoNode).not.toHaveBeenCalled();
+  });
+});
+
+const RECORD_KEY = "halfday-rune-pin-record";
+const PIN_MSG = /differ from the set you confirmed/;
+
+/** Key file mode with a confirmed set {own} and recipients.txt {own, attacker}. */
+async function appendedKey() {
+  const identity = await generateIdentity();
+  const own = await identityToRecipient(identity);
+  const attacker = await identityToRecipient(await generateIdentity());
+  h.fileIdentity = identity;
+  h.fileRecipients = [own, attacker];
+  const pin = await makePin(identity, [own]);
+  h.data = { recipientPin: pin };
+  h.local[RECORD_KEY] = { recipients: pin.recipients, keyMode: "file" };
+  const { p } = await boot(true, { identity });
+  return { p, identity, own, attacker };
+}
+
+describe("fix round 1: F1 local record", () => {
+  it("first use records the confirmed set and key mode on this device", async () => {
+    const identity = await generateIdentity();
+    const other = await identityToRecipient(await generateIdentity());
+    h.fileIdentity = identity;
+    h.fileRecipients = [other];
+    const { p } = await boot(true, { identity });
+    await p.getKeySource().getRecipients();
+    expect(h.local[RECORD_KEY]).toEqual({
+      recipients: p.settings.recipientPin.recipients,
+      keyMode: "file",
+    });
+  });
+
+  it("mobile: pin deleted from data.json + an older genuine copy: refused as removed, no first-use modal", async () => {
+    const identity = await generateIdentity();
+    const own = await identityToRecipient(identity);
+    const revoked = await identityToRecipient(await generateIdentity());
+    h.local[RECORD_KEY] = { recipients: [own], keyMode: "file" };
+    h.data = null; // data.json deleted
+    const { p } = await boot(false, { identity, copyRecipients: [revoked] });
+    await expect(p.getKeySource().getIdentity()).rejects.toThrow(/removed or replaced/);
+    expect(p.getKeySource().isUnlocked()).toBe(false);
+    expect(h.confirmSet).not.toHaveBeenCalled();
+    // Confirm shows the revoked key as new against this device's record
+    h.confirmSet.mockImplementation(async () => false);
+    await p.confirmRecipientSet();
+    const shown = h.confirmSet.mock.calls[0][0] as { diff: { added: string[] }; note: string };
+    expect(shown.diff.added).toEqual([revoked]);
+    expect(shown.note).toMatch(/removed or replaced/);
+    expect(p.settings.recipientPin).toBeUndefined();
+  });
+
+  it("desktop: data.json deleted (mode back to file) + planted files: encrypting refuses, no first-use modal", async () => {
+    const planted = await generateIdentity();
+    h.fileIdentity = planted;
+    h.fileRecipients = [await identityToRecipient(planted)];
+    h.local[RECORD_KEY] = { recipients: [await identityToRecipient(await generateIdentity())], keyMode: "passphrase" };
+    h.data = null;
+    const { p } = await boot(true, { identity: planted });
+    expect(p.usesPassphrase()).toBe(false);
+    await expect(p.getKeySource().getRecipients()).rejects.toThrow(/switched to passphrase unlock/);
+    expect(h.confirmSet).not.toHaveBeenCalled();
+  });
+
+  it("desktop: after a reverted mode, Confirm warns and, on yes, records key file mode so encrypting works", async () => {
+    const identity = await generateIdentity();
+    const own = await identityToRecipient(identity);
+    h.fileIdentity = identity;
+    h.fileRecipients = [own];
+    const pin = await makePin(identity, [own]);
+    h.local[RECORD_KEY] = { recipients: pin.recipients, keyMode: "passphrase" };
+    h.data = { recipientPin: pin };
+    const { p } = await boot(true, { identity });
+    await expect(p.getKeySource().getRecipients()).rejects.toThrow(/switched to passphrase unlock/);
+    await p.confirmRecipientSet();
+    expect((h.confirmSet.mock.calls[0][0] as { note: string }).note).toMatch(/switched back yourself/);
+    expect((h.local[RECORD_KEY] as { keyMode: string }).keyMode).toBe("file");
+    expect(await p.getKeySource().getRecipients()).toEqual([own]);
+  });
+
+  it("'Use key file again' records key file mode, so the next start is not refused", async () => {
+    const identity = await generateIdentity();
+    const own = await identityToRecipient(identity);
+    h.fileIdentity = identity;
+    h.fileRecipients = [own];
+    const pin = await makePin(identity, [own]);
+    h.local[RECORD_KEY] = { recipients: pin.recipients, keyMode: "passphrase" };
+    h.data = { desktopKeyMode: "passphrase", recipientPin: pin };
+    const { p } = await boot(true, { identity });
+    await p.switchToKeyFile();
+    h.data = JSON.parse(p.saved.at(-1));
+    const { p: p2 } = await boot(true, { identity });
+    expect(await p2.getKeySource().getRecipients()).toEqual([own]);
+  });
+
+  it("switching to passphrase records passphrase mode with the copy's set", async () => {
+    const identity = await generateIdentity();
+    const own = await identityToRecipient(identity);
+    h.fileRecipients = [own];
+    const { p } = await boot(true, { identity, files: (w) => ({ [KEY_PATH]: w }) });
+    await p.switchToPassphrase();
+    expect(h.local[RECORD_KEY]).toEqual({ recipients: [own], keyMode: "passphrase" });
+  });
+});
+
+describe("fix round 1: F2 the switch never replaces a confirmed set silently", () => {
+  it("verified pin {own}, recipients.txt edited to match an older copy with K: shows the diff, and declining changes nothing", async () => {
+    const identity = await generateIdentity();
+    const own = await identityToRecipient(identity);
+    const k = await identityToRecipient(await generateIdentity());
+    h.fileRecipients = [own, k];
+    const pin = await makePin(identity, [own]);
+    h.data = { recipientPin: pin };
+    h.local[RECORD_KEY] = { recipients: pin.recipients, keyMode: "file" };
+    h.confirmSet.mockImplementation(async () => false);
+    const { p } = await boot(true, { identity, copyRecipients: [k], files: (w) => ({ [KEY_PATH]: w }) });
+    const before = p.saved.length;
+    await p.switchToPassphrase();
+    expect(h.confirmSet).toHaveBeenCalledTimes(1);
+    expect((h.confirmSet.mock.calls[0][0] as { diff: { added: string[] } }).diff.added).toEqual([k]);
+    expect(p.settings.desktopKeyMode).toBe("file");
+    expect(p.settings.recipientPin).toEqual(pin);
+    expect(p.saved.length).toBe(before);
+  });
+
+  it("a verified pin that already equals the copy's set switches without a modal", async () => {
+    const identity = await generateIdentity();
+    const own = await identityToRecipient(identity);
+    const other = await identityToRecipient(await generateIdentity());
+    h.fileRecipients = [own, other];
+    const pin = await makePin(identity, [own, other]);
+    h.data = { recipientPin: pin };
+    h.local[RECORD_KEY] = { recipients: pin.recipients, keyMode: "file" };
+    const { p } = await boot(true, { identity, copyRecipients: [other], files: (w) => ({ [KEY_PATH]: w }) });
+    await p.switchToPassphrase();
+    expect(h.confirmSet).not.toHaveBeenCalled();
+    expect(p.settings.desktopKeyMode).toBe("passphrase");
+  });
+});
+
+describe("fix round 1: F3 every encrypting command refuses an appended key", () => {
+  it("Encrypt current note: no read, no write, the pin message", async () => {
+    const { p } = await appendedKey();
+    const vault = p.app.vault;
+    vault.read = vi.fn(async () => "secret");
+    vault.createBinary = vi.fn();
+    vault.modify = vi.fn();
+    vault.getAbstractFileByPath = () => null;
+    p.app.metadataCache = { getFileCache: () => null };
+    p.app.fileManager = { trashFile: vi.fn() };
+    await p.encryptCurrentNote({ path: "n.md", name: "n.md", extension: "md" });
+    expect(vault.read).not.toHaveBeenCalled();
+    expect(vault.createBinary).not.toHaveBeenCalled();
+    expect(vault.modify).not.toHaveBeenCalled();
+    expect(p.app.fileManager.trashFile).not.toHaveBeenCalled();
+    expect(h.notices.at(-1)).toMatch(PIN_MSG);
+  });
+
+  it("New private note: nothing created, the pin message", async () => {
+    const { p } = await appendedKey();
+    p.app.vault.createBinary = vi.fn();
+    p.app.vault.getAbstractFileByPath = () => null;
+    p.app.workspace.getActiveFile = () => null;
+    h.onModalOpen = (m) => m.resolver("secret");
+    await p.newPrivateNote();
+    expect(p.app.vault.createBinary).not.toHaveBeenCalled();
+    expect(h.notices.at(-1)).toMatch(PIN_MSG);
+  });
+
+  it("Rotate vault keys: stops at preflight, before files, backup or log", async () => {
+    const { p } = await appendedKey();
+    p.app.vault.getFiles = vi.fn(() => [{ path: "a.age", extension: "age" }]);
+    await p.rotateKeys();
+    expect(p.app.vault.getFiles).not.toHaveBeenCalled();
+    expect(h.loadBackup).not.toHaveBeenCalled();
+    expect(h.loadRotateLog).not.toHaveBeenCalled();
+    expect(h.notices.at(-1)).toMatch(/rotate aborted/);
+    expect(h.notices.at(-1)).toMatch(PIN_MSG);
+  });
+
+  it("Create mobile unlock copy: nothing written, the pin message in the modal", async () => {
+    const { p } = await appendedKey();
+    const writeBinary = vi.fn();
+    Object.assign(p.app.vault.adapter, { exists: async () => false, mkdir: vi.fn(), writeBinary, remove: vi.fn() });
+    await p.createMobileUnlockCopy();
+    expect(await h.copySubmit).toMatch(PIN_MSG);
+    expect(writeBinary).not.toHaveBeenCalled();
+  });
+
+  it("AgeFileView save: nothing written, the pin message", async () => {
+    const { p } = await appendedKey();
+    const { AgeFileView } = await import("../src/age-view");
+    const view = new (AgeFileView as unknown as new (l: unknown, d: unknown) => any)({}, {
+      getKeySource: () => p.getKeySource(),
+      updateStatusBar() {},
+      clearStatusBar() {},
+    });
+    const modifyBinary = vi.fn();
+    view.app = { vault: { readBinary: vi.fn(), modifyBinary } };
+    view.file = { path: "n.md.age", name: "n.md.age" };
+    view.editor = { state: { doc: { toString: () => "new text" } }, destroy() {} };
+    view.plaintext = "old";
+    view.dirty = true;
+    await expect(view.save("manual")).rejects.toThrow(PIN_MSG);
+    expect(modifyBinary).not.toHaveBeenCalled();
+    expect(h.notices.at(-1)).toMatch(PIN_MSG);
+  });
+});
+
+describe("fix round 1: F7", () => {
+  it("first-use prompts are keyed by set: two different sets get two modals, the same set one", async () => {
+    const { p } = await boot(true);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    h.confirmSet.mockImplementation(async () => (await gate, true));
+    const store = p.pinStore();
+    const [a, b] = [["age1a"], ["age1b"]];
+    const answers = [store.confirmFirst(a, "age1a"), store.confirmFirst(b, "age1a"), store.confirmFirst(a, "age1a")];
+    await vi.waitFor(() => expect(h.confirmSet).toHaveBeenCalledTimes(2));
+    release();
+    expect(await Promise.all(answers)).toEqual([true, true, true]);
+    expect(h.confirmSet).toHaveBeenCalledTimes(2);
+  });
+
+  it("unloading while the first-use modal is open leaves the source locked", async () => {
+    let answer!: (ok: boolean) => void;
+    h.confirmSet.mockImplementation(() => new Promise<boolean>((r) => (answer = r)));
+    const { p } = await boot(false);
+    const ks = p.getKeySource();
+    const unlocking = ks.getIdentity();
+    await vi.waitFor(() => expect(h.confirmSet).toHaveBeenCalled());
+    p.onunload();
+    answer(true);
+    await expect(unlocking).rejects.toThrow();
+    expect(ks.isUnlocked()).toBe(false);
   });
 });

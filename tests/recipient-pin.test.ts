@@ -10,8 +10,12 @@ import { FileKeySource, PassphraseKeySource } from "../src/keysource";
 import {
   assertPinned,
   checkPin,
+  copyOlderMessage,
   effectiveSet,
+  evaluatePin,
   makePin,
+  pinChangedMessage,
+  pinRemovedMessage,
   PIN_NOT_CONFIRMED_MESSAGE,
   PIN_UNVERIFIED_MESSAGE,
   RecipientPinError,
@@ -33,17 +37,29 @@ beforeEach(async () => {
   attacker = await identityToRecipient(await generateIdentity());
 });
 
-function store(initial: unknown = undefined, confirm = true) {
+/**
+ * In-memory PinStore. `rec`: this device's local record (default: none).
+ * save() writes the record too, as the plugin does.
+ */
+function store(initial: unknown = undefined, confirm = true, rec: string[] | null = null) {
   const s = {
     pin: initial,
+    rec,
+    blockedMsg: null as string | null,
     saves: [] as RecipientPin[],
     asked: [] as string[][],
+    owns: [] as string[],
     get: () => s.pin,
+    record: () => s.rec,
+    blocked: () => s.blockedMsg,
     save: async (p: RecipientPin) => {
       s.pin = p;
+      s.rec = p.recipients;
       s.saves.push(p);
     },
-    confirmFirst: vi.fn(async (r: string[]) => (s.asked.push(r), confirm)),
+    confirmFirst: vi.fn(
+      async (r: string[], own: string) => (s.asked.push(r), s.owns.push(own), confirm)
+    ),
   };
   return s as typeof s & PinStore;
 }
@@ -106,10 +122,71 @@ describe("makePin / checkPin", () => {
 
 describe("assertPinned", () => {
   it("passes on the confirmed set without asking", async () => {
-    const s = store(await makePin(identity, [other]));
+    const pin = await makePin(identity, [other]);
+    const s = store(pin, true, pin.recipients);
     await assertPinned(s, identity, [other]);
     expect(s.confirmFirst).not.toHaveBeenCalled();
     expect(s.saves).toEqual([]);
+  });
+
+  it("a valid pin on a device with no record (synced from another device) is recorded here", async () => {
+    const pin = await makePin(identity, [other]);
+    const s = store(pin);
+    await assertPinned(s, identity, [other]);
+    expect(s.confirmFirst).not.toHaveBeenCalled();
+    expect(s.rec).toEqual(pin.recipients);
+  });
+
+  it("F1: record present, pin deleted: refused as removed, never first use", async () => {
+    const s = store(undefined, true, [own, other].sort());
+    const err = await assertPinned(s, identity, [other, attacker]).catch((e) => e);
+    expect(err).toBeInstanceOf(RecipientPinError);
+    expect(err.message).toBe(pinRemovedMessage(1, 0));
+    expect(s.confirmFirst).not.toHaveBeenCalled();
+    expect(s.saves).toEqual([]);
+  });
+
+  it("F1: record present, pin forged: refused as removed", async () => {
+    const pin = await makePin(identity, [other]);
+    const s = store({ ...pin, mac: "0".repeat(64) }, true, pin.recipients);
+    await expect(assertPinned(s, identity, [other])).rejects.toThrow(/removed or replaced/);
+    expect(s.confirmFirst).not.toHaveBeenCalled();
+  });
+
+  it("F1: an older, genuine pin restored over the recorded one is refused, even though it verifies", async () => {
+    const old = await makePin(identity, [other, attacker]);
+    const s = store(old, true, await effectiveSet(identity, [other]));
+    await expect(assertPinned(s, identity, [other, attacker])).rejects.toThrow(/removed or replaced/);
+    expect(s.saves).toEqual([]);
+  });
+
+  it("F1: evaluatePin reports a removed pin's difference against the record", async () => {
+    expect(await evaluatePin(undefined, [own, other].sort(), identity, [attacker])).toEqual({
+      status: "removed",
+      added: [attacker],
+      removed: [other],
+    });
+  });
+
+  it("a blocked store refuses before comparing anything", async () => {
+    const pin = await makePin(identity, [other]);
+    const s = store(pin, true, pin.recipients);
+    s.blockedMsg = "blocked for a reason";
+    await expect(assertPinned(s, identity, [other])).rejects.toThrow("blocked for a reason");
+  });
+
+  it("F6: an unlock copy with only extra keys is called an old copy; a file, or a copy missing keys, is not", async () => {
+    const pin = await makePin(identity, [other]);
+    const s = store(pin, true, pin.recipients);
+    await expect(assertPinned(s, identity, [other, attacker], "copy")).rejects.toThrow(copyOlderMessage(1));
+    await expect(assertPinned(s, identity, [other, attacker], "file")).rejects.toThrow(pinChangedMessage(1, 0));
+    await expect(assertPinned(s, identity, [attacker], "copy")).rejects.toThrow(pinChangedMessage(1, 1));
+  });
+
+  it("F5: first use passes the identity's own recipient to the prompt", async () => {
+    const s = store(undefined, true);
+    await assertPinned(s, identity, [other]);
+    expect(s.owns).toEqual([own]);
   });
 
   it("an added key fails closed with the count, never asks inline, saves nothing", async () => {
@@ -214,7 +291,7 @@ describe("PassphraseKeySource with a pin", () => {
     await expect(ks.getIdentity()).rejects.toThrow();
     expect(ks.isUnlocked()).toBe(false);
     expect(errors[0]).toBeInstanceOf(RecipientPinError);
-    expect((errors[0] as Error).message).toMatch(/\+1 added/);
+    expect((errors[0] as Error).message).toBe(copyOlderMessage(1));
   });
 
   it("refuses a copy made with another identity under the same passphrase (the pin does not verify)", async () => {
