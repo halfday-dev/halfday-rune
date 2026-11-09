@@ -107,7 +107,10 @@ import {
 import { isExcludedPath } from "./path-fold";
 import { rotateVault, recipientsChanged } from "./rotate";
 import { addedToMainFile, confirmRecipientsSave } from "./recipients-guard";
-import { ConfirmMainRecipientsModal } from "./recipients-modal";
+import { ConfirmMainRecipientsModal, ConfirmRecipientSetModal } from "./recipients-modal";
+import type { RecipientSetPrompt } from "./recipients-modal";
+import { checkPin, makePin } from "./recipient-pin";
+import type { PinCheck, PinStore, RecipientPin } from "./recipient-pin";
 import type { RotateResult } from "./rotate";
 
 interface HalfdayObsidianRuneSettings {
@@ -137,6 +140,11 @@ interface HalfdayObsidianRuneSettings {
    * working. Takes effect after the plugin reloads.
    */
   desktopKeyMode: "file" | "passphrase";
+  /**
+   * The recipient set the owner confirmed, with a MAC keyed from the identity
+   * (see recipient-pin). Public keys only. Absent until the first confirm.
+   */
+  recipientPin?: RecipientPin;
 }
 
 const DEFAULT_SETTINGS: HalfdayObsidianRuneSettings = {
@@ -176,7 +184,7 @@ export default class HalfdayObsidianRune extends Plugin {
     await this.loadSettings();
 
     if (!this.usesPassphrase()) {
-      this.keySource = new FileKeySource(() => this.settings);
+      this.keySource = new FileKeySource(() => this.settings, loadCryptoNode, this.pinStore());
     } else {
       // Mobile, or desktop in passphrase mode: passphrase-unlocked, memory-only source. The identity lives
       // only inside this object; see PassphraseKeySource.
@@ -189,6 +197,7 @@ export default class HalfdayObsidianRune extends Plugin {
           backgroundLockGraceSeconds: this.settings.backgroundLockGraceSeconds,
         }),
         prompt: this.unlockPrompt,
+        pin: this.pinStore(),
         beforeLock: async () => {
           for (const v of this.ageViews()) await v.flushBeforeLock();
         },
@@ -325,6 +334,13 @@ export default class HalfdayObsidianRune extends Plugin {
         callback: () => void this.switchToPassphrase(),
       });
     }
+
+    // Review the exact set of keys rune encrypts to and pin it (#2).
+    this.addCommand({
+      id: "halfday-rune-confirm-recipients",
+      name: "Confirm recipient set",
+      callback: () => void this.confirmRecipientSet(),
+    });
 
     // v0.3.0: custom view + .age extension routing
     // v0.3.2: view also needs the recipient path so it can re-encrypt on save
@@ -492,9 +508,15 @@ export default class HalfdayObsidianRune extends Plugin {
    * you type now, and the recipient list INSIDE the copy equals the current
    * list normalised the way the copy is made (recipients.txt plus your own
    * recipient, deduped). The plain sidecar plays no part: any same-user process
-   * can write it. Only then does it record the mode. It reads the identity
-   * file (to normalise) but never moves or deletes it: that is the owner's
-   * step, after the next start works.
+   * can write it. Only then does it record the mode, and pin the copy's list
+   * as the confirmed recipient set. It reads the identity file (to normalise)
+   * but never moves or deletes it: that is the owner's step, after the next
+   * start works.
+   *
+   * No identity file on this computer (enrolling a second Mac, or after the
+   * owner deleted it): nothing to compare against, so trust on first use. The
+   * owner sees the count, fingerprint and every key inside the copy and must
+   * confirm them; that set becomes the pin.
    */
   async switchToPassphrase(): Promise<void> {
     if (!Platform.isDesktopApp || this.usesPassphrase()) return;
@@ -512,47 +534,227 @@ export default class HalfdayObsidianRune extends Plugin {
       );
       return;
     }
-    let current: string[];
+    // The owner's own recipient comes from the FILE identity, never the
+    // unwrapped one, so an older copy (made before a key rotation) can't match.
+    let fileIdentity: string | null = null;
     try {
-      const keys = this.getKeySource();
-      current = (await buildMobileKey(await keys.getIdentity(), await keys.getRecipients()))
-        .recipients;
+      fileIdentity = await this.fileKeys().getIdentity();
     } catch {
-      new Notice(
-        "Halfday Rune: could not read your identity file and recipients list to compare with the unlock copy. Nothing changed.",
-        10_000
-      );
+      /* no identity file: enrol by trust on first use below */
+    }
+    let current: string[] | null = null;
+    if (fileIdentity !== null) {
+      try {
+        const { recipients } = await this.fileKeys().readUnpinned();
+        current = (await buildMobileKey(fileIdentity, recipients)).recipients;
+      } catch {
+        new Notice(
+          "Halfday Rune: could not read your identity file and recipients list to compare with the unlock copy. Nothing changed.",
+          10_000
+        );
+        return;
+      }
+    }
+    const got = await this.unwrapCopyOnce(path);
+    if (!got) {
+      new Notice("Halfday Rune: unlock did not complete. Nothing changed.");
       return;
     }
+    const unwrapped = got.recipients;
+    const fingerprint = await recipientsFingerprint(unwrapped);
+    let pin: RecipientPin;
+    try {
+      pin = await makePin(got.identity, unwrapped);
+    } catch {
+      new Notice("Halfday Rune: the unlock copy could not be read. Nothing changed.", 10_000);
+      return;
+    }
+    if (current !== null) {
+      if (fingerprint !== (await recipientsFingerprint(current))) {
+        new Notice(`Halfday Rune: ${STALE_COPY_WARNING} Nothing changed.`, 10_000);
+        return;
+      }
+    } else {
+      const check = await checkPin(this.settings.recipientPin, got.identity, unwrapped);
+      const ok = await this.askRecipientSet({
+        recipients: pin.recipients,
+        fingerprint,
+        diff: check.status === "changed" ? { added: check.added, removed: check.removed } : null,
+        note:
+          "There is no identity file on this computer, so rune cannot check the unlock copy against it. " +
+          "The keys inside the copy become the set rune encrypts to.",
+      });
+      if (!ok) {
+        new Notice("Halfday Rune: recipient set not confirmed. Nothing changed.");
+        return;
+      }
+    }
+    this.settings.recipientPin = pin;
+    this.settings.desktopKeyMode = "passphrase";
+    await this.saveSettings();
+    new Notice(
+      `Halfday Rune: passphrase unlock is set. Notes will be encrypted to the ${unwrapped.length} ` +
+        `recipient(s) in the unlock copy (fingerprint ${fingerprint}), and rune refuses any other set. ` +
+        "Reload Obsidian, open a note to check it unlocks" +
+        (current !== null
+          ? ", then delete your identity file yourself. The plugin never deletes it."
+          : "."),
+      0
+    );
+  }
+
+  /** The file source; only valid in key file mode. */
+  private fileKeys(): FileKeySource {
+    const keys = this.getKeySource();
+    if (!(keys instanceof FileKeySource)) throw new Error("not in key file mode");
+    return keys;
+  }
+
+  /**
+   * One-off passphrase unlock of the copy at `path`, NOT checked against the
+   * pin (it is how a changed copy gets reviewed). The identity goes to the
+   * caller and the probe is disposed. null when the owner did not unlock.
+   */
+  private async unwrapCopyOnce(
+    path: string
+  ): Promise<{ identity: string; recipients: string[] } | null> {
     const prompt = makeUnlockPrompt(this.app);
     const probe = new PassphraseKeySource({
       adapter: this.app.vault.adapter,
       getSettings: () => ({ mobileKeyPath: path, autoLockMinutes: 0, backgroundLockGraceSeconds: 0 }),
       prompt,
     });
-    let unwrapped: string[];
     try {
-      unwrapped = await probe.getRecipients(); // prompts; the list inside the copy
+      const recipients = await probe.getRecipients(); // prompts; the list inside the copy
+      return { identity: await probe.getIdentity(), recipients };
     } catch {
-      new Notice("Halfday Rune: unlock did not complete. Nothing changed.");
-      return;
+      return null;
     } finally {
       probe.dispose();
       prompt.close();
     }
-    const fingerprint = await recipientsFingerprint(unwrapped);
-    if (fingerprint !== (await recipientsFingerprint(current))) {
-      new Notice(`Halfday Rune: ${STALE_COPY_WARNING} Nothing changed.`, 10_000);
+  }
+
+  /**
+   * Sets the owner confirmed on first use this session. Saves that checked the
+   * pin before the first answer was saved get that answer instead of a second
+   * modal. Only a yes for the identical set is remembered.
+   */
+  private firstUseAnswers = new Map<string, Promise<boolean>>();
+
+  /** Where the owner-confirmed recipient set is read and written. */
+  private pinStore(): PinStore {
+    return {
+      get: () => this.settings.recipientPin,
+      save: async (pin) => {
+        this.settings.recipientPin = pin;
+        await this.saveSettings();
+      },
+      confirmFirst: (recipients) => {
+        const key = JSON.stringify(recipients);
+        let answer = this.firstUseAnswers.get(key);
+        if (!answer) {
+          answer = (async () =>
+            this.askRecipientSet({
+              recipients,
+              fingerprint: await recipientsFingerprint(recipients),
+              diff: null,
+              note: "rune has no confirmed recipient set yet.",
+            }))();
+          this.firstUseAnswers.set(key, answer);
+          void answer.then((ok) => {
+            if (!ok) this.firstUseAnswers.delete(key);
+          });
+        }
+        return answer;
+      },
+    };
+  }
+
+  private pendingSetPrompts = new Map<string, Promise<boolean>>();
+
+  /** One modal per distinct question at a time; concurrent saves share the answer. */
+  private askRecipientSet(p: RecipientSetPrompt): Promise<boolean> {
+    const key = JSON.stringify([p.recipients, p.diff, p.note ?? ""]);
+    const pending = this.pendingSetPrompts.get(key);
+    if (pending) return pending;
+    const ask = new Promise<boolean>((resolve) =>
+      new ConfirmRecipientSetModal(this.app, p, resolve).open()
+    ).finally(() => this.pendingSetPrompts.delete(key));
+    this.pendingSetPrompts.set(key, ask);
+    return ask;
+  }
+
+  /**
+   * 'Confirm recipient set': show the set rune would encrypt to now and pin it
+   * if the owner confirms. Key file mode reads both files; passphrase mode
+   * unlocks the copy with a one-off prompt that skips the pin, so a copy the
+   * pin refuses can still be reviewed. Keys added since the last pin that
+   * verifies are listed apart; a pin that does not verify is ignored (its list
+   * could be anyone's), so every key reads as new.
+   *
+   * `afterEdit` (the settings editor just saved recipients.txt): quiet when
+   * nothing changed, and re-pins without asking when keys were only removed,
+   * since narrowing the set cannot widen who can read.
+   */
+  async confirmRecipientSet(opts: { afterEdit?: boolean } = {}): Promise<void> {
+    let got: { identity: string; recipients: string[] } | null;
+    if (!this.usesPassphrase()) {
+      try {
+        got = await this.fileKeys().readUnpinned();
+      } catch {
+        new Notice(
+          "Halfday Rune: could not read your identity file and recipients list. Nothing changed.",
+          10_000
+        );
+        return;
+      }
+    } else {
+      if (opts.afterEdit) return; // recipients.txt is not used in passphrase mode
+      got = await this.unwrapCopyOnce(this.mobileKeyPath());
+      if (!got) {
+        new Notice("Halfday Rune: unlock did not complete. Nothing changed.");
+        return;
+      }
+    }
+    let check: PinCheck;
+    let pin: RecipientPin;
+    try {
+      check = await checkPin(this.settings.recipientPin, got.identity, got.recipients);
+      pin = await makePin(got.identity, got.recipients);
+    } catch {
+      new Notice("Halfday Rune: your key could not be read. Nothing changed.", 10_000);
       return;
     }
-    this.settings.desktopKeyMode = "passphrase";
-    await this.saveSettings();
+    if (check.status === "ok") {
+      if (!opts.afterEdit) new Notice("Halfday Rune: this recipient set is already confirmed.");
+      return;
+    }
+    if (opts.afterEdit && check.status === "changed" && check.added.length === 0) {
+      await this.pinStore().save(pin);
+      return;
+    }
+    const fingerprint = await recipientsFingerprint(pin.recipients);
+    const ok = await this.askRecipientSet({
+      recipients: pin.recipients,
+      fingerprint,
+      diff: check.status === "changed" ? { added: check.added, removed: check.removed } : null,
+      note:
+        check.status === "unverified"
+          ? "Your previous confirmed set could not be verified with your key, so nothing is marked as new. Check every key."
+          : check.status === "missing"
+            ? "rune has no confirmed recipient set yet."
+            : undefined,
+    });
+    if (!ok) {
+      new Notice(
+        "Halfday Rune: recipient set not confirmed. rune will not encrypt to it until you confirm it."
+      );
+      return;
+    }
+    await this.pinStore().save(pin);
     new Notice(
-      `Halfday Rune: passphrase unlock is set. Notes will be encrypted to the ${unwrapped.length} ` +
-        `recipient(s) in the unlock copy (fingerprint ${fingerprint}). ` +
-        "Reload Obsidian, open a note to check it unlocks, " +
-        "then delete your identity file yourself. The plugin never deletes it.",
-      0
+      `Halfday Rune: recipient set confirmed (${pin.recipients.length} key(s), fingerprint ${fingerprint}).`
     );
   }
 
@@ -600,7 +802,8 @@ export default class HalfdayObsidianRune extends Plugin {
       } catch (err) {
         // MobileCopyError carries a fixed message; anything else (e.g. the
         // identity file could not be read) gets the same fixed message.
-        return err instanceof Error && err.name === "MobileCopyError"
+        return err instanceof Error &&
+          (err.name === "MobileCopyError" || err.name === "RecipientPinError")
           ? err.message
           : "Could not read your key or create the copy. Nothing was changed.";
       }
@@ -623,10 +826,9 @@ export default class HalfdayObsidianRune extends Plugin {
     // In passphrase mode this would prompt for the passphrase at every start.
     if (!Platform.isDesktopApp || !this.keySource || this.usesPassphrase()) return;
     try {
-      const keys = this.keySource;
-      const current = (
-        await buildMobileKey(await keys.getIdentity(), await keys.getRecipients())
-      ).recipients;
+      // compare only: the unpinned read never asks the owner to confirm at startup
+      const { identity, recipients } = await this.fileKeys().readUnpinned();
+      const current = (await buildMobileKey(identity, recipients)).recipients;
       const warning = await mobileCopyWarning(
         this.app.vault.adapter,
         this.mobileKeyPath(),
@@ -2001,6 +2203,9 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
             new Notice("Halfday Rune: recipients saved");
           }
           void this.plugin.checkMobileCopyFreshness();
+          // rune refuses to encrypt to a set the owner has not confirmed:
+          // ask now (removals re-pin quietly) rather than at the next save
+          void this.plugin.confirmRecipientSet({ afterEdit: true });
         console.log("[halfday-rune] recipients saved", {
             path: this.plugin.settings.recipientsPath,
             bytes: content.length,
