@@ -109,8 +109,8 @@ import { rotateVault, recipientsChanged } from "./rotate";
 import { addedToMainFile, confirmRecipientsSave } from "./recipients-guard";
 import { ConfirmMainRecipientsModal, ConfirmRecipientSetModal } from "./recipients-modal";
 import type { RecipientSetPrompt } from "./recipients-modal";
-import { evaluatePin, makePin, normalizeRecord, ownRecipient } from "./recipient-pin";
-import type { PinCheck, PinStore, RecipientPin } from "./recipient-pin";
+import { evaluatePin, makePin, nextSeq, ownRecipient, parseDeviceRecord } from "./recipient-pin";
+import type { DeviceRecord, PinCheck, PinStore, RecipientPin } from "./recipient-pin";
 import type { RotateResult } from "./rotate";
 
 interface HalfdayObsidianRuneSettings {
@@ -569,9 +569,14 @@ export default class HalfdayObsidianRune extends Plugin {
     }
     const unwrapped = got.recipients;
     const fingerprint = await recipientsFingerprint(unwrapped);
+    const record = this.localRecord().record;
     let pin: RecipientPin;
     try {
-      pin = await makePin(got.identity, unwrapped);
+      pin = await makePin(
+        got.identity,
+        unwrapped,
+        await nextSeq(this.settings.recipientPin, record, got.identity)
+      );
     } catch {
       new Notice("Halfday Rune: the unlock copy could not be read. Nothing changed.", 10_000);
       return;
@@ -583,12 +588,7 @@ export default class HalfdayObsidianRune extends Plugin {
     // Never replace a confirmed set without the owner seeing the difference:
     // recipients.txt may have been edited to match an older copy. With no
     // identity file there is nothing to compare, so always ask.
-    const check = await evaluatePin(
-      this.settings.recipientPin,
-      this.localRecord().recipients,
-      got.identity,
-      unwrapped
-    );
+    const check = await evaluatePin(this.settings.recipientPin, record, got.identity, unwrapped);
     if (current === null || check.status !== "ok") {
       const described = this.describeCheck(check);
       const ok = await this.askRecipientSet({
@@ -614,7 +614,7 @@ export default class HalfdayObsidianRune extends Plugin {
     this.settings.recipientPin = pin;
     this.settings.desktopKeyMode = "passphrase";
     await this.saveSettings();
-    this.writeLocalRecord(pin.recipients, "passphrase");
+    this.writeLocalRecord(pin.recipients, pin.seq ?? 0, "passphrase");
     new Notice(
       `Halfday Rune: passphrase unlock is set. Notes will be encrypted to the ${unwrapped.length} ` +
         `recipient(s) in the unlock copy (fingerprint ${fingerprint}), and rune refuses any other set. ` +
@@ -666,39 +666,51 @@ export default class HalfdayObsidianRune extends Plugin {
   private firstUseAnswers = new Map<string, Promise<boolean>>();
 
   /**
-   * This device's record of the last confirmed set and key mode, in Obsidian's
-   * per-vault local storage (not synced, not in data.json). See recipient-pin
-   * for why. Public keys only.
+   * This device's record of the newest confirmation it has seen (set + seq)
+   * and its key mode, in Obsidian's per-vault local storage (not synced, not
+   * in data.json). See recipient-pin for why. Public keys only. A stored value
+   * that does not parse is "corrupt" and fails closed.
    */
-  private localRecord(): { recipients: string[] | null; keyMode: "file" | "passphrase" | null } {
+  private localRecord(): { record: DeviceRecord; keyMode: "file" | "passphrase" | null } {
     let raw: unknown = null;
     try {
-      raw =
-        typeof this.app.loadLocalStorage === "function"
-          ? this.app.loadLocalStorage(PIN_RECORD_KEY)
-          : JSON.parse(localStorage.getItem(this.legacyRecordKey()) ?? "null");
+      if (typeof this.app.loadLocalStorage === "function") {
+        raw = this.app.loadLocalStorage(PIN_RECORD_KEY);
+      } else {
+        const s = localStorage.getItem(this.legacyRecordKey());
+        raw = s === null ? null : JSON.parse(s);
+      }
     } catch {
-      raw = null;
+      return { record: { kind: "corrupt" }, keyMode: null };
     }
-    const o = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
-    return {
-      recipients: normalizeRecord(o.recipients),
-      keyMode: o.keyMode === "file" || o.keyMode === "passphrase" ? o.keyMode : null,
-    };
+    return parseDeviceRecord(raw);
   }
 
-  private writeLocalRecord(recipients: string[] | null, keyMode: "file" | "passphrase"): void {
-    const data = { recipients, keyMode };
+  private writeLocalRecord(
+    recipients: string[] | null,
+    seq: number,
+    keyMode: "file" | "passphrase"
+  ): void {
+    const data = { recipients, seq, keyMode };
     if (typeof this.app.loadLocalStorage === "function") {
       this.app.saveLocalStorage(PIN_RECORD_KEY, data);
     } else {
-      // Obsidian before 1.8.7: plain localStorage, keyed by vault
+      // Obsidian before 1.8.7: plain localStorage, keyed by this vault's id
       localStorage.setItem(this.legacyRecordKey(), JSON.stringify(data));
     }
   }
 
+  /** Plain-localStorage key: by the vault's app id, or its name when there is none. */
   private legacyRecordKey(): string {
-    return `${PIN_RECORD_KEY}:${this.app.vault.getName()}`;
+    const appId = (this.app as unknown as { appId?: unknown }).appId;
+    const id = typeof appId === "string" && appId !== "" ? appId : this.app.vault.getName();
+    return `${PIN_RECORD_KEY}:${id}`;
+  }
+
+  /** Move this device's record forward to a verified, newer pin; key mode kept. */
+  private adoptPin(pin: RecipientPin): void {
+    const { keyMode } = this.localRecord();
+    this.writeLocalRecord(pin.recipients, pin.seq ?? 0, keyMode ?? this.settings.desktopKeyMode);
   }
 
   /**
@@ -746,9 +758,10 @@ export default class HalfdayObsidianRune extends Plugin {
       save: async (pin) => {
         this.settings.recipientPin = pin;
         await this.saveSettings();
-        this.writeLocalRecord(pin.recipients, this.settings.desktopKeyMode);
+        this.writeLocalRecord(pin.recipients, pin.seq ?? 0, this.settings.desktopKeyMode);
       },
-      record: () => this.localRecord().recipients,
+      record: () => this.localRecord().record,
+      adopt: (pin) => this.adoptPin(pin),
       blocked: () => (this.modeReverted() ? MODE_REVERTED_MESSAGE : null),
       confirmFirst: (recipients, own) => {
         const key = JSON.stringify(recipients);
@@ -822,13 +835,15 @@ export default class HalfdayObsidianRune extends Plugin {
     let pin: RecipientPin;
     let own: string;
     try {
-      check = await evaluatePin(
-        this.settings.recipientPin,
-        this.localRecord().recipients,
+      // a newer pin from another device is compared against directly; the
+      // record moves to it at the next unlock / encrypt, or when this saves
+      const record = this.localRecord().record;
+      check = await evaluatePin(this.settings.recipientPin, record, got.identity, got.recipients);
+      pin = await makePin(
         got.identity,
-        got.recipients
+        got.recipients,
+        await nextSeq(this.settings.recipientPin, record, got.identity)
       );
-      pin = await makePin(got.identity, got.recipients);
       own = await ownRecipient(got.identity);
     } catch {
       new Notice("Halfday Rune: your key could not be read. Nothing changed.", 10_000);
@@ -877,7 +892,10 @@ export default class HalfdayObsidianRune extends Plugin {
     if (!Platform.isDesktopApp) return;
     this.settings.desktopKeyMode = "file";
     await this.saveSettings();
-    this.writeLocalRecord(this.localRecord().recipients, "file");
+    const { record } = this.localRecord();
+    if (record.kind === "ok") this.writeLocalRecord(record.recipients, record.seq, "file");
+    else if (record.kind === "none") this.writeLocalRecord(null, 0, "file");
+    // corrupt: left as is, so it keeps failing closed until the owner confirms
     new Notice("Halfday Rune: key file mode is set. Reload Obsidian to apply.");
   }
 

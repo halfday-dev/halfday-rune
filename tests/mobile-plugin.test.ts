@@ -697,6 +697,7 @@ describe("fix round 1: F1 local record", () => {
     await p.getKeySource().getRecipients();
     expect(h.local[RECORD_KEY]).toEqual({
       recipients: p.settings.recipientPin.recipients,
+      seq: 1,
       keyMode: "file",
     });
   });
@@ -769,7 +770,7 @@ describe("fix round 1: F1 local record", () => {
     h.fileRecipients = [own];
     const { p } = await boot(true, { identity, files: (w) => ({ [KEY_PATH]: w }) });
     await p.switchToPassphrase();
-    expect(h.local[RECORD_KEY]).toEqual({ recipients: [own], keyMode: "passphrase" });
+    expect(h.local[RECORD_KEY]).toEqual({ recipients: [own], seq: 1, keyMode: "passphrase" });
   });
 });
 
@@ -903,5 +904,138 @@ describe("fix round 1: F7", () => {
     answer(true);
     await expect(unlocking).rejects.toThrow();
     expect(ks.isUnlocked()).toBe(false);
+  });
+});
+
+describe("fix round 2", () => {
+  it("F6 on the phone: a newer pin without K is adopted, the old copy is refused as older, and Confirm shows K as new", async () => {
+    const identity = await generateIdentity();
+    const own = await identityToRecipient(identity);
+    const k = await identityToRecipient(await generateIdentity());
+    const phoneRecord = await makePin(identity, [own, k], 1);
+    h.local[RECORD_KEY] = { recipients: phoneRecord.recipients, seq: 1, keyMode: "file" };
+    h.data = { recipientPin: await makePin(identity, [own], 2) }; // the Mac removed K
+    const { p } = await boot(false, { identity, copyRecipients: [k] }); // the phone's copy still has K
+    await expect(p.getKeySource().getIdentity()).rejects.toThrow(/older than your confirmed set.*make a new unlock copy on desktop/i);
+    expect(h.local[RECORD_KEY]).toEqual({ recipients: [own], seq: 2, keyMode: "file" });
+    h.confirmSet.mockImplementation(async () => false);
+    await p.confirmRecipientSet();
+    const shown = h.confirmSet.mock.calls[0][0] as { diff: { added: string[]; removed: string[] }; note?: string };
+    expect(shown.diff).toEqual({ added: [k], removed: [] });
+    expect(shown.note ?? "").not.toMatch(/removed or replaced/);
+    expect(p.settings.recipientPin.recipients).toEqual([own]); // declined: K not re-added
+  });
+
+  it("N1 on the Mac: a newer pin confirmed on the phone is accepted, not 'removed or replaced'", async () => {
+    const identity = await generateIdentity();
+    const own = await identityToRecipient(identity);
+    const k = await identityToRecipient(await generateIdentity());
+    h.fileIdentity = identity;
+    h.fileRecipients = [own];
+    h.local[RECORD_KEY] = { recipients: (await makePin(identity, [own, k], 1)).recipients, seq: 1, keyMode: "file" };
+    h.data = { recipientPin: await makePin(identity, [own], 2) };
+    const { p } = await boot(true, { identity });
+    expect(await p.getKeySource().getRecipients()).toEqual([own]);
+    expect(h.confirmSet).not.toHaveBeenCalled();
+    expect((h.local[RECORD_KEY] as { seq: number }).seq).toBe(2);
+  });
+
+  it("a confirm writes seq above both the record and the pin", async () => {
+    const identity = await generateIdentity();
+    const own = await identityToRecipient(identity);
+    const added = await identityToRecipient(await generateIdentity());
+    h.fileIdentity = identity;
+    h.fileRecipients = [own, added];
+    const pin = await makePin(identity, [own], 4);
+    h.data = { recipientPin: pin };
+    h.local[RECORD_KEY] = { recipients: pin.recipients, seq: 4, keyMode: "file" };
+    const { p } = await boot(true, { identity });
+    await p.confirmRecipientSet();
+    expect(p.settings.recipientPin.seq).toBe(5);
+    expect((h.local[RECORD_KEY] as { seq: number }).seq).toBe(5);
+  });
+
+  it("switching to passphrase writes seq above the existing pin", async () => {
+    const identity = await generateIdentity();
+    const own = await identityToRecipient(identity);
+    h.fileRecipients = [own];
+    const pin = await makePin(identity, [own], 3);
+    h.data = { recipientPin: pin };
+    h.local[RECORD_KEY] = { recipients: pin.recipients, seq: 3, keyMode: "file" };
+    const { p } = await boot(true, { identity, files: (w) => ({ [KEY_PATH]: w }) });
+    await p.switchToPassphrase();
+    expect(p.settings.recipientPin.seq).toBe(4);
+    expect(h.local[RECORD_KEY]).toEqual({ recipients: [own], seq: 4, keyMode: "passphrase" });
+  });
+
+  it("corrupt record shapes fail closed as removed, with no first-use prompt", async () => {
+    for (const bad of ["garbage", { recipients: [1] }, { recipients: "age1x" }, { recipients: [] }, {}]) {
+      h.local = { [RECORD_KEY]: bad };
+      h.confirmSet.mockClear();
+      const identity = await generateIdentity();
+      h.fileIdentity = identity;
+      h.fileRecipients = [await identityToRecipient(identity)];
+      h.data = null;
+      const { p } = await boot(true, { identity });
+      await expect(p.getKeySource().getRecipients()).rejects.toThrow(/removed or replaced/);
+      expect(h.confirmSet).not.toHaveBeenCalled();
+    }
+  });
+
+  it("a legacy localStorage record that is not JSON fails closed as removed", async () => {
+    const identity = await generateIdentity();
+    h.fileIdentity = identity;
+    h.fileRecipients = [await identityToRecipient(identity)];
+    const { p } = await boot(true, { identity });
+    delete p.app.loadLocalStorage;
+    delete p.app.saveLocalStorage;
+    vi.stubGlobal("localStorage", { getItem: () => "{not json", setItem: () => {}, removeItem: () => {} });
+    await expect(p.getKeySource().getRecipients()).rejects.toThrow(/removed or replaced/);
+    expect(h.confirmSet).not.toHaveBeenCalled();
+  });
+
+  it("R33: first use passes the real own recipient to the prompt", async () => {
+    const identity = await generateIdentity();
+    const other = await identityToRecipient(await generateIdentity());
+    h.fileIdentity = identity;
+    h.fileRecipients = [other];
+    const { p } = await boot(true, { identity });
+    await p.getKeySource().getRecipients();
+    expect((h.confirmSet.mock.calls[0][0] as { own: string }).own).toBe(await identityToRecipient(identity));
+  });
+
+  it("N2: on Obsidian without loadLocalStorage, the record is keyed by app.appId (vault name only without one)", async () => {
+    const identity = await generateIdentity();
+    h.fileIdentity = identity;
+    h.fileRecipients = [await identityToRecipient(identity)];
+    const { p } = await boot(true, { identity });
+    delete p.app.loadLocalStorage;
+    delete p.app.saveLocalStorage;
+    p.app.appId = "f00dfeed1234";
+    await p.getKeySource().getRecipients();
+    expect(storageWrites.some((w) => w.startsWith("halfday-rune-pin-record:f00dfeed1234="))).toBe(true);
+    expect(storageWrites.some((w) => w.startsWith("halfday-rune-pin-record:test-vault="))).toBe(false);
+    delete p.app.appId;
+    storageWrites.length = 0;
+    p.settings.recipientPin = undefined;
+    await p.confirmRecipientSet();
+    expect(storageWrites.some((w) => w.startsWith("halfday-rune-pin-record:test-vault="))).toBe(true);
+  });
+
+  it("N3: reverted mode plus an editor save that only removes a key shows the modal with the reverted note, never a quiet re-pin", async () => {
+    const identity = await generateIdentity();
+    const own = await identityToRecipient(identity);
+    const gone = await identityToRecipient(await generateIdentity());
+    h.fileIdentity = identity;
+    h.fileRecipients = [own];
+    const pin = await makePin(identity, [own, gone], 1);
+    h.data = { recipientPin: pin }; // desktopKeyMode back to "file"
+    h.local[RECORD_KEY] = { recipients: pin.recipients, seq: 1, keyMode: "passphrase" };
+    h.confirmSet.mockImplementation(async () => false);
+    const { p } = await boot(true, { identity });
+    await p.confirmRecipientSet({ afterEdit: true });
+    expect(h.confirmSet).toHaveBeenCalledTimes(1);
+    expect((h.confirmSet.mock.calls[0][0] as { note: string }).note).toMatch(/switched back yourself/);
+    expect(p.settings.recipientPin).toEqual(pin);
   });
 });

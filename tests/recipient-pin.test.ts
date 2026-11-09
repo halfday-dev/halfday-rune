@@ -19,6 +19,10 @@ import {
   PIN_NOT_CONFIRMED_MESSAGE,
   PIN_UNVERIFIED_MESSAGE,
   RecipientPinError,
+  nextSeq,
+  parseDeviceRecord,
+  verifiedPin,
+  type DeviceRecord,
   type PinStore,
   type RecipientPin,
 } from "../src/recipient-pin";
@@ -37,24 +41,37 @@ beforeEach(async () => {
   attacker = await identityToRecipient(await generateIdentity());
 });
 
+/** A device record holding `recipients` at `seq` (makePin defaults to seq 1). */
+const rec = (recipients: string[], seq = 1): DeviceRecord => ({ kind: "ok", recipients, seq });
+
 /**
- * In-memory PinStore. `rec`: this device's local record (default: none).
- * save() writes the record too, as the plugin does.
+ * In-memory PinStore. `record`: this device's local record (default: none; a
+ * plain list means that list at seq 1). save() and adopt() move the record,
+ * as the plugin does.
  */
-function store(initial: unknown = undefined, confirm = true, rec: string[] | null = null) {
+function store(
+  initial: unknown = undefined,
+  confirm = true,
+  record: DeviceRecord | string[] | null = null
+) {
   const s = {
     pin: initial,
-    rec,
+    rec: (record === null ? { kind: "none" } : Array.isArray(record) ? rec(record) : record) as DeviceRecord,
     blockedMsg: null as string | null,
     saves: [] as RecipientPin[],
+    adopted: [] as RecipientPin[],
     asked: [] as string[][],
     owns: [] as string[],
     get: () => s.pin,
     record: () => s.rec,
     blocked: () => s.blockedMsg,
+    adopt: (p: RecipientPin) => {
+      s.adopted.push(p);
+      s.rec = rec(p.recipients, p.seq ?? 0);
+    },
     save: async (p: RecipientPin) => {
       s.pin = p;
-      s.rec = p.recipients;
+      s.rec = rec(p.recipients, p.seq ?? 0);
       s.saves.push(p);
     },
     confirmFirst: vi.fn(
@@ -134,7 +151,7 @@ describe("assertPinned", () => {
     const s = store(pin);
     await assertPinned(s, identity, [other]);
     expect(s.confirmFirst).not.toHaveBeenCalled();
-    expect(s.rec).toEqual(pin.recipients);
+    expect(s.rec).toEqual(rec(pin.recipients, 1));
   });
 
   it("F1: record present, pin deleted: refused as removed, never first use", async () => {
@@ -161,7 +178,7 @@ describe("assertPinned", () => {
   });
 
   it("F1: evaluatePin reports a removed pin's difference against the record", async () => {
-    expect(await evaluatePin(undefined, [own, other].sort(), identity, [attacker])).toEqual({
+    expect(await evaluatePin(undefined, rec([own, other].sort()), identity, [attacker])).toEqual({
       status: "removed",
       added: [attacker],
       removed: [other],
@@ -317,5 +334,163 @@ describe("PassphraseKeySource with a pin", () => {
     await ks.getIdentity();
     s.pin = await makePin(identity, []);
     await expect(ks.getRecipients()).rejects.toThrow(RecipientPinError);
+  });
+});
+
+/** A pin as builds before seq made it: the MAC covers the list only. */
+async function legacyPin(id: string, recipients: string[]): Promise<RecipientPin> {
+  const set = await effectiveSet(id, recipients);
+  const raw = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode("halfday-rune recipient pin v1\n" + id.trim())
+  );
+  const key = await crypto.subtle.importKey("raw", raw, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const mac = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(set.join("\n")));
+  return { recipients: set, mac: [...new Uint8Array(mac)].map((b) => b.toString(16).padStart(2, "0")).join("") };
+}
+
+describe("fix round 2: N1 seq", () => {
+  it("seq is covered by the MAC: changing it, or stripping it, breaks verification", async () => {
+    const pin = await makePin(identity, [other], 3);
+    expect(await verifiedPin(pin, identity)).toEqual({ recipients: pin.recipients, seq: 3 });
+    expect(await verifiedPin({ ...pin, seq: 9 }, identity)).toBeNull();
+    const { seq: _drop, ...stripped } = pin;
+    expect(await verifiedPin(stripped, identity)).toBeNull();
+    expect(await verifiedPin({ ...pin, seq: -1 }, identity)).toBeNull();
+    expect(await verifiedPin({ ...pin, seq: 1.5 }, identity)).toBeNull();
+  });
+
+  it("a pin from before seq verifies as seq 0", async () => {
+    const pin = await legacyPin(identity, [other]);
+    expect(await verifiedPin(pin, identity)).toEqual({ recipients: pin.recipients, seq: 0 });
+  });
+
+  it("nextSeq is above both the record and the verified pin; a forged pin's seq is ignored", async () => {
+    expect(await nextSeq(await makePin(identity, [other], 4), rec([own], 2), identity)).toBe(5);
+    expect(await nextSeq(await makePin(identity, [other], 1), rec([own], 7), identity)).toBe(8);
+    expect(await nextSeq(undefined, { kind: "none" }, identity)).toBe(1);
+    const forged = { ...(await makePin(identity, [other], 1)), seq: 1_000_000 };
+    expect(await nextSeq(forged, rec([own], 2), identity)).toBe(3);
+  });
+
+  it("a verified pin newer than the record is adopted, then compared as usual", async () => {
+    const pin = await makePin(identity, [other], 2);
+    expect(await evaluatePin(pin, rec([own, attacker].sort(), 1), identity, [other])).toEqual({
+      status: "ok",
+      adopt: true,
+    });
+    expect(await evaluatePin(pin, rec([own], 1), identity, [other, attacker])).toEqual({
+      status: "changed",
+      added: [attacker],
+      removed: [],
+      adopt: true,
+    });
+  });
+
+  it("an older genuine pin (lower seq than the record) is a rollback: removed", async () => {
+    const old = await makePin(identity, [other, attacker], 2);
+    const s = store(old, true, rec(await effectiveSet(identity, [other]), 3));
+    await expect(assertPinned(s, identity, [other, attacker])).rejects.toThrow(/removed or replaced/);
+    expect(s.adopted).toEqual([]);
+    expect(s.confirmFirst).not.toHaveBeenCalled();
+  });
+
+  it("the same seq with a different set is removed", async () => {
+    const pin = await makePin(identity, [other, attacker], 2);
+    expect((await evaluatePin(pin, rec(await effectiveSet(identity, [other]), 2), identity, [other, attacker])).status).toBe("removed");
+  });
+
+  /** Two devices sharing one synced pin (data.json), each with its own record. */
+  async function twoDevices(initialSet: string[]) {
+    const shared = { pin: (await makePin(identity, initialSet, 1)) as unknown };
+    const device = () => {
+      const s = store(undefined, false, rec(shared.pin ? (shared.pin as RecipientPin).recipients : [], 1));
+      s.get = () => shared.pin;
+      s.save = async (p: RecipientPin) => {
+        shared.pin = p;
+        s.rec = rec(p.recipients, p.seq ?? 0);
+        s.saves.push(p);
+      };
+      return s;
+    };
+    const confirmOn = async (d: ReturnType<typeof device>, recipients: string[]) =>
+      d.save(await makePin(identity, recipients, await nextSeq(shared.pin, d.rec, identity)));
+    return { shared, mac: device(), phone: device(), confirmOn };
+  }
+
+  it("P4a: the Mac narrows the set, the phone gets a fresh copy: accepted, and the phone's record moves on", async () => {
+    const t = await twoDevices([own, other]);
+    await t.confirmOn(t.mac, [own]);
+    await assertPinned(t.phone, identity, [own], "copy");
+    expect(t.phone.rec).toEqual(rec([own], 2));
+  });
+
+  it("P4b: the Mac adds a key, the phone gets the matching copy: accepted; a phone with the old copy is told it lacks a key", async () => {
+    const t = await twoDevices([own]);
+    await t.confirmOn(t.mac, [own, other]);
+    await expect(assertPinned(t.phone, identity, [own], "copy")).rejects.toThrow(pinChangedMessage(0, 1));
+    await assertPinned(t.phone, identity, [own, other], "copy");
+    expect(t.phone.rec).toEqual(rec([own, other].sort(), 2));
+  });
+
+  it("P4c: a confirm on the phone does not flip the Mac (no ping-pong)", async () => {
+    const t = await twoDevices([own, other]);
+    await t.confirmOn(t.mac, [own]);
+    await assertPinned(t.phone, identity, [own], "copy");
+    await t.confirmOn(t.phone, [own]); // the owner confirms again on the phone
+    await assertPinned(t.mac, identity, [own]);
+    await assertPinned(t.phone, identity, [own], "copy");
+    await assertPinned(t.mac, identity, [own]);
+    expect(t.mac.rec).toEqual(rec([own], 3));
+    expect(t.phone.rec).toEqual(rec([own], 3));
+  });
+
+  it("F6/P6: the Mac removes K, the phone still has a copy with K: newer pin adopted, 'older copy' refusal, and K stays new", async () => {
+    const t = await twoDevices([own, other]); // other = K
+    await t.confirmOn(t.mac, [own]);
+    await expect(assertPinned(t.phone, identity, [own, other], "copy")).rejects.toThrow(copyOlderMessage(1));
+    expect(t.phone.rec).toEqual(rec([own], 2));
+    // what Confirm on the phone would see: K added against the newer set, never silently re-added
+    expect(await evaluatePin(t.shared.pin, t.phone.rec, identity, [own, other])).toEqual({
+      status: "changed",
+      added: [other],
+      removed: [],
+    });
+  });
+});
+
+describe("fix round 2: corrupt record", () => {
+  it("parses only a non-empty list of strings with an optional non-negative integer seq", () => {
+    expect(parseDeviceRecord(null).record).toEqual({ kind: "none" });
+    expect(parseDeviceRecord(undefined).record).toEqual({ kind: "none" });
+    expect(parseDeviceRecord({ recipients: null, keyMode: "file" })).toEqual({ record: { kind: "none" }, keyMode: "file" });
+    expect(parseDeviceRecord({ recipients: ["age1b", "age1a"], keyMode: "passphrase" })).toEqual({
+      record: { kind: "ok", recipients: ["age1a", "age1b"], seq: 0 },
+      keyMode: "passphrase",
+    });
+    expect(parseDeviceRecord({ recipients: ["age1a"], seq: 4 }).record).toEqual({ kind: "ok", recipients: ["age1a"], seq: 4 });
+    for (const bad of [
+      "garbage",
+      42,
+      ["age1a"],
+      {},
+      { recipients: [1, 2] },
+      { recipients: "age1a" },
+      { recipients: [] },
+      { recipients: [""] },
+      { recipients: { 0: "age1a" } },
+      { recipients: ["age1a"], seq: -1 },
+      { recipients: ["age1a"], seq: "3" },
+    ]) {
+      expect(parseDeviceRecord(bad).record).toEqual({ kind: "corrupt" });
+    }
+  });
+
+  it("a corrupt record fails closed as removed, never first use", async () => {
+    const s = store(undefined, true, { kind: "corrupt" });
+    await expect(assertPinned(s, identity, [other])).rejects.toThrow(/removed or replaced/);
+    expect(s.confirmFirst).not.toHaveBeenCalled();
+    const s2 = store(await makePin(identity, [other]), true, { kind: "corrupt" });
+    await expect(assertPinned(s2, identity, [other])).rejects.toThrow(/removed or replaced/);
   });
 });
