@@ -982,14 +982,14 @@ describe("fix round 2", () => {
     }
   });
 
-  it("a legacy localStorage record that is not JSON fails closed as removed", async () => {
+  it("a stored record that does not parse (loadLocalStorage throws) fails closed as removed", async () => {
     const identity = await generateIdentity();
     h.fileIdentity = identity;
     h.fileRecipients = [await identityToRecipient(identity)];
     const { p } = await boot(true, { identity });
-    delete p.app.loadLocalStorage;
-    delete p.app.saveLocalStorage;
-    vi.stubGlobal("localStorage", { getItem: () => "{not json", setItem: () => {}, removeItem: () => {} });
+    p.app.loadLocalStorage = () => {
+      throw new SyntaxError("Unexpected token n in JSON");
+    };
     await expect(p.getKeySource().getRecipients()).rejects.toThrow(/removed or replaced/);
     expect(h.confirmSet).not.toHaveBeenCalled();
   });
@@ -1004,22 +1004,25 @@ describe("fix round 2", () => {
     expect((h.confirmSet.mock.calls[0][0] as { own: string }).own).toBe(await identityToRecipient(identity));
   });
 
-  it("N2: on Obsidian without loadLocalStorage, the record is keyed by app.appId (vault name only without one)", async () => {
+  it("N2: the record goes through app.saveLocalStorage only, never raw localStorage", async () => {
+    const identity = await generateIdentity();
+    const own = await identityToRecipient(identity);
+    h.fileIdentity = identity;
+    h.fileRecipients = [own];
+    const { p } = await boot(true, { identity });
+    await p.getKeySource().getRecipients();
+    expect(h.local[RECORD_KEY]).toMatchObject({ recipients: [own] });
+    expect(storageWrites.some((w) => w.startsWith("halfday-rune-pin-record"))).toBe(false);
+  });
+
+  it("without app.loadLocalStorage the record reads as corrupt and fails closed", async () => {
     const identity = await generateIdentity();
     h.fileIdentity = identity;
     h.fileRecipients = [await identityToRecipient(identity)];
     const { p } = await boot(true, { identity });
     delete p.app.loadLocalStorage;
-    delete p.app.saveLocalStorage;
-    p.app.appId = "f00dfeed1234";
-    await p.getKeySource().getRecipients();
-    expect(storageWrites.some((w) => w.startsWith("halfday-rune-pin-record:f00dfeed1234="))).toBe(true);
-    expect(storageWrites.some((w) => w.startsWith("halfday-rune-pin-record:test-vault="))).toBe(false);
-    delete p.app.appId;
-    storageWrites.length = 0;
-    p.settings.recipientPin = undefined;
-    await p.confirmRecipientSet();
-    expect(storageWrites.some((w) => w.startsWith("halfday-rune-pin-record:test-vault="))).toBe(true);
+    await expect(p.getKeySource().getRecipients()).rejects.toThrow(/removed or replaced/);
+    expect(h.confirmSet).not.toHaveBeenCalled();
   });
 
   it("N3: reverted mode plus an editor save that only removes a key shows the modal with the reverted note, never a quiet re-pin", async () => {
