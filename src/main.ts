@@ -674,12 +674,7 @@ export default class HalfdayObsidianRune extends Plugin {
   private localRecord(): { record: DeviceRecord; keyMode: "file" | "passphrase" | null } {
     let raw: unknown = null;
     try {
-      if (typeof this.app.loadLocalStorage === "function") {
-        raw = this.app.loadLocalStorage(PIN_RECORD_KEY);
-      } else {
-        const s = localStorage.getItem(this.legacyRecordKey());
-        raw = s === null ? null : JSON.parse(s);
-      }
+      raw = this.app.loadLocalStorage(PIN_RECORD_KEY);
     } catch {
       return { record: { kind: "corrupt" }, keyMode: null };
     }
@@ -692,19 +687,7 @@ export default class HalfdayObsidianRune extends Plugin {
     keyMode: "file" | "passphrase"
   ): void {
     const data = { recipients, seq, keyMode };
-    if (typeof this.app.loadLocalStorage === "function") {
-      this.app.saveLocalStorage(PIN_RECORD_KEY, data);
-    } else {
-      // Obsidian before 1.8.7: plain localStorage, keyed by this vault's id
-      localStorage.setItem(this.legacyRecordKey(), JSON.stringify(data));
-    }
-  }
-
-  /** Plain-localStorage key: by the vault's app id, or its name when there is none. */
-  private legacyRecordKey(): string {
-    const appId = (this.app as unknown as { appId?: unknown }).appId;
-    const id = typeof appId === "string" && appId !== "" ? appId : this.app.vault.getName();
-    return `${PIN_RECORD_KEY}:${id}`;
+    this.app.saveLocalStorage(PIN_RECORD_KEY, data);
   }
 
   /** Move this device's record forward to a verified, newer pin; key mode kept. */
