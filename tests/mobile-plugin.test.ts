@@ -4,7 +4,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { generateIdentity, identityToRecipient } from "age-encryption";
-import { wrapMobileKey } from "../src/crypto";
+import { decryptToString, encrypt, wrapMobileKey } from "../src/crypto";
 import { recipientsFingerprint, STALE_COPY_WARNING } from "../src/mobile-copy";
 import { checkPin, makePin } from "../src/recipient-pin";
 
@@ -111,7 +111,7 @@ vi.mock("obsidian", () => {
   return {
     get Platform() { return { isDesktopApp: h.desktop, isMobile: !h.desktop }; },
     App: Stub, Modal, Notice, Plugin, PluginSettingTab: Stub, Setting: Stub,
-    TFile: Stub, FileView: Stub, Scope: Stub, WorkspaceLeaf: Stub,
+    TFile: Stub, TFolder: class TFolder {}, FileView: Stub, Scope: Stub, WorkspaceLeaf: Stub,
   };
 });
 
@@ -230,7 +230,7 @@ describe("mobile plugin wiring", () => {
     // the first unlock pinned the recipient set (public keys + MAC): nothing else is added
     expect(Object.keys(JSON.parse(p.saved.at(-1))).sort()).toEqual([
       "autoBackupBeforeRotate", "autoLockMinutes", "backgroundLockGraceSeconds",
-      "desktopKeyMode", "identityPath", "mobileKeyPath", "recipientPin", "recipientsPath",
+      "desktopKeyMode", "identityPath", "journalFolder", "mobileKeyPath", "recipientPin", "recipientsPath",
     ]);
     expect(h.loadCryptoNode).not.toHaveBeenCalled();
   });
@@ -1040,5 +1040,91 @@ describe("fix round 2", () => {
     expect(h.confirmSet).toHaveBeenCalledTimes(1);
     expect((h.confirmSet.mock.calls[0][0] as { note: string }).note).toMatch(/switched back yourself/);
     expect(p.settings.recipientPin).toEqual(pin);
+  });
+});
+
+describe("journal API wiring (gabbro #107)", () => {
+  /** Give the booted plugin an indexed vault: folders plus encrypted files. */
+  async function withVault(p: Record<string, any>, files: Map<string, Uint8Array>, folders: string[]) {
+    const { TFile, TFolder } = (await import("obsidian")) as unknown as {
+      TFile: new () => object;
+      TFolder: new () => object;
+    };
+    const fileObj = (path: string) => Object.assign(Object.create(TFile.prototype), { path });
+    // boot's adapter says every path exists; keep that only for the unlock copy
+    const exists = p.app.vault.adapter.exists;
+    p.app.vault.adapter.exists = async (path: string) =>
+      path === KEY_PATH ? exists(path) : files.has(path);
+    Object.assign(p.app.vault, {
+      getAbstractFileByPath: (path: string) =>
+        files.has(path) ? fileObj(path) : folders.includes(path) ? Object.create(TFolder.prototype) : null,
+      readBinary: async (f: { path: string }) => files.get(f.path)!.slice().buffer,
+      createBinary: async (path: string, data: ArrayBuffer) => {
+        if (files.has(path)) throw new Error("exists");
+        files.set(path, new Uint8Array(data.slice(0)));
+      },
+      modifyBinary: async (f: { path: string }, data: ArrayBuffer) => {
+        files.set(f.path, new Uint8Array(data.slice(0)));
+      },
+    });
+  }
+
+  it("is on the plugin, off by default, and never prompts while locked", async () => {
+    const { p } = await boot(false);
+    const api = p.journalApi;
+    expect(api.apiVersion).toBe(1);
+    expect(p.settings.journalFolder).toBe("");
+    p.settings.journalFolder = "j";
+    const prompt = vi.fn(h.prompt!);
+    h.prompt = prompt;
+    expect(api.isUnlocked()).toBe(false);
+    await expect(api.decrypt("j/a.md.age")).rejects.toMatchObject({ code: "locked" });
+    await expect(api.encrypt("j/a.md.age", "x", { mode: "create" })).rejects.toMatchObject({ code: "locked" });
+    expect(prompt).not.toHaveBeenCalled();
+  });
+
+  it("phone: lock events reach listeners, and a round trip works only while unlocked", async () => {
+    const { p, identity } = await boot(false);
+    const api = p.journalApi;
+    const files = new Map<string, Uint8Array>();
+    await withVault(p, files, ["j"]);
+    p.settings.journalFolder = "j";
+    const seen: boolean[] = [];
+    api.onLockChange((u: boolean) => seen.push(u));
+    await p.getKeySource().getIdentity(); // unlock
+    expect(seen).toEqual([true]);
+    expect(api.isUnlocked()).toBe(true);
+    await api.encrypt("j/a.md.age", "dear diary", { mode: "create" });
+    expect(await decryptToString(identity, files.get("j/a.md.age")!)).toBe("dear diary");
+    expect(await api.decrypt("j/a.md.age")).toBe("dear diary");
+    await p.passphraseSource.lockGracefully();
+    expect(seen).toEqual([true, false]);
+    await expect(api.decrypt("j/a.md.age")).rejects.toMatchObject({ code: "locked" });
+  });
+
+  it("unload: listeners hear locked and every later call refuses", async () => {
+    const { p } = await boot(false);
+    const api = p.journalApi;
+    await withVault(p, new Map(), ["j"]);
+    p.settings.journalFolder = "j";
+    await p.getKeySource().getIdentity();
+    const seen: boolean[] = [];
+    api.onLockChange((u: boolean) => seen.push(u));
+    p.onunload();
+    expect(seen).toEqual([false]);
+    expect(api.isUnlocked()).toBe(false);
+    await expect(api.encrypt("j/a.md.age", "x", { mode: "create" })).rejects.toMatchObject({ code: "locked" });
+  });
+
+  it("desktop: the symlink check is wired and fails closed when it cannot run", async () => {
+    const identity = await generateIdentity();
+    h.fileIdentity = identity;
+    h.fileRecipients = [await identityToRecipient(identity)];
+    const { p } = await boot(true, { identity });
+    const files = new Map([["j/a.md.age", await encrypt(h.fileRecipients, "x")]]);
+    await withVault(p, files, ["j"]);
+    p.settings.journalFolder = "j";
+    // the mocked Node loader has no vaultPathHasSymlink: the check throws
+    await expect(p.journalApi.decrypt("j/a.md.age")).rejects.toMatchObject({ code: "symlink" });
   });
 });

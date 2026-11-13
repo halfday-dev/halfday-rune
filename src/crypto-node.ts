@@ -171,3 +171,29 @@ export function readIdentity(filePath: string): string {
   }
   return line;
 }
+
+/**
+ * Journal API: true when any component of the vault-relative path `rel`
+ * (`/`-separated) under the vault folder `base` is a symbolic link. Only the
+ * last component may be missing (a file about to be created); a missing
+ * folder on the way, or any other error, throws, and the caller treats a
+ * throw as a symlink. The vault folder itself is not checked.
+ */
+export function vaultPathHasSymlink(base: string, rel: string): boolean {
+  if (!base) throw new Error("vault path unknown");
+  const parts = rel.split("/");
+  let cur = base;
+  for (let i = 0; i < parts.length; i++) {
+    cur = path.join(cur, parts[i]);
+    let st: fs.Stats;
+    try {
+      st = fs.lstatSync(cur);
+    } catch (err: unknown) {
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      if (code === "ENOENT" && i === parts.length - 1) return false;
+      throw err;
+    }
+    if (st.isSymbolicLink()) return true;
+  }
+  return false;
+}
