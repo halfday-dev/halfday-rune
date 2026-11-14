@@ -4,7 +4,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { generateIdentity, identityToRecipient } from "age-encryption";
-import { wrapMobileKey } from "../src/crypto";
+import { decryptToString, encrypt, wrapMobileKey } from "../src/crypto";
 import { recipientsFingerprint, STALE_COPY_WARNING } from "../src/mobile-copy";
 import { checkPin, makePin } from "../src/recipient-pin";
 
@@ -30,6 +30,8 @@ const h = vi.hoisted(() => ({
   loadCryptoNode: vi.fn(),
   loadBackup: vi.fn(),
   loadRotateLog: vi.fn(),
+  /** Setting rows the settings tab built (see the Setting mock). */
+  settings: [] as any[],
 }));
 
 vi.mock("../src/node-loader", () => ({
@@ -43,6 +45,9 @@ vi.mock("../src/node-loader", () => ({
         return h.fileIdentity;
       },
       readRecipients: () => [...h.fileRecipients],
+      // the real lstat walk (it only ever sees a scratch dir in these tests)
+      vaultPathHasSymlink: async (base: string, rel: string) =>
+        (await vi.importActual<typeof import("../src/crypto-node")>("../src/crypto-node")).vaultPathHasSymlink(base, rel),
     };
   },
   loadBackup: async () => {
@@ -100,7 +105,9 @@ vi.mock("obsidian", () => {
       });
       return el;
     }
-    registerView() {} registerExtensions() {} registerEvent() {} addSettingTab() {}
+    settingTab: unknown = null;
+    registerView() {} registerExtensions() {} registerEvent() {}
+    addSettingTab(t: unknown) { this.settingTab = t; }
     registerDomEvent(_t: unknown, ev: string, cb: () => void) { this.domListeners[ev] = cb; }
   }
   class Modal {
@@ -108,10 +115,43 @@ vi.mock("obsidian", () => {
     open() { h.onModalOpen?.(this); }
     close() {}
   }
+  /** Records every Setting row the settings tab builds, with its text field. */
+  class Setting {
+    name = ""; desc = ""; text: any = null;
+    constructor(_el: unknown) { h.settings.push(this); }
+    setName(n: string) { this.name = n; return this; }
+    setDesc(d: string) { this.desc = d; return this; }
+    setHeading() { return this; }
+    addText(cb: (t: any) => void) {
+      const t: any = {
+        listeners: {} as Record<string, (e?: unknown) => void>,
+        invalid: false,
+        change: null as null | ((v: string) => void),
+        setPlaceholder: () => t,
+        setValue: (v: string) => { t.inputEl.value = v; return t; },
+        onChange: (f: (v: string) => void) => { t.change = f; return t; },
+      };
+      t.inputEl = {
+        value: "", type: "", min: "",
+        toggleClass: (_c: string, on: boolean) => { t.invalid = on; },
+        addEventListener: (ev: string, f: (e?: unknown) => void) => { t.listeners[ev] = f; },
+      };
+      this.text = t;
+      cb(t);
+      return this;
+    }
+    addButton(cb: (b: any) => void) { const b: any = { setButtonText: () => b, onClick: () => b }; cb(b); return this; }
+    addToggle(cb: (b: any) => void) { const b: any = { setValue: () => b, onChange: () => b }; cb(b); return this; }
+  }
+  class PluginSettingTab {
+    containerEl = { empty() {}, createEl: () => ({}) };
+    constructor(public app: unknown, public plugin: unknown) {}
+    hide() {}
+  }
   return {
     get Platform() { return { isDesktopApp: h.desktop, isMobile: !h.desktop }; },
-    App: Stub, Modal, Notice, Plugin, PluginSettingTab: Stub, Setting: Stub,
-    TFile: Stub, FileView: Stub, Scope: Stub, WorkspaceLeaf: Stub,
+    App: Stub, Modal, Notice, Plugin, PluginSettingTab, Setting,
+    TFile: Stub, TFolder: class TFolder {}, FileView: Stub, Scope: Stub, WorkspaceLeaf: Stub,
   };
 });
 
@@ -182,6 +222,7 @@ beforeEach(() => {
   h.local = {};
   h.onModalOpen = null;
   h.copySubmit = null;
+  h.settings = [];
   h.confirmSet.mockReset();
   h.confirmSet.mockImplementation(async () => true);
   h.loadCryptoNode.mockClear();
@@ -230,7 +271,7 @@ describe("mobile plugin wiring", () => {
     // the first unlock pinned the recipient set (public keys + MAC): nothing else is added
     expect(Object.keys(JSON.parse(p.saved.at(-1))).sort()).toEqual([
       "autoBackupBeforeRotate", "autoLockMinutes", "backgroundLockGraceSeconds",
-      "desktopKeyMode", "identityPath", "mobileKeyPath", "recipientPin", "recipientsPath",
+      "desktopKeyMode", "identityPath", "journalFolder", "mobileKeyPath", "recipientPin", "recipientsPath",
     ]);
     expect(h.loadCryptoNode).not.toHaveBeenCalled();
   });
@@ -1040,5 +1081,256 @@ describe("fix round 2", () => {
     expect(h.confirmSet).toHaveBeenCalledTimes(1);
     expect((h.confirmSet.mock.calls[0][0] as { note: string }).note).toMatch(/switched back yourself/);
     expect(p.settings.recipientPin).toEqual(pin);
+  });
+});
+
+describe("journal API wiring (gabbro #107)", () => {
+  /** Give the booted plugin an indexed vault: folders plus encrypted files. */
+  async function withVault(p: Record<string, any>, files: Map<string, Uint8Array>, folders: string[]) {
+    const { TFile, TFolder } = (await import("obsidian")) as unknown as {
+      TFile: new () => object;
+      TFolder: new () => object;
+    };
+    const fileObj = (path: string) => Object.assign(Object.create(TFile.prototype), { path });
+    // boot's adapter says every path exists; keep that only for the unlock copy
+    const exists = p.app.vault.adapter.exists;
+    p.app.vault.adapter.exists = async (path: string) =>
+      path === KEY_PATH ? exists(path) : files.has(path);
+    Object.assign(p.app.vault, {
+      getAbstractFileByPath: (path: string) =>
+        files.has(path) ? fileObj(path) : folders.includes(path) ? Object.create(TFolder.prototype) : null,
+      readBinary: async (f: { path: string }) => files.get(f.path)!.slice().buffer,
+      createBinary: async (path: string, data: ArrayBuffer) => {
+        if (files.has(path)) throw new Error("exists");
+        files.set(path, new Uint8Array(data.slice(0)));
+      },
+      modifyBinary: async (f: { path: string }, data: ArrayBuffer) => {
+        files.set(f.path, new Uint8Array(data.slice(0)));
+      },
+    });
+  }
+
+  it("is on the plugin, off by default, and never prompts while locked", async () => {
+    const { p } = await boot(false);
+    const api = p.journalApi;
+    expect(api.apiVersion).toBe(1);
+    expect(p.settings.journalFolder).toBe("");
+    p.settings.journalFolder = "j";
+    const prompt = vi.fn(h.prompt!);
+    h.prompt = prompt;
+    expect(api.isUnlocked()).toBe(false);
+    await expect(api.decrypt("j/a.md.age")).rejects.toMatchObject({ code: "locked" });
+    await expect(api.encrypt("j/a.md.age", "x", { mode: "create" })).rejects.toMatchObject({ code: "locked" });
+    expect(prompt).not.toHaveBeenCalled();
+  });
+
+  it("phone: lock events reach listeners, and a round trip works only while unlocked", async () => {
+    const { p, identity } = await boot(false);
+    const api = p.journalApi;
+    const files = new Map<string, Uint8Array>();
+    await withVault(p, files, ["j"]);
+    p.settings.journalFolder = "j";
+    const seen: boolean[] = [];
+    api.onLockChange((u: boolean) => seen.push(u));
+    await p.getKeySource().getIdentity(); // unlock
+    expect(seen).toEqual([true]);
+    expect(api.isUnlocked()).toBe(true);
+    await api.encrypt("j/a.md.age", "dear diary", { mode: "create" });
+    expect(await decryptToString(identity, files.get("j/a.md.age")!)).toBe("dear diary");
+    expect(await api.decrypt("j/a.md.age")).toBe("dear diary");
+    await p.passphraseSource.lockGracefully();
+    expect(seen).toEqual([true, false]);
+    await expect(api.decrypt("j/a.md.age")).rejects.toMatchObject({ code: "locked" });
+  });
+
+  it("unload: listeners hear locked and every later call refuses", async () => {
+    const { p } = await boot(false);
+    const api = p.journalApi;
+    await withVault(p, new Map(), ["j"]);
+    p.settings.journalFolder = "j";
+    await p.getKeySource().getIdentity();
+    const seen: boolean[] = [];
+    api.onLockChange((u: boolean) => seen.push(u));
+    p.onunload();
+    expect(seen).toEqual([false]);
+    expect(api.isUnlocked()).toBe(false);
+    await expect(api.encrypt("j/a.md.age", "x", { mode: "create" })).rejects.toMatchObject({ code: "locked" });
+  });
+
+  it("desktop key file mode (never locks): unload still tells listeners it is locked", async () => {
+    const identity = await generateIdentity();
+    h.fileIdentity = identity;
+    h.fileRecipients = [await identityToRecipient(identity)];
+    const { p } = await boot(true, { identity });
+    const api = p.journalApi;
+    expect(api.isUnlocked()).toBe(true);
+    const seen: boolean[] = [];
+    api.onLockChange((u: boolean) => seen.push(u));
+    p.onunload();
+    expect(seen).toEqual([false]);
+    expect(api.isUnlocked()).toBe(false);
+  });
+
+  /** Desktop key-file plugin with an indexed vault holding j/a.md.age. */
+  async function desktopWithNote() {
+    const identity = await generateIdentity();
+    h.fileIdentity = identity;
+    h.fileRecipients = [await identityToRecipient(identity)];
+    const { p } = await boot(true, { identity });
+    const files = new Map([["j/a.md.age", await encrypt(h.fileRecipients, "x")]]);
+    await withVault(p, files, ["j"]);
+    p.settings.journalFolder = "j";
+    return { p, files };
+  }
+
+  it("F4 desktop: no vault base path (the adapter has none) fails closed", async () => {
+    const { p } = await desktopWithNote();
+    // boot's adapter has neither getBasePath nor basePath: vaultBasePath() is ""
+    await expect(p.journalApi.decrypt("j/a.md.age")).rejects.toMatchObject({ code: "symlink" });
+  });
+
+  it("F4 desktop: the real base path is checked on disk (works, and refuses a symlink)", async () => {
+    const fs = await import("fs");
+    const os = await import("os");
+    const path = await import("path");
+    const { p } = await desktopWithNote();
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "rune-plugin-journal-"));
+    try {
+      fs.mkdirSync(path.join(base, "j"));
+      fs.writeFileSync(path.join(base, "j", "a.md.age"), "x");
+      p.app.vault.adapter.getBasePath = () => base;
+      expect(await p.journalApi.decrypt("j/a.md.age")).toBe("x");
+      fs.rmSync(path.join(base, "j"), { recursive: true });
+      fs.mkdirSync(path.join(base, "elsewhere"));
+      fs.writeFileSync(path.join(base, "elsewhere", "a.md.age"), "x");
+      fs.symlinkSync(path.join(base, "elsewhere"), path.join(base, "j"));
+      await expect(p.journalApi.decrypt("j/a.md.age")).rejects.toMatchObject({ code: "symlink" });
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("F4: unlocked with default settings (no folder) refuses as disabled", async () => {
+    const { p } = await boot(false);
+    await withVault(p, new Map(), ["j"]);
+    await p.getKeySource().getIdentity();
+    expect(p.settings.journalFolder).toBe("");
+    await expect(p.journalApi.decrypt("j/a.md.age")).rejects.toMatchObject({ code: "disabled" });
+    await expect(p.journalApi.encrypt("j/a.md.age", "x", { mode: "create" })).rejects.toMatchObject({ code: "disabled" });
+  });
+
+  it("F4: create on a path that is on disk but not indexed refuses as exists", async () => {
+    const { p } = await boot(false);
+    const files = new Map<string, Uint8Array>();
+    await withVault(p, files, ["j"]);
+    p.app.vault.adapter.exists = async (path: string) => path === KEY_PATH || path === "j/ghost.md.age";
+    p.settings.journalFolder = "j";
+    await p.getKeySource().getIdentity();
+    await expect(p.journalApi.encrypt("j/ghost.md.age", "x", { mode: "create" })).rejects.toMatchObject({ code: "exists" });
+    expect(files.size).toBe(0);
+  });
+
+  it("F4: the mobile unlock file inside the folder is refused", async () => {
+    const { p, view } = await boot(false);
+    void view;
+    await withVault(p, new Map(), ["_rune"]);
+    p.settings.journalFolder = "_rune";
+    await p.getKeySource().getIdentity();
+    await expect(p.journalApi.decrypt(KEY_PATH)).rejects.toMatchObject({ code: "unsupported-type" });
+    await expect(p.journalApi.encrypt("_rune/identity.md.age", "x", { mode: "create" })).resolves.toBeUndefined();
+    p.settings.mobileKeyPath = "_rune/identity.md.age"; // a custom unlock path is excluded too
+    await expect(
+      p.journalApi.encrypt("_rune/identity.md.age", "x", { mode: "replace" })
+    ).rejects.toMatchObject({ code: "unsupported-type" });
+  });
+
+  it("F2a wiring: replace refuses while an open rune view has unsaved edits to that file", async () => {
+    const { p, identity, view } = await boot(false);
+    const files = new Map([["j/a.md.age", await encrypt([await identityToRecipient(identity)], "old")]]);
+    await withVault(p, files, ["j"]);
+    p.settings.journalFolder = "j";
+    await p.getKeySource().getIdentity();
+    (view as any).hasUnsavedEdits = (path: string) => path === "j/a.md.age";
+    await expect(p.journalApi.encrypt("j/a.md.age", "new", { mode: "replace" })).rejects.toMatchObject({
+      code: "open-in-editor",
+    });
+    expect(await decryptToString(identity, files.get("j/a.md.age")!)).toBe("old");
+  });
+
+  it("F4/F8: the settings field saves on Enter / blur only, shows the folder in effect, and the API follows it", async () => {
+    const { p, identity } = await boot(false);
+    const files = new Map([["10_journal/a.md.age", await encrypt([await identityToRecipient(identity)], "dear diary")]]);
+    await withVault(p, files, ["10_journal"]);
+    await p.getKeySource().getIdentity();
+    h.settings = [];
+    p.settingTab.display();
+    const row = h.settings.find((s) => s.name === "Folder gabbro may open");
+    expect(row.desc).toContain("In key-file mode rune is always unlocked.");
+    expect(row.desc).toContain("Now: off.");
+    const t = row.text;
+    const savedBefore = p.saved.length;
+    // typing: validated, never saved
+    for (const partial of ["1", "10_", "10_journal/"]) {
+      t.inputEl.value = partial;
+      t.change(partial);
+    }
+    expect(p.settings.journalFolder).toBe("");
+    expect(p.saved.length).toBe(savedBefore);
+    await expect(p.journalApi.decrypt("10_journal/a.md.age")).rejects.toMatchObject({ code: "disabled" });
+    // Enter commits the normalised folder
+    t.listeners.keydown({ key: "Enter" });
+    await vi.waitFor(() => expect(row.desc).toContain('Now: "10_journal".'));
+    expect(p.settings.journalFolder).toBe("10_journal");
+    expect(p.saved.length).toBe(savedBefore + 1);
+    expect(t.inputEl.value).toBe("10_journal");
+    expect(row.desc).toContain('Now: "10_journal".');
+    expect(await p.journalApi.decrypt("10_journal/a.md.age")).toBe("dear diary");
+    // an invalid value on blur is not saved; the stored folder stays in effect
+    t.inputEl.value = "../10_journal";
+    t.change("../10_journal");
+    expect(t.invalid).toBe(true);
+    t.listeners.blur();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(p.settings.journalFolder).toBe("10_journal");
+    expect(p.saved.length).toBe(savedBefore + 1);
+    // clearing it on blur turns the API off
+    t.inputEl.value = "";
+    t.listeners.blur();
+    await vi.waitFor(() => expect(row.desc).toContain("Now: off."));
+    expect(p.settings.journalFolder).toBe("");
+    await expect(p.journalApi.decrypt("10_journal/a.md.age")).rejects.toMatchObject({ code: "disabled" });
+  });
+
+  it("N4: closing settings (Esc) commits a cleared folder field, turning the API off", async () => {
+    const { p, identity } = await boot(false);
+    const files = new Map([["10_journal/a.md.age", await encrypt([await identityToRecipient(identity)], "dear diary")]]);
+    await withVault(p, files, ["10_journal"]);
+    await p.getKeySource().getIdentity();
+    p.settings.journalFolder = "10_journal";
+    p.settingTab.display();
+    const t = h.settings.find((s) => s.name === "Folder gabbro may open").text;
+    expect(await p.journalApi.decrypt("10_journal/a.md.age")).toBe("dear diary");
+    t.inputEl.value = "";
+    t.change(""); // typed, no blur, no Enter
+    p.settingTab.hide();
+    await vi.waitFor(() => expect(p.settings.journalFolder).toBe(""));
+    await expect(p.journalApi.decrypt("10_journal/a.md.age")).rejects.toMatchObject({ code: "disabled" });
+  });
+
+  it("N1 wiring: the API's remove deletes the vault file through app.vault.delete", async () => {
+    const { p } = await boot(false);
+    const files = new Map([["j/a.md.age", new Uint8Array([1])]]);
+    await withVault(p, files, ["j"]);
+    const deleted: string[] = [];
+    p.app.vault.delete = async (f: { path: string }) => {
+      deleted.push(f.path);
+      files.delete(f.path);
+    };
+    await p.journalVault().remove("j/a.md.age");
+    expect(deleted).toEqual(["j/a.md.age"]);
+    expect(await p.journalVault().kind("j/a.md.age")).toBe("none");
+    // a path that is not an indexed file is never deleted
+    await expect(p.journalVault().remove("j")).rejects.toThrow();
+    expect(deleted).toEqual(["j/a.md.age"]);
   });
 });

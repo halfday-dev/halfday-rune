@@ -74,6 +74,7 @@ import {
   PluginSettingTab,
   Setting,
   TFile,
+  TFolder,
 } from "obsidian";
 import { AgeFileView, VIEW_TYPE_AGE } from "./age-view";
 import type { AgeStatusBarState } from "./age-view";
@@ -112,6 +113,8 @@ import type { RecipientSetPrompt } from "./recipients-modal";
 import { evaluatePin, makePin, nextSeq, ownRecipient, parseDeviceRecord } from "./recipient-pin";
 import type { DeviceRecord, PinCheck, PinStore, RecipientPin } from "./recipient-pin";
 import type { RotateResult } from "./rotate";
+import { JournalApiHost, validateJournalFolder } from "./journal-api";
+import type { JournalApi, JournalVault } from "./journal-api";
 
 interface HalfdayObsidianRuneSettings {
   recipientsPath: string;
@@ -145,6 +148,12 @@ interface HalfdayObsidianRuneSettings {
    * (see recipient-pin). Public keys only. Absent until the first confirm.
    */
   recipientPin?: RecipientPin;
+  /**
+   * "Folder gabbro may open": the one vault folder the journal API (see
+   * journal-api) may decrypt and write in while rune is unlocked. Empty
+   * (the default) turns the API off.
+   */
+  journalFolder: string;
 }
 
 /** Local-storage key of this device's confirmed-set record (see recipient-pin). */
@@ -162,6 +171,7 @@ const DEFAULT_SETTINGS: HalfdayObsidianRuneSettings = {
   autoLockMinutes: 15,
   backgroundLockGraceSeconds: 60,
   desktopKeyMode: "file",
+  journalFolder: "",
 };
 
 export default class HalfdayObsidianRune extends Plugin {
@@ -187,8 +197,28 @@ export default class HalfdayObsidianRune extends Plugin {
   /** Latest state the active AgeFileView has pushed. Held so leaf-changes can re-render. */
   private latestStatusState: AgeStatusBarState | null = null;
 
+  /**
+   * Narrow API for gabbro's Journal tab: decrypt / encrypt notes in the one
+   * folder the owner named, only while rune is unlocked. See journal-api.
+   * Frozen; it holds no reference to the key source.
+   */
+  journalApi: JournalApi | null = null;
+  private journalHost: JournalApiHost | null = null;
+
   async onload(): Promise<void> {
     await this.loadSettings();
+
+    this.journalHost = new JournalApiHost({
+      getKeySource: () => this.getKeySource(),
+      getFolder: () => this.settings.journalFolder,
+      excludedPaths: () => [this.mobileKeyPath()],
+      vault: this.journalVault(),
+      pathHasSymlink: Platform.isDesktopApp
+        ? async (p) => (await loadCryptoNode()).vaultPathHasSymlink(this.vaultBasePath(), p)
+        : null,
+      isOpenDirty: (p) => this.ageViews().some((v) => v.hasUnsavedEdits(p)),
+    });
+    this.journalApi = this.journalHost.api();
 
     if (!this.usesPassphrase()) {
       this.keySource = new FileKeySource(() => this.settings, loadCryptoNode, this.pinStore());
@@ -211,6 +241,7 @@ export default class HalfdayObsidianRune extends Plugin {
         onStateChange: (unlocked) => {
           if (!unlocked) for (const v of this.ageViews()) v.showLocked();
           this.renderLockStatus();
+          this.journalHost?.notifyLockChange(unlocked);
         },
       });
       this.keySource = source;
@@ -394,6 +425,8 @@ export default class HalfdayObsidianRune extends Plugin {
   }
 
   onunload(): void {
+    // first, so journal callers hear "locked" and every later call refuses
+    this.journalHost?.dispose();
     if (this.passphraseSource) this.passphraseSource.dispose();
     this.unlockPrompt?.close();
     this.unlockPrompt = null;
@@ -955,6 +988,43 @@ export default class HalfdayObsidianRune extends Plugin {
     } catch {
       /* identity or recipients unreadable: nothing to compare */
     }
+  }
+
+  /** The vault access the journal API uses: indexed files only, binary writes. */
+  private journalVault(): JournalVault {
+    const fileAt = (p: string): TFile => {
+      const f = this.app.vault.getAbstractFileByPath(p);
+      if (!(f instanceof TFile)) throw new Error("not a file");
+      return f;
+    };
+    return {
+      kind: async (p) => {
+        const f = this.app.vault.getAbstractFileByPath(p);
+        if (f instanceof TFile) return "file";
+        if (f instanceof TFolder) return "folder";
+        if (f) return "other";
+        // not indexed (yet) but on disk: never treat as free to create
+        return (await this.app.vault.adapter.exists(p)) ? "other" : "none";
+      },
+      // async so a non-file path rejects rather than throwing synchronously
+      read: async (p) => this.app.vault.readBinary(fileAt(p)),
+      create: async (p, data) => {
+        await this.app.vault.createBinary(p, data);
+      },
+      replace: async (p, data) => this.app.vault.modifyBinary(fileAt(p), data),
+      remove: async (p) => this.app.vault.delete(fileAt(p)),
+    };
+  }
+
+  /** Desktop: the vault's folder on disk, or "" when the adapter has none. */
+  private vaultBasePath(): string {
+    const adapter = this.app.vault.adapter as unknown as {
+      basePath?: string;
+      getBasePath?: () => string;
+    };
+    return typeof adapter.getBasePath === "function"
+      ? adapter.getBasePath()
+      : adapter.basePath ?? "";
   }
 
   getKeySource(): KeySource {
@@ -1913,9 +1983,23 @@ class RotateSummaryModal extends Modal {
 class HalfdayRuneSettingTab extends PluginSettingTab {
   plugin: HalfdayObsidianRune;
 
+  /** Saves the "Folder gabbro may open" field as typed (set by display()). */
+  private commitJournalFolder: (() => Promise<void>) | null = null;
+
   constructor(app: App, plugin: HalfdayObsidianRune) {
     super(app, plugin);
     this.plugin = plugin;
+  }
+
+  /**
+   * Closing settings (Esc included) commits the folder field too, so a
+   * cleared field can't leave the journal API on.
+   */
+  hide(): void {
+    const commit = this.commitJournalFolder;
+    this.commitJournalFolder = null;
+    if (commit) void commit();
+    super.hide();
   }
 
   display(): void {
@@ -2038,6 +2122,47 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           });
       });
+
+    // Journal API (gabbro's Journal tab). Off until the owner names a folder.
+    // Saved on blur / Enter only (never a half-typed folder); the description
+    // shows the folder that is actually in effect.
+    const journalDesc = (): string => {
+      const stored = validateJournalFolder(this.plugin.settings.journalFolder);
+      const now = stored.ok && stored.folder !== "" ? `"${stored.folder}"` : "off";
+      return (
+        "Vault-relative folder (e.g. 10_journal) whose encrypted notes another plugin may read and " +
+        "write through rune's journal API while rune is unlocked. Empty = off. " +
+        "While unlocked, any plugin in this vault can use it. In key-file mode rune is always unlocked. " +
+        `Now: ${now}. Saved when you press Enter or leave the field.`
+      );
+    };
+    const journalSetting = new Setting(containerEl)
+      .setName("Folder gabbro may open")
+      .setDesc(journalDesc());
+    journalSetting.addText((text) => {
+      text
+        .setPlaceholder("off")
+        .setValue(this.plugin.settings.journalFolder)
+        .onChange((value) => {
+          text.inputEl.toggleClass("halfday-rune-invalid", !validateJournalFolder(value).ok);
+        });
+      const commit = async (): Promise<void> => {
+        const check = validateJournalFolder(text.inputEl.value);
+        text.inputEl.toggleClass("halfday-rune-invalid", !check.ok);
+        if (!check.ok) return; // keep the last valid value
+        if (check.folder !== this.plugin.settings.journalFolder) {
+          this.plugin.settings.journalFolder = check.folder;
+          await this.plugin.saveSettings();
+        }
+        text.setValue(check.folder);
+        journalSetting.setDesc(journalDesc());
+      };
+      this.commitJournalFolder = commit;
+      text.inputEl.addEventListener("blur", () => void commit());
+      text.inputEl.addEventListener("keydown", (e: KeyboardEvent) => {
+        if (e.key === "Enter") void commit();
+      });
+    });
 
     // Mobile lock behaviour. Used by the phone; harmless on desktop.
     const numberSetting = (

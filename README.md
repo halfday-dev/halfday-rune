@@ -73,6 +73,7 @@ Halfday Rune's settings tab has these fields (the first three are desktop-only; 
 - **Identity path** — defaults to `~/.age/vault.identity`.
 - **Auto-backup before rotate** — on by default. Copies every `.age` file to `~/halfday/logs/age-backups/` before running `Rotate vault keys`.
 - **Mobile unlock file**, **Auto-lock after idle**, **Lock after leaving the app** — see below.
+- **Folder gabbro may open** — empty (off) by default. See *Journal API* below.
 
 There's also an inline "Recipients (file content)" editor — paste your `age1...` lines, save, and the plugin writes them to disk verbatim (preserving comments and ordering). Save validates the whole file before writing; malformed input refuses to save with the offending line called out inline.
 
@@ -108,6 +109,19 @@ The unlock file in your vault is useless without its passphrase, but anyone hold
 3. **Remove rune from the lost device's sync** if you can (sign the device out of Obsidian Sync / iCloud), and delete any stale copies of the old `_rune/identity.age`.
 
 Rotation does not reach old copies: earlier synced versions of your notes and any backups are still encrypted to the old key, so they stay readable with the old key even after a rotation.
+
+### Journal API (for gabbro)
+
+Rune can let one other plugin, gabbro's Journal tab, read and edit your encrypted journal while rune is unlocked. It is **off** until you name a folder in **Folder gabbro may open** (a vault-relative folder such as `10_journal`; empty = off).
+
+The API is `plugin.journalApi` on the rune plugin instance (`apiVersion: 1`):
+- `isUnlocked()` and `onLockChange(cb)` (returns an unsubscribe function; fires on unlock, lock, auto-lock and when rune unloads).
+- `decrypt(path)` returns the text of a `.md.age` (or `.age`) note.
+- `encrypt(path, text, { mode })` writes `text` encrypted to a `.md.age` path. `mode: "create"` fails if the file exists; `"replace"` fails if it doesn't, or if your unlocked key can't open the file that is there.
+
+Every call refuses (with a `JournalApiError` whose `code` says why, and no partial effect) when rune is locked, the folder is not set, or the path is not strictly inside that folder: `..`, `.`, empty segments, a leading `/`, backslashes, a different case of the folder name, a path through a symlink (desktop), anything that isn't `.md.age` / `.age`, and the mobile unlock file are all refused. It never asks for your passphrase; a call made while locked just fails. `encrypt` uses the same confirmed recipient set and the same refusals as a normal rune save, checks the encrypted text decrypts back in memory before writing, then reads the file back and checks it holds exactly what it wrote. It only ever undoes its own write: if the file now holds anything else (another device synced an entry there, or the write was damaged) it touches nothing and reports `conflict`. If the file holds its own bytes but they don't decrypt back, it puts the previous file back (or removes the new one) and reports `verify-failed`; if that undo fails, or the file can't be read back at all, it reports `restore-failed`, meaning the entry on disk may be damaged. `encrypt` with `"replace"` refuses with `open-in-editor` while the note is open in rune with unsaved edits. A note open in rune with no unsaved edits reloads when gabbro writes it. A rune save never overwrites a version another writer saved after you opened the note: your edits go to an encrypted copy beside it, `<name> (conflict YYYY-MM-DD HHMMSS).md.age`, and a notice names the copy. This also happens when the save is the one rune makes before locking or closing the note, so the text is on disk even if you never see the notice. API calls don't count as activity, so they never keep rune from auto-locking. Nothing decrypted is written to disk or logged, and errors never carry your text or your key. The API does not expose your key, your passphrase, or a way to decrypt files outside the folder.
+
+**Exposure, stated plainly.** While rune is unlocked, any plugin in this vault can call this API, not just gabbro. That is the same exposure rune's open notes already have: any plugin running in Obsidian can already reach rune's internals (and its settings), so the folder limit stops mistakes and an honest caller straying, not a hostile plugin. In key file mode on desktop rune never locks, so the API answers whenever Obsidian is open and the folder is set. Leave the folder empty if you don't use gabbro's Journal tab.
 
 ### Usage
 
