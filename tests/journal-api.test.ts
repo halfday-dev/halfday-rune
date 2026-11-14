@@ -193,6 +193,17 @@ describe("locked", () => {
     expect(snapshot(t.files)).toBe(before);
   });
 
+  it("a lock before the key is needed never asks the key source", async () => {
+    const t = await setup({ existing: { [DAY]: TEXT } });
+    const read = t.vault.read.getMockImplementation()!;
+    t.vault.read.mockImplementationOnce(async (p: string) => {
+      t.lockNow(); // locks between the start of the call and the decrypt
+      return read(p);
+    });
+    expect(await code(t.api.decrypt(DAY))).toBe("locked");
+    expect(t.keys.getIdentity).not.toHaveBeenCalled();
+  });
+
   it("isUnlocked follows the key source", async () => {
     const t = await setup();
     expect(t.api.isUnlocked()).toBe(true);
@@ -252,6 +263,10 @@ describe("paths", () => {
       expect(await code(t.api.encrypt(p, TEXT, { mode: "replace" })), p).toBe("outside-folder");
     }
     expect(t.vault.read).not.toHaveBeenCalled();
+  });
+
+  it("checkJournalPath refuses everything when the folder is empty", () => {
+    expect(() => checkJournalPath(DAY, "", [".md.age"], [])).toThrow(/off/);
   });
 
   it("the folder itself is not a file inside it", () => {
@@ -335,6 +350,30 @@ describe("encrypt modes and refusals", () => {
     expect(await code(t.api.encrypt(DAY, TEXT, { mode: "replace" }))).toBe("missing");
     expect(t.files.size).toBe(0);
     expect(t.vault.replace).not.toHaveBeenCalled();
+    expect(t.vault.read).not.toHaveBeenCalled();
+    expect(t.keys.getRecipients).not.toHaveBeenCalled();
+  });
+
+  it("an in-memory round trip failure writes nothing", async () => {
+    const stranger = await identityToRecipient(await generateIdentity());
+    const t = await setup();
+    t.keys.getRecipients.mockResolvedValueOnce([stranger]); // our key could not read it back
+    expect(await code(t.api.encrypt(DAY, TEXT, { mode: "create" }))).toBe("encrypt-failed");
+    expect(t.vault.create).not.toHaveBeenCalled();
+    expect(t.files.size).toBe(0);
+  });
+
+  it("an unexpected key source error is not passed on", async () => {
+    const t = await setup();
+    t.keys.getRecipients.mockRejectedValueOnce(new Error("AGE-SECRET-KEY-1LEAKED"));
+    let msg = "";
+    try {
+      await t.api.encrypt(DAY, TEXT, { mode: "create" });
+    } catch (e) {
+      msg = (e as Error).message;
+      expect((e as JournalApiError).code).toBe("refused");
+    }
+    expect(msg).not.toContain("AGE-SECRET-KEY");
   });
 
   it("create refuses when the parent folder is missing", async () => {
@@ -494,6 +533,9 @@ describe("lock events", () => {
     expect(t.api.isUnlocked()).toBe(false);
     expect(await code(t.api.decrypt(DAY))).toBe("locked");
     expect(await code(t.api.encrypt(DAY, TEXT, { mode: "replace" }))).toBe("locked");
+    // refused up front, even though the key source itself still says unlocked
+    expect(t.vault.read).not.toHaveBeenCalled();
+    expect(t.vault.kind).not.toHaveBeenCalled();
   });
 });
 

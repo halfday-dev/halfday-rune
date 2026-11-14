@@ -1116,6 +1116,20 @@ describe("journal API wiring (gabbro #107)", () => {
     await expect(api.encrypt("j/a.md.age", "x", { mode: "create" })).rejects.toMatchObject({ code: "locked" });
   });
 
+  it("desktop key file mode (never locks): unload still tells listeners it is locked", async () => {
+    const identity = await generateIdentity();
+    h.fileIdentity = identity;
+    h.fileRecipients = [await identityToRecipient(identity)];
+    const { p } = await boot(true, { identity });
+    const api = p.journalApi;
+    expect(api.isUnlocked()).toBe(true);
+    const seen: boolean[] = [];
+    api.onLockChange((u: boolean) => seen.push(u));
+    p.onunload();
+    expect(seen).toEqual([false]);
+    expect(api.isUnlocked()).toBe(false);
+  });
+
   it("desktop: the symlink check is wired and fails closed when it cannot run", async () => {
     const identity = await generateIdentity();
     h.fileIdentity = identity;
