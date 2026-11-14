@@ -6,7 +6,9 @@ Open a `.age` file in your vault and Halfday Rune decrypts it in memory, mounts 
 
 > 🌐 **[halfday.dev/products/rune](https://halfday.dev/products/rune)** — full product page, screenshots, and the launch story.
 
-Status: pre-release. The plugin is in active development by [halfday](https://halfday.dev). v0.7 will submit it to the Obsidian Community Plugins catalog.
+**Available in Obsidian's Community Plugins catalog.** Works on desktop and iPhone/iPad. Install from **Settings → Community plugins → Browse → "Halfday Rune"**.
+
+Free and open source, never paywalled. If Rune keeps your vault private, you can [buy us a coffee](https://buymeacoffee.com/halfday) (see [Support](#support)).
 
 ## Why Rune
 
@@ -35,15 +37,16 @@ Full case in the launch post: [Using Obsidian Securely in the AI Era](https://ha
 
 ## Install
 
-### Manual (today — pre-community-catalog)
+### Community catalog (recommended)
 
-1. Download `manifest.json`, `main.js`, and `styles.css` from the latest [release](https://github.com/halfday-dev/halfday-obsidian-rune/releases) (TBD: link will go live with the v0.7 submission).
+1. Open **Settings → Community plugins**. If you've never used one, click **"Turn on community plugins"** first.
+2. Click **Browse**, search for **Halfday Rune**, then **Install** and **Enable**.
+
+### Manual
+
+1. Download `manifest.json`, `main.js`, and `styles.css` from the [latest release](https://github.com/halfday-dev/halfday-rune/releases/latest).
 2. Copy them into `<your-vault>/.obsidian/plugins/halfday-rune/`.
-3. Enable the plugin in **Settings → Community plugins**. (You'll need **Settings → Community plugins → "Turn on community plugins"** if you've never enabled one before.)
-
-### Community catalog (post-v0.7)
-
-Once submitted and approved, install via **Settings → Community plugins → Browse → Halfday Obsidian Rune**.
+3. Enable the plugin in **Settings → Community plugins**.
 
 ---
 
@@ -203,8 +206,6 @@ npm run dev        # watch-mode build into the plugin folder
 npm test           # vitest run
 npx tsc --noEmit   # type-check
 ```
-
-The plugin design plan and milestone history live in the [vault_plugin_v0_plan](https://github.com/halfday-dev/halfday-obsidian-rune/wiki/vault_plugin_v0_plan) document (link TBD).
 
 ---
 
