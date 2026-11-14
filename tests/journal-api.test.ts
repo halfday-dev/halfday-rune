@@ -866,6 +866,14 @@ describe("fix round 2", () => {
     expect(t.vault.replace).toHaveBeenCalledTimes(1);
   });
 
+  it("N1: success needs our exact bytes, not just the same text (another writer's identical entry is a conflict)", async () => {
+    const t = await setup();
+    const sameTextTheirs = await encrypt(t.recipients, TEXT); // different ciphertext, same plaintext
+    t.hooks.afterWrite = (p) => t.files.set(p, sameTextTheirs);
+    expect(await code(t.api.encrypt(DAY, TEXT, { mode: "create" }))).toBe("conflict");
+    expect(t.files.get(DAY)).toBe(sameTextTheirs);
+  });
+
   it("N1: an unreadable file after the write touches nothing: restore-failed", async () => {
     const t = await setup({ existing: { [DAY]: "old" } });
     t.hooks.afterWrite = (p) => t.files.delete(p);
