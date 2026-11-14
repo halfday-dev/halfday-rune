@@ -7,8 +7,26 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { generateIdentity, identityToRecipient } from "age-encryption";
-import { encrypt, decryptToString } from "../src/crypto";
-import { KeyLockedError } from "../src/keysource";
+
+/** Set to make the API's crypto calls throw a given error (F3 leak tests). */
+const cryptoFail = vi.hoisted(() => ({ decrypt: null as Error | null, encrypt: null as Error | null }));
+vi.mock("../src/crypto", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../src/crypto")>();
+  return {
+    ...real,
+    decryptToString: async (...a: Parameters<typeof real.decryptToString>) => {
+      if (cryptoFail.decrypt) throw cryptoFail.decrypt;
+      return real.decryptToString(...a);
+    },
+    encrypt: async (...a: Parameters<typeof real.encrypt>) => {
+      if (cryptoFail.encrypt) throw cryptoFail.encrypt;
+      return real.encrypt(...a);
+    },
+  };
+});
+
+import { encrypt, decryptToString, wrapMobileKey } from "../src/crypto";
+import { KeyLockedError, PassphraseKeySource } from "../src/keysource";
 import type { KeySource } from "../src/keysource";
 import { RecipientPinError } from "../src/recipient-pin";
 import {
@@ -34,9 +52,13 @@ async function setup(
     symlinked?: string[];
     symlinkCheck?: "fake" | "throws" | "none";
     existing?: Record<string, string>;
+    /** Use this identity (e.g. the one inside a real PassphraseKeySource). */
+    identity?: string;
+    /** Use this key source instead of the fake. */
+    keySource?: KeySource;
   } = {}
 ) {
-  const identity = await generateIdentity();
+  const identity = opts.identity ?? (await generateIdentity());
   const own = await identityToRecipient(identity);
   const recipients = [own, ...(opts.others ?? [])];
   const state = { unlocked: opts.unlocked ?? true, folder: opts.folder ?? FOLDER };
@@ -45,15 +67,27 @@ async function setup(
   for (const [p, t] of Object.entries(opts.existing ?? {})) {
     files.set(p, await encrypt(recipients, t));
   }
-  const keys: KeySource & { getIdentity: ReturnType<typeof vi.fn>; getRecipients: ReturnType<typeof vi.fn> } = {
+  const keys: KeySource & {
+    getIdentity: ReturnType<typeof vi.fn>;
+    getRecipients: ReturnType<typeof vi.fn>;
+    peekIdentity: ReturnType<typeof vi.fn>;
+    peekRecipients: ReturnType<typeof vi.fn>;
+  } = {
     fixedRecipientList: opts.fixedRecipientList ?? false,
     isUnlocked: () => state.unlocked,
     lock() {},
+    // the prompting, idle-resetting getters: the API must never use them
     getIdentity: vi.fn(async () => {
+      throw new Error("getIdentity must not be called by the journal API");
+    }),
+    getRecipients: vi.fn(async () => {
+      throw new Error("getRecipients must not be called by the journal API");
+    }),
+    peekIdentity: vi.fn(async () => {
       if (!state.unlocked) throw new KeyLockedError();
       return identity;
     }),
-    getRecipients: vi.fn(async () => {
+    peekRecipients: vi.fn(async () => {
       if (!state.unlocked) throw new KeyLockedError();
       return [...recipients];
     }),
@@ -62,7 +96,14 @@ async function setup(
     /** Mutates bytes on their way to disk (simulates a bad write). */
     corruptWrite: false,
     failWrite: false,
+    /** Every write after the first fails (the restore / cleanup). */
+    failAfterFirstWrite: false,
+    failRemove: false,
+    openDirty: new Set<string>(),
+    /** When set, create waits for it before writing. */
+    createGate: null as Promise<void> | null,
   };
+  let writes = 0;
   const vault = {
     kind: vi.fn(async (p: string) =>
       files.has(p) ? ("file" as const) : folders.has(p) ? ("folder" as const) : ("none" as const)
@@ -76,6 +117,7 @@ async function setup(
       if (hooks.failWrite) throw new Error("disk full");
       // let a concurrent caller run between the check and the write
       await new Promise((r) => setTimeout(r, 5));
+      if (hooks.createGate) await hooks.createGate;
       if (files.has(p)) throw new Error("File already exists.");
       files.set(p, write(data));
     }),
@@ -84,8 +126,13 @@ async function setup(
       if (!files.has(p)) throw new Error("not a file");
       files.set(p, write(data));
     }),
+    remove: vi.fn(async (p: string) => {
+      if (hooks.failRemove) throw new Error("EPERM");
+      files.delete(p);
+    }),
   } satisfies JournalVault;
   const write = (data: ArrayBuffer): Uint8Array => {
+    if (hooks.failAfterFirstWrite && writes++ > 0) throw new Error("disk full");
     const b = new Uint8Array(data.slice(0));
     if (hooks.corruptWrite) {
       b[b.length - 1] ^= 0xff;
@@ -99,11 +146,12 @@ async function setup(
     return [...symlinked].some((s) => p === s || p.startsWith(`${s}/`));
   });
   const host = new JournalApiHost({
-    getKeySource: () => keys,
+    getKeySource: () => opts.keySource ?? keys,
     getFolder: () => state.folder,
     excludedPaths: () => ["_rune/identity.age", `${FOLDER}/identity.age`],
     vault,
     pathHasSymlink: opts.symlinkCheck === "none" ? null : symlinkCheck,
+    isOpenDirty: (p) => hooks.openDirty.has(p),
   });
   const api = host.api();
   const lockNow = () => {
@@ -126,7 +174,36 @@ async function code(p: Promise<unknown>): Promise<JournalApiErrorCode | "resolve
 const snapshot = (files: Map<string, Uint8Array>) =>
   JSON.stringify([...files].map(([k, v]) => [k, Buffer.from(v).toString("base64")]));
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+  cryptoFail.decrypt = null;
+  cryptoFail.encrypt = null;
+});
+
+const PW = "a long random passphrase for tests 4821";
+
+/** A real passphrase source, unlocked, with a prompt spy. Test key only. */
+async function realSource(opts: { autoLockMinutes?: number; now?: () => number } = {}) {
+  const identity = await generateIdentity();
+  const wrapped = await wrapMobileKey(identity, [], PW, 16);
+  const prompt = vi.fn(async (attempt: (pw: string) => Promise<void>) => (await attempt(PW), true));
+  const hostRef: { host: JournalApiHost | null } = { host: null };
+  const source = new PassphraseKeySource({
+    adapter: { exists: async () => true, readBinary: async () => wrapped.slice().buffer as ArrayBuffer },
+    getSettings: () => ({
+      mobileKeyPath: "_rune/identity.age",
+      autoLockMinutes: opts.autoLockMinutes ?? 15,
+      backgroundLockGraceSeconds: 60,
+    }),
+    prompt,
+    onStateChange: (u) => hostRef.host?.notifyLockChange(u),
+    now: opts.now,
+  });
+  await source.getIdentity(); // the owner unlocks once
+  expect(prompt).toHaveBeenCalledTimes(1);
+  return { identity, source, prompt, hostRef };
+}
 
 describe("round trip", () => {
   it("create then decrypt gives the same text; the file on disk is ciphertext", async () => {
@@ -166,15 +243,15 @@ describe("locked", () => {
     expect(await code(t.api.encrypt(DAY, TEXT, { mode: "replace" }))).toBe("locked");
     expect(await code(t.api.encrypt(`${FOLDER}/new.md.age`, TEXT, { mode: "create" }))).toBe("locked");
     // getIdentity on a passphrase source would open the unlock prompt
-    expect(t.keys.getIdentity).not.toHaveBeenCalled();
-    expect(t.keys.getRecipients).not.toHaveBeenCalled();
+    expect(t.keys.peekIdentity).not.toHaveBeenCalled();
+    expect(t.keys.peekRecipients).not.toHaveBeenCalled();
     expect(t.vault.read).not.toHaveBeenCalled();
     expect(snapshot(t.files)).toBe(before);
   });
 
   it("a lock while decrypting discards the plaintext", async () => {
     const t = await setup({ existing: { [DAY]: TEXT } });
-    t.keys.getIdentity.mockImplementationOnce(async () => {
+    t.keys.peekIdentity.mockImplementationOnce(async () => {
       t.lockNow(); // auto-lock fires mid-call
       return t.identity;
     });
@@ -184,7 +261,7 @@ describe("locked", () => {
   it("a lock while encrypting writes nothing", async () => {
     const t = await setup({ existing: { [DAY]: "old" } });
     const before = snapshot(t.files);
-    t.keys.getIdentity.mockImplementationOnce(async () => {
+    t.keys.peekIdentity.mockImplementationOnce(async () => {
       t.lockNow();
       return t.identity;
     });
@@ -201,7 +278,7 @@ describe("locked", () => {
       return read(p);
     });
     expect(await code(t.api.decrypt(DAY))).toBe("locked");
-    expect(t.keys.getIdentity).not.toHaveBeenCalled();
+    expect(t.keys.peekIdentity).not.toHaveBeenCalled();
   });
 
   it("isUnlocked follows the key source", async () => {
@@ -351,13 +428,13 @@ describe("encrypt modes and refusals", () => {
     expect(t.files.size).toBe(0);
     expect(t.vault.replace).not.toHaveBeenCalled();
     expect(t.vault.read).not.toHaveBeenCalled();
-    expect(t.keys.getRecipients).not.toHaveBeenCalled();
+    expect(t.keys.peekRecipients).not.toHaveBeenCalled();
   });
 
   it("an in-memory round trip failure writes nothing", async () => {
     const stranger = await identityToRecipient(await generateIdentity());
     const t = await setup();
-    t.keys.getRecipients.mockResolvedValueOnce([stranger]); // our key could not read it back
+    t.keys.peekRecipients.mockResolvedValueOnce([stranger]); // our key could not read it back
     expect(await code(t.api.encrypt(DAY, TEXT, { mode: "create" }))).toBe("encrypt-failed");
     expect(t.vault.create).not.toHaveBeenCalled();
     expect(t.files.size).toBe(0);
@@ -365,7 +442,7 @@ describe("encrypt modes and refusals", () => {
 
   it("an unexpected key source error is not passed on", async () => {
     const t = await setup();
-    t.keys.getRecipients.mockRejectedValueOnce(new Error("AGE-SECRET-KEY-1LEAKED"));
+    t.keys.peekRecipients.mockRejectedValueOnce(new Error("AGE-SECRET-KEY-1LEAKED"));
     let msg = "";
     try {
       await t.api.encrypt(DAY, TEXT, { mode: "create" });
@@ -398,7 +475,7 @@ describe("encrypt modes and refusals", () => {
   it("a recipient-pin refusal writes nothing and keeps rune's message", async () => {
     const t = await setup({ existing: { [DAY]: "old" } });
     const before = snapshot(t.files);
-    t.keys.getRecipients.mockRejectedValueOnce(new RecipientPinError("Halfday Rune: recipients differ (+1 added)"));
+    t.keys.peekRecipients.mockRejectedValueOnce(new RecipientPinError("Halfday Rune: recipients differ (+1 added)"));
     let err: unknown;
     try {
       await t.api.encrypt(DAY, TEXT, { mode: "replace" });
@@ -536,6 +613,168 @@ describe("lock events", () => {
     // refused up front, even though the key source itself still says unlocked
     expect(t.vault.read).not.toHaveBeenCalled();
     expect(t.vault.kind).not.toHaveBeenCalled();
+  });
+});
+
+describe("fix round 1", () => {
+  it("F1: API calls never reset the idle auto-lock (real PassphraseKeySource, fake timers)", async () => {
+    const r = await realSource({ autoLockMinutes: 1 });
+    const t = await setup({ identity: r.identity, keySource: r.source, existing: { [DAY]: TEXT } });
+    r.hostRef.host = t.host;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    // the owner uses rune once more under fake time: this arms the 1-minute idle timer
+    await r.source.getIdentity();
+    const seen: boolean[] = [];
+    t.api.onLockChange((u) => seen.push(u));
+    for (let i = 0; i < 2; i++) {
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(await t.api.decrypt(DAY)).toBe(TEXT);
+      await t.api.encrypt(DAY, TEXT, { mode: "replace" });
+    }
+    expect(r.source.isUnlocked()).toBe(true); // 40 s
+    await vi.advanceTimersByTimeAsync(20_000); // 60 s after the owner's last use
+    expect(r.source.isUnlocked()).toBe(false);
+    expect(seen).toEqual([false]);
+    expect(await code(t.api.decrypt(DAY))).toBe("locked");
+    expect(r.prompt).toHaveBeenCalledTimes(1); // only the owner's unlock, none from the API
+  });
+
+  it("F2a: replace refuses while the file is open with unsaved edits, before touching the key", async () => {
+    const t = await setup({ existing: { [DAY]: "old" } });
+    const before = snapshot(t.files);
+    t.hooks.openDirty.add(DAY);
+    expect(await code(t.api.encrypt(DAY, TEXT, { mode: "replace" }))).toBe("open-in-editor");
+    expect(t.keys.peekRecipients).not.toHaveBeenCalled();
+    expect(snapshot(t.files)).toBe(before);
+    // other files are unaffected
+    await t.api.encrypt(`${FOLDER}/other.md.age`, TEXT, { mode: "create" });
+  });
+
+  it("F2a: the owner starting to edit mid-call stops the write", async () => {
+    const t = await setup({ existing: { [DAY]: "old" } });
+    const before = snapshot(t.files);
+    t.keys.peekRecipients.mockImplementationOnce(async () => {
+      t.hooks.openDirty.add(DAY);
+      return [...t.recipients];
+    });
+    expect(await code(t.api.encrypt(DAY, TEXT, { mode: "replace" }))).toBe("open-in-editor");
+    expect(t.vault.replace).not.toHaveBeenCalled();
+    expect(snapshot(t.files)).toBe(before);
+  });
+
+  it("F3: crypto and key errors never leak plaintext or the identity", async () => {
+    const t = await setup({ existing: { [DAY]: TEXT } });
+    const poison = () => new Error(`underlying: ${TEXT} ${t.identity}`);
+    const caught: { code: string; text: string }[] = [];
+    const grab = async (p: Promise<unknown>) => {
+      try {
+        await p;
+        caught.push({ code: "resolved", text: "" });
+      } catch (e) {
+        caught.push({ code: (e as JournalApiError).code, text: `${(e as Error).message}\n${(e as Error).stack}` });
+      }
+    };
+    cryptoFail.decrypt = poison();
+    await grab(t.api.decrypt(DAY));
+    cryptoFail.decrypt = null;
+    cryptoFail.encrypt = poison();
+    await grab(t.api.encrypt(DAY, TEXT, { mode: "replace" }));
+    cryptoFail.encrypt = null;
+    t.keys.peekIdentity.mockRejectedValueOnce(poison());
+    await grab(t.api.decrypt(DAY));
+    expect(caught.map((c) => c.code)).toEqual(["decrypt-failed", "encrypt-failed", "locked"]);
+    for (const c of caught) {
+      expect(c.text).not.toContain("secret journal words");
+      expect(c.text).not.toContain(t.identity);
+      expect(c.text).not.toContain("AGE-SECRET-KEY");
+      expect(c.text).not.toContain("underlying");
+    }
+  });
+
+  it("F5: lock then re-unlock mid-call is refused by the lock generation", async () => {
+    const t = await setup({ existing: { [DAY]: TEXT } });
+    const read = t.vault.read.getMockImplementation()!;
+    t.vault.read.mockImplementationOnce(async (p: string) => {
+      t.lockNow();
+      t.state.unlocked = true; // unlocked again before the call goes on
+      t.host.notifyLockChange(true);
+      return read(p);
+    });
+    expect(await code(t.api.decrypt(DAY))).toBe("locked");
+    expect(t.api.isUnlocked()).toBe(true);
+    expect(t.keys.peekIdentity).not.toHaveBeenCalled();
+  });
+
+  it("F5: a lock while an encrypt is queued never prompts (real PassphraseKeySource)", async () => {
+    const r = await realSource();
+    const t = await setup({ identity: r.identity, keySource: r.source });
+    r.hostRef.host = t.host;
+    let release!: () => void;
+    t.hooks.createGate = new Promise<void>((res) => (release = res));
+    const p = `${FOLDER}/frag.md.age`;
+    const a = t.api.encrypt(p, "first", { mode: "create" });
+    const b = t.api.encrypt(p, "second", { mode: "replace" }); // queued behind a
+    await vi.waitFor(() => expect(t.vault.create).toHaveBeenCalled());
+    await r.source.lockGracefully();
+    release();
+    await a; // its bytes were already on their way to disk
+    expect(await code(b)).toBe("locked");
+    expect(r.prompt).toHaveBeenCalledTimes(1); // only the owner's own unlock
+    expect(r.source.isUnlocked()).toBe(false);
+  });
+
+  it("F6: clearing or narrowing the folder stops a queued write", async () => {
+    for (const change of ["", "other"]) {
+      const t = await setup();
+      let release!: () => void;
+      t.hooks.createGate = new Promise<void>((res) => (release = res));
+      const a = t.api.encrypt(`${FOLDER}/x.md.age`, "first", { mode: "create" });
+      const b = t.api.encrypt(`${FOLDER}/x.md.age`, "second", { mode: "replace" });
+      await vi.waitFor(() => expect(t.vault.create).toHaveBeenCalled());
+      t.state.folder = change;
+      release();
+      await a;
+      expect(await code(b), change).toBe(change === "" ? "disabled" : "outside-folder");
+      expect(t.keys.peekRecipients).toHaveBeenCalledTimes(1); // b refused before touching the key
+      expect(t.vault.replace).not.toHaveBeenCalled();
+    }
+  });
+
+  it("F6: a folder change during the encrypt stops the write", async () => {
+    const t = await setup({ existing: { [DAY]: "old" } });
+    const before = snapshot(t.files);
+    t.keys.peekRecipients.mockImplementationOnce(async () => {
+      t.state.folder = "";
+      return [...t.recipients];
+    });
+    expect(await code(t.api.encrypt(DAY, TEXT, { mode: "replace" }))).toBe("disabled");
+    expect(t.vault.replace).not.toHaveBeenCalled();
+    expect(snapshot(t.files)).toBe(before);
+  });
+
+  it("F7: a create that fails its read-back is removed", async () => {
+    const t = await setup();
+    t.hooks.corruptWrite = true;
+    expect(await code(t.api.encrypt(DAY, TEXT, { mode: "create" }))).toBe("verify-failed");
+    expect(t.files.has(DAY)).toBe(false);
+    expect(t.vault.remove).toHaveBeenCalledWith(DAY);
+    // and a retry can create it
+    await t.api.encrypt(DAY, TEXT, { mode: "create" });
+    expect(await t.api.decrypt(DAY)).toBe(TEXT);
+  });
+
+  it("F7: create read-back fails and the removal fails too: restore-failed", async () => {
+    const t = await setup();
+    t.hooks.corruptWrite = true;
+    t.hooks.failRemove = true;
+    expect(await code(t.api.encrypt(DAY, TEXT, { mode: "create" }))).toBe("restore-failed");
+  });
+
+  it("F7: replace read-back fails and the restore fails too: restore-failed", async () => {
+    const t = await setup({ existing: { [DAY]: "old" } });
+    t.hooks.corruptWrite = true;
+    t.hooks.failAfterFirstWrite = true;
+    expect(await code(t.api.encrypt(DAY, TEXT, { mode: "replace" }))).toBe("restore-failed");
   });
 });
 

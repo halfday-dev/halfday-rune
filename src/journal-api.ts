@@ -16,7 +16,12 @@
  *   - encrypt() uses the key source's pinned recipients and the same
  *     refusals as a normal rune save, round-trip-verifies in memory before
  *     writing, then reads the file back and verifies it decrypts to the same
- *     text. A failed read-back restores the previous ciphertext.
+ *     text. A failed read-back puts the previous ciphertext back (replace)
+ *     or removes the new file (create); if that fails too: "restore-failed".
+ *   - The key is read with peekIdentity()/peekRecipients(): API calls never
+ *     reset rune's idle auto-lock.
+ *   - replace refuses while the file is open with unsaved edits in a rune
+ *     editor, and the folder is re-checked just before the write.
  *   - Nothing plaintext is written to disk, logged or put in an error. The
  *     identity, passphrase and a decrypt-anything function are never exposed.
  *
@@ -62,8 +67,16 @@ export type JournalApiErrorCode =
   | "encrypt-failed"
   /** The vault write failed. */
   | "write-failed"
-  /** The written file did not read back as the same text. */
-  | "verify-failed";
+  /** The written file did not read back as the same text (the old file was put back). */
+  | "verify-failed"
+  /**
+   * The written file did not read back as the same text AND putting the old
+   * file back (replace) or removing the new one (create) failed too. The
+   * entry on disk may be damaged.
+   */
+  | "restore-failed"
+  /** replace: the file is open in a rune editor with unsaved edits. */
+  | "open-in-editor";
 
 const MESSAGES: Record<JournalApiErrorCode, string> = {
   locked: "rune is locked",
@@ -79,7 +92,9 @@ const MESSAGES: Record<JournalApiErrorCode, string> = {
   "decrypt-failed": "the file could not be decrypted with the unlocked key",
   "encrypt-failed": "encrypting failed; nothing was written",
   "write-failed": "writing the file failed",
-  "verify-failed": "the written file did not read back as the same text",
+  "verify-failed": "the written file did not read back as the same text; the previous file was kept",
+  "restore-failed": "the written file did not read back as the same text and could not be undone; the entry may be damaged",
+  "open-in-editor": "the file is open in rune with unsaved edits; save or close it first",
 };
 
 /**
@@ -118,6 +133,8 @@ export interface JournalVault {
   create(path: string, data: ArrayBuffer): Promise<void>;
   /** Overwrites an existing file. */
   replace(path: string, data: ArrayBuffer): Promise<void>;
+  /** Deletes a file (only ever one this API just created and that failed its check). */
+  remove(path: string): Promise<void>;
 }
 
 export interface JournalApiDeps {
@@ -134,6 +151,8 @@ export interface JournalApiDeps {
    * be checked (mobile).
    */
   pathHasSymlink: ((path: string) => Promise<boolean>) | null;
+  /** True when the file is open in a rune editor with unsaved edits. */
+  isOpenDirty: (path: string) => boolean;
 }
 
 /**
@@ -210,6 +229,12 @@ export function checkJournalPath(
   if (!suffix || name.length <= suffix.length) throw new JournalApiError("unsupported-type");
   if (isExcludedPath(path, excluded)) throw new JournalApiError("unsupported-type");
   return path;
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.byteLength !== b.byteLength) return false;
+  for (let i = 0; i < a.byteLength; i++) if (a[i] !== b[i]) return false;
+  return true;
 }
 
 function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
@@ -340,24 +365,24 @@ export class JournalApiHost {
   }
 
   /**
-   * The identity, without ever prompting: the synchronous check right before
-   * the call means a passphrase source answers from memory (or throws
-   * KeyLockedError), never opens the unlock prompt.
+   * The identity via peekIdentity(): never prompts (throws KeyLockedError
+   * when locked) and does not reset the idle auto-lock, so a caller polling
+   * the API cannot keep rune unlocked.
    */
   private async identity(keys: KeySource, gen: number): Promise<string> {
     this.assertStillUnlocked(keys, gen);
     try {
-      return await keys.getIdentity();
+      return await keys.peekIdentity();
     } catch {
       throw new JournalApiError("locked");
     }
   }
 
-  /** The pinned recipients, same rules as a rune save; never prompts to unlock. */
+  /** The pinned recipients, same rules as a rune save; never prompts, no idle reset. */
   private async recipients(keys: KeySource, gen: number): Promise<string[]> {
     this.assertStillUnlocked(keys, gen);
     try {
-      return await keys.getRecipients();
+      return await keys.peekRecipients();
     } catch (err) {
       if (err instanceof RecipientPinError) throw new JournalApiError("refused", err.message);
       if (err instanceof KeyLockedError) throw new JournalApiError("locked");
@@ -365,11 +390,16 @@ export class JournalApiHost {
     }
   }
 
-  private async checkPath(path: string, suffixes: readonly string[]): Promise<string> {
-    // re-read the setting per call: a change takes effect immediately
+  /** The path against the folder setting as it is right now (no symlink check). */
+  private checkAgainstFolder(path: string, suffixes: readonly string[]): string {
+    // re-read the setting each time: a change takes effect immediately
     const folder = validateJournalFolder(this.deps.getFolder());
     if (!folder.ok) throw new JournalApiError("disabled");
-    const p = checkJournalPath(path, folder.folder, suffixes, this.deps.excludedPaths());
+    return checkJournalPath(path, folder.folder, suffixes, this.deps.excludedPaths());
+  }
+
+  private async checkPath(path: string, suffixes: readonly string[]): Promise<string> {
+    const p = this.checkAgainstFolder(path, suffixes);
     const check = this.deps.pathHasSymlink;
     if (check) {
       let linked: boolean;
@@ -404,6 +434,9 @@ export class JournalApiHost {
   ): Promise<void> {
     const vault = this.deps.vault;
     this.assertStillUnlocked(keys, gen);
+    // queued behind another write: the folder may have changed since the call
+    this.checkAgainstFolder(p, ENCRYPT_SUFFIXES);
+    if (mode === "replace" && this.deps.isOpenDirty(p)) throw new JournalApiError("open-in-editor");
 
     const parent = p.slice(0, p.lastIndexOf("/"));
     if ((await vault.kind(parent)) !== "folder") throw new JournalApiError("missing");
@@ -447,8 +480,11 @@ export class JournalApiHost {
       throw new JournalApiError("encrypt-failed");
     }
 
-    // locked while encrypting: write nothing
+    // locked, folder cleared or narrowed, or the owner started editing the
+    // file while encrypting: write nothing
     this.assertStillUnlocked(keys, gen);
+    this.checkAgainstFolder(p, ENCRYPT_SUFFIXES);
+    if (mode === "replace" && this.deps.isOpenDirty(p)) throw new JournalApiError("open-in-editor");
 
     try {
       if (mode === "create") await vault.create(p, toArrayBuffer(ciphertext));
@@ -459,21 +495,43 @@ export class JournalApiHost {
 
     // read back from the vault and check it decrypts to the same text
     let readBack = false;
+    let onDisk: Uint8Array | null = null;
     try {
-      const onDisk = new Uint8Array(await vault.read(p));
+      onDisk = new Uint8Array(await vault.read(p));
       readBack = (await decryptToString(identity, onDisk)) === text;
     } catch {
       readBack = false;
     }
     if (readBack) return;
 
-    if (old !== null) {
-      try {
-        await vault.replace(p, toArrayBuffer(old));
-      } catch {
-        /* restoring failed too; still report the verify failure */
-      }
+    // undo: replace puts the old ciphertext back; create removes the file it
+    // just wrote, but only if it still holds what this call read back
+    // (never delete something another writer put there since)
+    const undone =
+      old !== null ? await this.restore(p, old) : await this.removeCreated(p, onDisk);
+    throw new JournalApiError(undone ? "verify-failed" : "restore-failed");
+  }
+
+  /** Write `old` back and check it landed byte for byte. */
+  private async restore(p: string, old: Uint8Array): Promise<boolean> {
+    try {
+      await this.deps.vault.replace(p, toArrayBuffer(old));
+      return bytesEqual(new Uint8Array(await this.deps.vault.read(p)), old);
+    } catch {
+      return false;
     }
-    throw new JournalApiError("verify-failed");
+  }
+
+  /** Remove a just-created file that failed its check, if it is still ours. */
+  private async removeCreated(p: string, ours: Uint8Array | null): Promise<boolean> {
+    try {
+      if (ours === null || !bytesEqual(new Uint8Array(await this.deps.vault.read(p)), ours)) {
+        return false;
+      }
+      await this.deps.vault.remove(p);
+      return (await this.deps.vault.kind(p)) === "none";
+    } catch {
+      return false;
+    }
   }
 }

@@ -151,7 +151,8 @@ describe("mobile layout: the editor does not clip", () => {
       {},
       { remeasureOnViewport: mobile, getKeySource: () => ({}), updateStatusBar() {}, clearStatusBar() {} }
     );
-    view.app = { scope: {} };
+    view.app = { scope: {}, vault: { on: () => ({}) } };
+    view.registerEvent = () => {}; // Obsidian's Component method; onOpen watches for external writes
     view.contentEl = { empty() {}, addClass: (c: string) => classes.push(c), createDiv: () => ({}) };
     return { view, classes };
   };

@@ -30,6 +30,8 @@ const h = vi.hoisted(() => ({
   loadCryptoNode: vi.fn(),
   loadBackup: vi.fn(),
   loadRotateLog: vi.fn(),
+  /** Setting rows the settings tab built (see the Setting mock). */
+  settings: [] as any[],
 }));
 
 vi.mock("../src/node-loader", () => ({
@@ -43,6 +45,9 @@ vi.mock("../src/node-loader", () => ({
         return h.fileIdentity;
       },
       readRecipients: () => [...h.fileRecipients],
+      // the real lstat walk (it only ever sees a scratch dir in these tests)
+      vaultPathHasSymlink: async (base: string, rel: string) =>
+        (await vi.importActual<typeof import("../src/crypto-node")>("../src/crypto-node")).vaultPathHasSymlink(base, rel),
     };
   },
   loadBackup: async () => {
@@ -100,7 +105,9 @@ vi.mock("obsidian", () => {
       });
       return el;
     }
-    registerView() {} registerExtensions() {} registerEvent() {} addSettingTab() {}
+    settingTab: unknown = null;
+    registerView() {} registerExtensions() {} registerEvent() {}
+    addSettingTab(t: unknown) { this.settingTab = t; }
     registerDomEvent(_t: unknown, ev: string, cb: () => void) { this.domListeners[ev] = cb; }
   }
   class Modal {
@@ -108,9 +115,41 @@ vi.mock("obsidian", () => {
     open() { h.onModalOpen?.(this); }
     close() {}
   }
+  /** Records every Setting row the settings tab builds, with its text field. */
+  class Setting {
+    name = ""; desc = ""; text: any = null;
+    constructor(_el: unknown) { h.settings.push(this); }
+    setName(n: string) { this.name = n; return this; }
+    setDesc(d: string) { this.desc = d; return this; }
+    setHeading() { return this; }
+    addText(cb: (t: any) => void) {
+      const t: any = {
+        listeners: {} as Record<string, (e?: unknown) => void>,
+        invalid: false,
+        change: null as null | ((v: string) => void),
+        setPlaceholder: () => t,
+        setValue: (v: string) => { t.inputEl.value = v; return t; },
+        onChange: (f: (v: string) => void) => { t.change = f; return t; },
+      };
+      t.inputEl = {
+        value: "", type: "", min: "",
+        toggleClass: (_c: string, on: boolean) => { t.invalid = on; },
+        addEventListener: (ev: string, f: (e?: unknown) => void) => { t.listeners[ev] = f; },
+      };
+      this.text = t;
+      cb(t);
+      return this;
+    }
+    addButton(cb: (b: any) => void) { const b: any = { setButtonText: () => b, onClick: () => b }; cb(b); return this; }
+    addToggle(cb: (b: any) => void) { const b: any = { setValue: () => b, onChange: () => b }; cb(b); return this; }
+  }
+  class PluginSettingTab {
+    containerEl = { empty() {}, createEl: () => ({}) };
+    constructor(public app: unknown, public plugin: unknown) {}
+  }
   return {
     get Platform() { return { isDesktopApp: h.desktop, isMobile: !h.desktop }; },
-    App: Stub, Modal, Notice, Plugin, PluginSettingTab: Stub, Setting: Stub,
+    App: Stub, Modal, Notice, Plugin, PluginSettingTab, Setting,
     TFile: Stub, TFolder: class TFolder {}, FileView: Stub, Scope: Stub, WorkspaceLeaf: Stub,
   };
 });
@@ -182,6 +221,7 @@ beforeEach(() => {
   h.local = {};
   h.onModalOpen = null;
   h.copySubmit = null;
+  h.settings = [];
   h.confirmSet.mockReset();
   h.confirmSet.mockImplementation(async () => true);
   h.loadCryptoNode.mockClear();
@@ -1130,7 +1170,8 @@ describe("journal API wiring (gabbro #107)", () => {
     expect(api.isUnlocked()).toBe(false);
   });
 
-  it("desktop: the symlink check is wired and fails closed when it cannot run", async () => {
+  /** Desktop key-file plugin with an indexed vault holding j/a.md.age. */
+  async function desktopWithNote() {
     const identity = await generateIdentity();
     h.fileIdentity = identity;
     h.fileRecipients = [await identityToRecipient(identity)];
@@ -1138,7 +1179,124 @@ describe("journal API wiring (gabbro #107)", () => {
     const files = new Map([["j/a.md.age", await encrypt(h.fileRecipients, "x")]]);
     await withVault(p, files, ["j"]);
     p.settings.journalFolder = "j";
-    // the mocked Node loader has no vaultPathHasSymlink: the check throws
+    return { p, files };
+  }
+
+  it("F4 desktop: no vault base path (the adapter has none) fails closed", async () => {
+    const { p } = await desktopWithNote();
+    // boot's adapter has neither getBasePath nor basePath: vaultBasePath() is ""
     await expect(p.journalApi.decrypt("j/a.md.age")).rejects.toMatchObject({ code: "symlink" });
+  });
+
+  it("F4 desktop: the real base path is checked on disk (works, and refuses a symlink)", async () => {
+    const fs = await import("fs");
+    const os = await import("os");
+    const path = await import("path");
+    const { p } = await desktopWithNote();
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "rune-plugin-journal-"));
+    try {
+      fs.mkdirSync(path.join(base, "j"));
+      fs.writeFileSync(path.join(base, "j", "a.md.age"), "x");
+      p.app.vault.adapter.getBasePath = () => base;
+      expect(await p.journalApi.decrypt("j/a.md.age")).toBe("x");
+      fs.rmSync(path.join(base, "j"), { recursive: true });
+      fs.mkdirSync(path.join(base, "elsewhere"));
+      fs.writeFileSync(path.join(base, "elsewhere", "a.md.age"), "x");
+      fs.symlinkSync(path.join(base, "elsewhere"), path.join(base, "j"));
+      await expect(p.journalApi.decrypt("j/a.md.age")).rejects.toMatchObject({ code: "symlink" });
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("F4: unlocked with default settings (no folder) refuses as disabled", async () => {
+    const { p } = await boot(false);
+    await withVault(p, new Map(), ["j"]);
+    await p.getKeySource().getIdentity();
+    expect(p.settings.journalFolder).toBe("");
+    await expect(p.journalApi.decrypt("j/a.md.age")).rejects.toMatchObject({ code: "disabled" });
+    await expect(p.journalApi.encrypt("j/a.md.age", "x", { mode: "create" })).rejects.toMatchObject({ code: "disabled" });
+  });
+
+  it("F4: create on a path that is on disk but not indexed refuses as exists", async () => {
+    const { p } = await boot(false);
+    const files = new Map<string, Uint8Array>();
+    await withVault(p, files, ["j"]);
+    p.app.vault.adapter.exists = async (path: string) => path === KEY_PATH || path === "j/ghost.md.age";
+    p.settings.journalFolder = "j";
+    await p.getKeySource().getIdentity();
+    await expect(p.journalApi.encrypt("j/ghost.md.age", "x", { mode: "create" })).rejects.toMatchObject({ code: "exists" });
+    expect(files.size).toBe(0);
+  });
+
+  it("F4: the mobile unlock file inside the folder is refused", async () => {
+    const { p, view } = await boot(false);
+    void view;
+    await withVault(p, new Map(), ["_rune"]);
+    p.settings.journalFolder = "_rune";
+    await p.getKeySource().getIdentity();
+    await expect(p.journalApi.decrypt(KEY_PATH)).rejects.toMatchObject({ code: "unsupported-type" });
+    await expect(p.journalApi.encrypt("_rune/identity.md.age", "x", { mode: "create" })).resolves.toBeUndefined();
+    p.settings.mobileKeyPath = "_rune/identity.md.age"; // a custom unlock path is excluded too
+    await expect(
+      p.journalApi.encrypt("_rune/identity.md.age", "x", { mode: "replace" })
+    ).rejects.toMatchObject({ code: "unsupported-type" });
+  });
+
+  it("F2a wiring: replace refuses while an open rune view has unsaved edits to that file", async () => {
+    const { p, identity, view } = await boot(false);
+    const files = new Map([["j/a.md.age", await encrypt([await identityToRecipient(identity)], "old")]]);
+    await withVault(p, files, ["j"]);
+    p.settings.journalFolder = "j";
+    await p.getKeySource().getIdentity();
+    (view as any).hasUnsavedEdits = (path: string) => path === "j/a.md.age";
+    await expect(p.journalApi.encrypt("j/a.md.age", "new", { mode: "replace" })).rejects.toMatchObject({
+      code: "open-in-editor",
+    });
+    expect(await decryptToString(identity, files.get("j/a.md.age")!)).toBe("old");
+  });
+
+  it("F4/F8: the settings field saves on Enter / blur only, shows the folder in effect, and the API follows it", async () => {
+    const { p, identity } = await boot(false);
+    const files = new Map([["10_journal/a.md.age", await encrypt([await identityToRecipient(identity)], "dear diary")]]);
+    await withVault(p, files, ["10_journal"]);
+    await p.getKeySource().getIdentity();
+    h.settings = [];
+    p.settingTab.display();
+    const row = h.settings.find((s) => s.name === "Folder gabbro may open");
+    expect(row.desc).toContain("In key-file mode rune is always unlocked.");
+    expect(row.desc).toContain("Now: off.");
+    const t = row.text;
+    const savedBefore = p.saved.length;
+    // typing: validated, never saved
+    for (const partial of ["1", "10_", "10_journal/"]) {
+      t.inputEl.value = partial;
+      t.change(partial);
+    }
+    expect(p.settings.journalFolder).toBe("");
+    expect(p.saved.length).toBe(savedBefore);
+    await expect(p.journalApi.decrypt("10_journal/a.md.age")).rejects.toMatchObject({ code: "disabled" });
+    // Enter commits the normalised folder
+    t.listeners.keydown({ key: "Enter" });
+    await vi.waitFor(() => expect(row.desc).toContain('Now: "10_journal".'));
+    expect(p.settings.journalFolder).toBe("10_journal");
+    expect(p.saved.length).toBe(savedBefore + 1);
+    expect(t.inputEl.value).toBe("10_journal");
+    expect(row.desc).toContain('Now: "10_journal".');
+    expect(await p.journalApi.decrypt("10_journal/a.md.age")).toBe("dear diary");
+    // an invalid value on blur is not saved; the stored folder stays in effect
+    t.inputEl.value = "../10_journal";
+    t.change("../10_journal");
+    expect(t.invalid).toBe(true);
+    t.listeners.blur();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(p.settings.journalFolder).toBe("10_journal");
+    expect(p.saved.length).toBe(savedBefore + 1);
+    // clearing it on blur turns the API off
+    t.inputEl.value = "";
+    t.listeners.blur();
+    await vi.waitFor(() => expect(row.desc).toContain("Now: off."));
+    expect(p.settings.journalFolder).toBe("");
+    await expect(p.journalApi.decrypt("10_journal/a.md.age")).rejects.toMatchObject({ code: "disabled" });
   });
 });

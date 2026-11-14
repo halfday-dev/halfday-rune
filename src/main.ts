@@ -216,6 +216,7 @@ export default class HalfdayObsidianRune extends Plugin {
       pathHasSymlink: Platform.isDesktopApp
         ? async (p) => (await loadCryptoNode()).vaultPathHasSymlink(this.vaultBasePath(), p)
         : null,
+      isOpenDirty: (p) => this.ageViews().some((v) => v.hasUnsavedEdits(p)),
     });
     this.journalApi = this.journalHost.api();
 
@@ -1010,6 +1011,7 @@ export default class HalfdayObsidianRune extends Plugin {
         await this.app.vault.createBinary(p, data);
       },
       replace: (p, data) => this.app.vault.modifyBinary(fileAt(p), data),
+      remove: (p) => this.app.vault.delete(fileAt(p)),
     };
   }
 
@@ -2107,25 +2109,44 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
       });
 
     // Journal API (gabbro's Journal tab). Off until the owner names a folder.
-    new Setting(containerEl)
-      .setName("Folder gabbro may open")
-      .setDesc(
+    // Saved on blur / Enter only (never a half-typed folder); the description
+    // shows the folder that is actually in effect.
+    const journalDesc = (): string => {
+      const stored = validateJournalFolder(this.plugin.settings.journalFolder);
+      const now = stored.ok && stored.folder !== "" ? `"${stored.folder}"` : "off";
+      return (
         "Vault-relative folder (e.g. 10_journal) whose encrypted notes another plugin may read and " +
-          "write through rune's journal API while rune is unlocked. Empty = off. " +
-          "While unlocked, any plugin in this vault can use it."
-      )
-      .addText((text) => {
-        text
-          .setPlaceholder("off")
-          .setValue(this.plugin.settings.journalFolder)
-          .onChange(async (value) => {
-            const check = validateJournalFolder(value);
-            text.inputEl.toggleClass("halfday-rune-invalid", !check.ok);
-            if (!check.ok) return; // keep the last valid value
-            this.plugin.settings.journalFolder = check.folder;
-            await this.plugin.saveSettings();
-          });
+        "write through rune's journal API while rune is unlocked. Empty = off. " +
+        "While unlocked, any plugin in this vault can use it. In key-file mode rune is always unlocked. " +
+        `Now: ${now}. Saved when you press Enter or leave the field.`
+      );
+    };
+    const journalSetting = new Setting(containerEl)
+      .setName("Folder gabbro may open")
+      .setDesc(journalDesc());
+    journalSetting.addText((text) => {
+      text
+        .setPlaceholder("off")
+        .setValue(this.plugin.settings.journalFolder)
+        .onChange((value) => {
+          text.inputEl.toggleClass("halfday-rune-invalid", !validateJournalFolder(value).ok);
+        });
+      const commit = async (): Promise<void> => {
+        const check = validateJournalFolder(text.inputEl.value);
+        text.inputEl.toggleClass("halfday-rune-invalid", !check.ok);
+        if (!check.ok) return; // keep the last valid value
+        if (check.folder !== this.plugin.settings.journalFolder) {
+          this.plugin.settings.journalFolder = check.folder;
+          await this.plugin.saveSettings();
+        }
+        text.setValue(check.folder);
+        journalSetting.setDesc(journalDesc());
+      };
+      text.inputEl.addEventListener("blur", () => void commit());
+      text.inputEl.addEventListener("keydown", (e: KeyboardEvent) => {
+        if (e.key === "Enter") void commit();
       });
+    });
 
     // Mobile lock behaviour. Used by the phone; harmless on desktop.
     const numberSetting = (

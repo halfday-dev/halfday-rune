@@ -21,6 +21,14 @@ export interface KeySource {
   getRecipients(): Promise<string[]>;
   /** True when getIdentity() can answer without user action. */
   isUnlocked(): boolean;
+  /**
+   * Like getIdentity(), but never prompts and never counts as activity (does
+   * not reset the idle auto-lock). Throws KeyLockedError when locked. For
+   * callers that are not the owner at the keyboard (the journal API).
+   */
+  peekIdentity(): Promise<string>;
+  /** Like getRecipients() (same pin check), with peekIdentity()'s rules. */
+  peekRecipients(): Promise<string[]>;
   /** Drop any held secret. Nothing to drop for a file-backed source. */
   lock(): void;
   /**
@@ -83,6 +91,15 @@ export class FileKeySource implements KeySource {
 
   isUnlocked(): boolean {
     return true;
+  }
+
+  /** Nothing to prompt for and no idle clock: the same reads as getIdentity(). */
+  peekIdentity(): Promise<string> {
+    return this.getIdentity();
+  }
+
+  peekRecipients(): Promise<string[]> {
+    return this.getRecipients();
   }
 
   lock(): void {
@@ -206,6 +223,21 @@ export class PassphraseKeySource implements KeySource {
 
   async getRecipients(): Promise<string[]> {
     const id = await this.getIdentity();
+    const recipients = [...this.#recipients];
+    if (this.deps.pin) await assertPinned(this.deps.pin, id, recipients, "copy");
+    return recipients;
+  }
+
+  /** The held identity, or KeyLockedError. Never prompts; does not reset the idle clock. */
+  async peekIdentity(): Promise<string> {
+    const id = this.#identity;
+    if (id === null) throw new KeyLockedError();
+    return id;
+  }
+
+  /** The held list, pin-checked like getRecipients(). Never prompts; no idle reset. */
+  async peekRecipients(): Promise<string[]> {
+    const id = await this.peekIdentity();
     const recipients = [...this.#recipients];
     if (this.deps.pin) await assertPinned(this.deps.pin, id, recipients, "copy");
     return recipients;
