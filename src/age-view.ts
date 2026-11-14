@@ -153,6 +153,30 @@ export const CHANGED_ON_DISK_NOTICE =
   "Halfday Rune: this note changed on disk since you opened it (another device or plugin wrote it). " +
   "Not saved, your text is still here: copy it, then close and reopen the note.";
 
+export function conflictCopyNotice(copyPath: string): string {
+  return (
+    "Halfday Rune: this note changed on disk since you opened it (another device or plugin wrote it). " +
+    `Your edits were saved, encrypted, to "${copyPath}". The note shows the newer version.`
+  );
+}
+
+/** `notes/day.md.age` → `notes/day (conflict 2026-11-14 093012).md.age`; `-2`, `-3` … on a clash. */
+export function conflictCopyPath(path: string, when: Date, n = 1): string {
+  const slash = path.lastIndexOf("/");
+  const dir = slash >= 0 ? path.slice(0, slash + 1) : "";
+  const name = path.slice(slash + 1);
+  const base = name.endsWith(".md.age")
+    ? name.slice(0, -".md.age".length)
+    : name.endsWith(".age")
+      ? name.slice(0, -".age".length)
+      : name;
+  const p2 = (x: number) => String(x).padStart(2, "0");
+  const stamp =
+    `${when.getFullYear()}-${p2(when.getMonth() + 1)}-${p2(when.getDate())} ` +
+    `${p2(when.getHours())}${p2(when.getMinutes())}${p2(when.getSeconds())}`;
+  return `${dir}${base} (conflict ${stamp}${n > 1 ? `-${n}` : ""}).md.age`;
+}
+
 function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
   if (a.byteLength !== b.byteLength) return false;
   for (let i = 0; i < a.byteLength; i++) if (a[i] !== b[i]) return false;
@@ -267,6 +291,25 @@ export class AgeFileView extends FileView {
         if (f instanceof TFile && f === this.file) void this.onExternalModify(f);
       })
     );
+  }
+
+  /**
+   * Write already-encrypted, round-trip-checked edits to a new conflict copy
+   * beside `file` (createBinary: never overwrites). Returns its path, or
+   * null when no copy could be written.
+   */
+  private async writeConflictCopy(file: TFile, ciphertext: ArrayBuffer): Promise<string | null> {
+    const when = new Date();
+    for (let n = 1; n <= 20; n++) {
+      const path = conflictCopyPath(file.path, when, n);
+      try {
+        await this.app.vault.createBinary(path, ciphertext);
+        return path;
+      } catch {
+        /* taken (or unwritable): try the next name */
+      }
+    }
+    return null;
   }
 
   /** True when this view has `path` open with unsaved edits. */
@@ -776,10 +819,27 @@ export class AgeFileView extends FileView {
       ) as ArrayBuffer;
 
       // Someone else wrote the file since this view read (or last saved) it:
-      // do not overwrite their version. The editor keeps its text.
+      // do not overwrite their version. The edits go to an encrypted conflict
+      // copy beside it instead, so they are on disk even if a lock or a close
+      // tears the editor down right after (and on a phone the notice may
+      // never be seen).
       if (this.diskBytes !== null) {
         const onDisk = new Uint8Array(await this.app.vault.readBinary(file));
-        if (!bytesEqual(onDisk, this.diskBytes)) throw new RecipientListError(CHANGED_ON_DISK_NOTICE);
+        if (!bytesEqual(onDisk, this.diskBytes)) {
+          const copy = await this.writeConflictCopy(file, buffer);
+          if (copy === null) throw new RecipientListError(CHANGED_ON_DISK_NOTICE);
+          new Notice(conflictCopyNotice(copy));
+          console.log("[halfday-rune] age view conflict copy", { path: file.path, copy });
+          if (gen !== this.lockGen || !this.editor) return;
+          if (this.editor.state.doc.toString() === plaintext) {
+            // the edits are safe in the copy: show the file as it is now
+            this.dirty = false;
+            this.updateTabHeader();
+            void this.onExternalModify(file);
+          }
+          this.pushStatusBar();
+          return;
+        }
       }
 
       await this.app.vault.modifyBinary(file, buffer);
@@ -790,7 +850,14 @@ export class AgeFileView extends FileView {
       if (gen !== this.lockGen || !this.editor) return;
 
       this.plaintext = plaintext;
-      this.dirty = false;
+      // Text typed while the save was in flight is not on disk yet: stay
+      // dirty (and keep the autosave) unless the editor still holds exactly
+      // what was saved.
+      if (this.editor.state.doc.toString() === plaintext) {
+        this.dirty = false;
+      } else {
+        this.scheduleAutosave();
+      }
       this.lastSavedAt = new Date();
       this.lastSavedBytes = ciphertext.byteLength;
       const dt = Date.now() - startedAt;

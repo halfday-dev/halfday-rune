@@ -1006,12 +1006,13 @@ export default class HalfdayObsidianRune extends Plugin {
         // not indexed (yet) but on disk: never treat as free to create
         return (await this.app.vault.adapter.exists(p)) ? "other" : "none";
       },
-      read: (p) => this.app.vault.readBinary(fileAt(p)),
+      // async so a non-file path rejects rather than throwing synchronously
+      read: async (p) => this.app.vault.readBinary(fileAt(p)),
       create: async (p, data) => {
         await this.app.vault.createBinary(p, data);
       },
-      replace: (p, data) => this.app.vault.modifyBinary(fileAt(p), data),
-      remove: (p) => this.app.vault.delete(fileAt(p)),
+      replace: async (p, data) => this.app.vault.modifyBinary(fileAt(p), data),
+      remove: async (p) => this.app.vault.delete(fileAt(p)),
     };
   }
 
@@ -1982,9 +1983,23 @@ class RotateSummaryModal extends Modal {
 class HalfdayRuneSettingTab extends PluginSettingTab {
   plugin: HalfdayObsidianRune;
 
+  /** Saves the "Folder gabbro may open" field as typed (set by display()). */
+  private commitJournalFolder: (() => Promise<void>) | null = null;
+
   constructor(app: App, plugin: HalfdayObsidianRune) {
     super(app, plugin);
     this.plugin = plugin;
+  }
+
+  /**
+   * Closing settings (Esc included) commits the folder field too, so a
+   * cleared field can't leave the journal API on.
+   */
+  hide(): void {
+    const commit = this.commitJournalFolder;
+    this.commitJournalFolder = null;
+    if (commit) void commit();
+    super.hide();
   }
 
   display(): void {
@@ -2142,6 +2157,7 @@ class HalfdayRuneSettingTab extends PluginSettingTab {
         text.setValue(check.folder);
         journalSetting.setDesc(journalDesc());
       };
+      this.commitJournalFolder = commit;
       text.inputEl.addEventListener("blur", () => void commit());
       text.inputEl.addEventListener("keydown", (e: KeyboardEvent) => {
         if (e.key === "Enter") void commit();

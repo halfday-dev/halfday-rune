@@ -16,8 +16,11 @@
  *   - encrypt() uses the key source's pinned recipients and the same
  *     refusals as a normal rune save, round-trip-verifies in memory before
  *     writing, then reads the file back and verifies it decrypts to the same
- *     text. A failed read-back puts the previous ciphertext back (replace)
- *     or removes the new file (create); if that fails too: "restore-failed".
+ *     text. Only what is provably this call's own is ever undone: if the
+ *     file no longer holds the bytes it wrote, nothing is touched
+ *     ("conflict"); if it does but they don't decrypt back, the previous
+ *     ciphertext is put back (replace) or the file removed (create), and a
+ *     failed undo is "restore-failed".
  *   - The key is read with peekIdentity()/peekRecipients(): API calls never
  *     reset rune's idle auto-lock.
  *   - replace refuses while the file is open with unsaved edits in a rune
@@ -76,7 +79,13 @@ export type JournalApiErrorCode =
    */
   | "restore-failed"
   /** replace: the file is open in a rune editor with unsaved edits. */
-  | "open-in-editor";
+  | "open-in-editor"
+  /**
+   * After the write, the file did not hold the bytes this call wrote
+   * (another writer landed there, or the write was damaged). Nothing was
+   * undone or deleted: only what is provably this call's own is ever undone.
+   */
+  | "conflict";
 
 const MESSAGES: Record<JournalApiErrorCode, string> = {
   locked: "rune is locked",
@@ -95,6 +104,8 @@ const MESSAGES: Record<JournalApiErrorCode, string> = {
   "verify-failed": "the written file did not read back as the same text; the previous file was kept",
   "restore-failed": "the written file did not read back as the same text and could not be undone; the entry may be damaged",
   "open-in-editor": "the file is open in rune with unsaved edits; save or close it first",
+  conflict:
+    "after writing, the file did not hold what was written (another writer, or a damaged write); nothing was undone",
 };
 
 /**
@@ -493,45 +504,59 @@ export class JournalApiHost {
       throw new JournalApiError("write-failed");
     }
 
-    // read back from the vault and check it decrypts to the same text
-    let readBack = false;
-    let onDisk: Uint8Array | null = null;
+    // read back from the vault: it must be exactly the ciphertext this call
+    // wrote, and decrypt to the same text
+    let onDisk: Uint8Array;
     try {
       onDisk = new Uint8Array(await vault.read(p));
+    } catch {
+      // can't tell what is there: touch nothing
+      throw new JournalApiError("restore-failed");
+    }
+    if (!bytesEqual(onDisk, ciphertext)) {
+      // Another writer (sync, another device) landed here after our write,
+      // or the write was damaged: either way the bytes are not provably ours,
+      // so nothing is undone and nothing is deleted.
+      throw new JournalApiError("conflict");
+    }
+    let readBack = false;
+    try {
       readBack = (await decryptToString(identity, onDisk)) === text;
     } catch {
       readBack = false;
     }
     if (readBack) return;
 
-    // undo: replace puts the old ciphertext back; create removes the file it
-    // just wrote, but only if it still holds what this call read back
-    // (never delete something another writer put there since)
+    // The file holds exactly our bytes and they don't decrypt back: undo
+    // only that. Replace puts the old ciphertext back; create removes the file.
     const undone =
-      old !== null ? await this.restore(p, old) : await this.removeCreated(p, onDisk);
-    throw new JournalApiError(undone ? "verify-failed" : "restore-failed");
+      old !== null ? await this.restore(p, old, ciphertext) : await this.removeCreated(p, ciphertext);
+    throw new JournalApiError(undone === "ok" ? "verify-failed" : undone);
   }
 
-  /** Write `old` back and check it landed byte for byte. */
-  private async restore(p: string, old: Uint8Array): Promise<boolean> {
+  /** Put `old` back, only while the file still holds `ours`; check it landed. */
+  private async restore(
+    p: string,
+    old: Uint8Array,
+    ours: Uint8Array
+  ): Promise<"ok" | "conflict" | "restore-failed"> {
     try {
+      if (!bytesEqual(new Uint8Array(await this.deps.vault.read(p)), ours)) return "conflict";
       await this.deps.vault.replace(p, toArrayBuffer(old));
-      return bytesEqual(new Uint8Array(await this.deps.vault.read(p)), old);
+      return bytesEqual(new Uint8Array(await this.deps.vault.read(p)), old) ? "ok" : "restore-failed";
     } catch {
-      return false;
+      return "restore-failed";
     }
   }
 
-  /** Remove a just-created file that failed its check, if it is still ours. */
-  private async removeCreated(p: string, ours: Uint8Array | null): Promise<boolean> {
+  /** Remove a just-created file, only while it still holds `ours`; check it is gone. */
+  private async removeCreated(p: string, ours: Uint8Array): Promise<"ok" | "conflict" | "restore-failed"> {
     try {
-      if (ours === null || !bytesEqual(new Uint8Array(await this.deps.vault.read(p)), ours)) {
-        return false;
-      }
+      if (!bytesEqual(new Uint8Array(await this.deps.vault.read(p)), ours)) return "conflict";
       await this.deps.vault.remove(p);
-      return (await this.deps.vault.kind(p)) === "none";
+      return (await this.deps.vault.kind(p)) === "none" ? "ok" : "restore-failed";
     } catch {
-      return false;
+      return "restore-failed";
     }
   }
 }

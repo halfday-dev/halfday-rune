@@ -9,13 +9,25 @@ import * as path from "path";
 import { generateIdentity, identityToRecipient } from "age-encryption";
 
 /** Set to make the API's crypto calls throw a given error (F3 leak tests). */
-const cryptoFail = vi.hoisted(() => ({ decrypt: null as Error | null, encrypt: null as Error | null }));
+const cryptoFail = vi.hoisted(() => ({
+  decrypt: null as Error | null,
+  encrypt: null as Error | null,
+  /** Count decryptToString calls; the one at `failDecryptAt` (1-based) throws. */
+  decryptCalls: 0,
+  failDecryptAt: null as number | null,
+  /** Runs when that call fails (e.g. another writer lands right then). */
+  onDecryptFail: null as null | (() => void),
+}));
 vi.mock("../src/crypto", async (importOriginal) => {
   const real = await importOriginal<typeof import("../src/crypto")>();
   return {
     ...real,
     decryptToString: async (...a: Parameters<typeof real.decryptToString>) => {
       if (cryptoFail.decrypt) throw cryptoFail.decrypt;
+      if (++cryptoFail.decryptCalls === cryptoFail.failDecryptAt) {
+        cryptoFail.onDecryptFail?.();
+        throw new Error("read-back did not decrypt");
+      }
       return real.decryptToString(...a);
     },
     encrypt: async (...a: Parameters<typeof real.encrypt>) => {
@@ -28,7 +40,8 @@ vi.mock("../src/crypto", async (importOriginal) => {
 import { encrypt, decryptToString, wrapMobileKey } from "../src/crypto";
 import { KeyLockedError, PassphraseKeySource } from "../src/keysource";
 import type { KeySource } from "../src/keysource";
-import { RecipientPinError } from "../src/recipient-pin";
+import { RecipientPinError, makePin } from "../src/recipient-pin";
+import type { DeviceRecord, PinStore, RecipientPin } from "../src/recipient-pin";
 import {
   JournalApiError,
   JournalApiHost,
@@ -98,9 +111,13 @@ async function setup(
     failWrite: false,
     /** Every write after the first fails (the restore / cleanup). */
     failAfterFirstWrite: false,
-    /** Every write, the restore included, lands damaged without an error. */
-    corruptEveryWrite: false,
+    /** Every write after the first (the restore) lands damaged without an error. */
+    corruptAfterFirstWrite: false,
     failRemove: false,
+    /** remove() resolves but the file stays. */
+    removeNoop: false,
+    /** Runs right after a write lands (another writer arriving then). */
+    afterWrite: null as null | ((p: string) => void),
     openDirty: new Set<string>(),
     /** When set, create waits for it before writing. */
     createGate: null as Promise<void> | null,
@@ -122,21 +139,24 @@ async function setup(
       if (hooks.createGate) await hooks.createGate;
       if (files.has(p)) throw new Error("File already exists.");
       files.set(p, write(data));
+      hooks.afterWrite?.(p);
     }),
     replace: vi.fn(async (p: string, data: ArrayBuffer) => {
       if (hooks.failWrite) throw new Error("disk full");
       if (!files.has(p)) throw new Error("not a file");
       files.set(p, write(data));
+      hooks.afterWrite?.(p);
     }),
     remove: vi.fn(async (p: string) => {
       if (hooks.failRemove) throw new Error("EPERM");
-      files.delete(p);
+      if (!hooks.removeNoop) files.delete(p);
     }),
   } satisfies JournalVault;
   const write = (data: ArrayBuffer): Uint8Array => {
-    if (hooks.failAfterFirstWrite && writes++ > 0) throw new Error("disk full");
+    const n = writes++;
+    if (hooks.failAfterFirstWrite && n > 0) throw new Error("disk full");
     const b = new Uint8Array(data.slice(0));
-    if (hooks.corruptWrite || hooks.corruptEveryWrite) {
+    if (hooks.corruptWrite || (hooks.corruptAfterFirstWrite && n > 0)) {
       b[b.length - 1] ^= 0xff;
       hooks.corruptWrite = false; // only the new write; the restore goes through
     }
@@ -181,6 +201,9 @@ afterEach(() => {
   vi.useRealTimers();
   cryptoFail.decrypt = null;
   cryptoFail.encrypt = null;
+  cryptoFail.decryptCalls = 0;
+  cryptoFail.failDecryptAt = null;
+  cryptoFail.onDecryptFail = null;
 });
 
 const PW = "a long random passphrase for tests 4821";
@@ -507,13 +530,21 @@ describe("encrypt modes and refusals", () => {
     expect(snapshot(t.files)).toBe(before);
   });
 
-  it("a read-back mismatch reports failure and restores the old file", async () => {
+  it("our bytes on disk that don't decrypt back: replace puts the old file back", async () => {
     const t = await setup({ existing: { [DAY]: "old" } });
     const before = snapshot(t.files);
-    t.hooks.corruptWrite = true;
+    cryptoFail.failDecryptAt = 2; // 1 = in-memory round trip, 2 = read-back
     expect(await code(t.api.encrypt(DAY, TEXT, { mode: "replace" }))).toBe("verify-failed");
     expect(snapshot(t.files)).toBe(before);
     expect(await t.api.decrypt(DAY)).toBe("old");
+  });
+
+  it("a damaged write is not provably ours: conflict, nothing undone", async () => {
+    const t = await setup({ existing: { [DAY]: "old" } });
+    t.hooks.corruptWrite = true;
+    expect(await code(t.api.encrypt(DAY, TEXT, { mode: "replace" }))).toBe("conflict");
+    expect(t.vault.replace).toHaveBeenCalledTimes(1);
+    expect(t.vault.remove).not.toHaveBeenCalled();
   });
 
   it("a failed write reports write-failed and leaves the old file", async () => {
@@ -754,9 +785,9 @@ describe("fix round 1", () => {
     expect(snapshot(t.files)).toBe(before);
   });
 
-  it("F7: a create that fails its read-back is removed", async () => {
+  it("F7: a create whose own bytes fail the read-back is removed", async () => {
     const t = await setup();
-    t.hooks.corruptWrite = true;
+    cryptoFail.failDecryptAt = 2; // 1 = in-memory round trip, 2 = read-back
     expect(await code(t.api.encrypt(DAY, TEXT, { mode: "create" }))).toBe("verify-failed");
     expect(t.files.has(DAY)).toBe(false);
     expect(t.vault.remove).toHaveBeenCalledWith(DAY);
@@ -767,22 +798,121 @@ describe("fix round 1", () => {
 
   it("F7: create read-back fails and the removal fails too: restore-failed", async () => {
     const t = await setup();
-    t.hooks.corruptWrite = true;
+    cryptoFail.failDecryptAt = 2;
     t.hooks.failRemove = true;
+    expect(await code(t.api.encrypt(DAY, TEXT, { mode: "create" }))).toBe("restore-failed");
+  });
+
+  it("F7: a removal that reports success but leaves the file is restore-failed (kind check)", async () => {
+    const t = await setup();
+    cryptoFail.failDecryptAt = 2;
+    t.hooks.removeNoop = true;
     expect(await code(t.api.encrypt(DAY, TEXT, { mode: "create" }))).toBe("restore-failed");
   });
 
   it("F7: replace read-back fails and the restore fails too: restore-failed", async () => {
     const t = await setup({ existing: { [DAY]: "old" } });
-    t.hooks.corruptWrite = true;
+    cryptoFail.failDecryptAt = 2;
     t.hooks.failAfterFirstWrite = true;
     expect(await code(t.api.encrypt(DAY, TEXT, { mode: "replace" }))).toBe("restore-failed");
   });
 
   it("F7: a restore that reports success but lands different bytes is restore-failed", async () => {
     const t = await setup({ existing: { [DAY]: "old" } });
-    t.hooks.corruptEveryWrite = true;
+    cryptoFail.failDecryptAt = 2;
+    t.hooks.corruptAfterFirstWrite = true;
     expect(await code(t.api.encrypt(DAY, TEXT, { mode: "replace" }))).toBe("restore-failed");
+  });
+});
+
+describe("fix round 2", () => {
+  const theirsFor = async (t: Awaited<ReturnType<typeof setup>>) => encrypt(t.recipients, "their entry");
+
+  it("N1: another writer lands before the read-back on create: their file survives, conflict", async () => {
+    const t = await setup();
+    const theirs = await theirsFor(t);
+    t.hooks.afterWrite = (p) => t.files.set(p, theirs);
+    expect(await code(t.api.encrypt(DAY, TEXT, { mode: "create" }))).toBe("conflict");
+    expect(t.files.get(DAY)).toBe(theirs);
+    expect(t.vault.remove).not.toHaveBeenCalled();
+  });
+
+  it("N1: another writer lands before the read-back on replace: their bytes survive, conflict", async () => {
+    const t = await setup({ existing: { [DAY]: "old" } });
+    const theirs = await theirsFor(t);
+    t.hooks.afterWrite = (p) => t.files.set(p, theirs);
+    expect(await code(t.api.encrypt(DAY, TEXT, { mode: "replace" }))).toBe("conflict");
+    expect(t.files.get(DAY)).toBe(theirs);
+    expect(t.vault.replace).toHaveBeenCalledTimes(1); // no restore over them
+  });
+
+  it("N1: another writer lands during the undo (create): their file is not deleted", async () => {
+    const t = await setup();
+    const theirs = await theirsFor(t);
+    cryptoFail.failDecryptAt = 2;
+    cryptoFail.onDecryptFail = () => t.files.set(DAY, theirs);
+    expect(await code(t.api.encrypt(DAY, TEXT, { mode: "create" }))).toBe("conflict");
+    expect(t.files.get(DAY)).toBe(theirs);
+    expect(t.vault.remove).not.toHaveBeenCalled();
+  });
+
+  it("N1: another writer lands during the undo (replace): the old file is not written over them", async () => {
+    const t = await setup({ existing: { [DAY]: "old" } });
+    const theirs = await theirsFor(t);
+    cryptoFail.failDecryptAt = 2;
+    cryptoFail.onDecryptFail = () => t.files.set(DAY, theirs);
+    expect(await code(t.api.encrypt(DAY, TEXT, { mode: "replace" }))).toBe("conflict");
+    expect(t.files.get(DAY)).toBe(theirs);
+    expect(t.vault.replace).toHaveBeenCalledTimes(1);
+  });
+
+  it("N1: an unreadable file after the write touches nothing: restore-failed", async () => {
+    const t = await setup({ existing: { [DAY]: "old" } });
+    t.hooks.afterWrite = (p) => t.files.delete(p);
+    expect(await code(t.api.encrypt(DAY, TEXT, { mode: "replace" }))).toBe("restore-failed");
+    expect(t.vault.replace).toHaveBeenCalledTimes(1);
+    expect(t.vault.remove).not.toHaveBeenCalled();
+  });
+
+  it("T1: the recipient pin changing after unlock makes an API encrypt refuse", async () => {
+    const identity = await generateIdentity();
+    const own = await identityToRecipient(identity);
+    const extra = await identityToRecipient(await generateIdentity());
+    const wrapped = await wrapMobileKey(identity, [], PW, 16);
+    let pin: RecipientPin | undefined;
+    let record: DeviceRecord = { kind: "none" };
+    const store: PinStore = {
+      get: () => pin,
+      save: async (p) => {
+        pin = p;
+        record = { kind: "ok", recipients: p.recipients, seq: p.seq ?? 0 };
+      },
+      record: () => record,
+      adopt: (p) => {
+        record = { kind: "ok", recipients: p.recipients, seq: p.seq ?? 0 };
+      },
+      confirmFirst: async () => true,
+    };
+    const source = new PassphraseKeySource({
+      adapter: { exists: async () => true, readBinary: async () => wrapped.slice().buffer as ArrayBuffer },
+      getSettings: () => ({ mobileKeyPath: "_rune/identity.age", autoLockMinutes: 15, backgroundLockGraceSeconds: 60 }),
+      prompt: async (attempt) => (await attempt(PW), true),
+      pin: store,
+    });
+    await source.getIdentity(); // unlock: first use pins [own]
+    const t = await setup({ identity, keySource: source });
+    await t.api.encrypt(`${FOLDER}/a.md.age`, TEXT, { mode: "create" }); // pinned set: fine
+    // a newer, validly MACed confirmation for a different set arrives (another device)
+    pin = await makePin(identity, [own, extra], (pin?.seq ?? 0) + 1);
+    let err: unknown;
+    try {
+      await t.api.encrypt(`${FOLDER}/b.md.age`, TEXT, { mode: "create" });
+    } catch (e) {
+      err = e;
+    }
+    expect((err as JournalApiError).code).toBe("refused");
+    expect((err as Error).message).toMatch(/differ from the set you confirmed/);
+    expect(t.files.has(`${FOLDER}/b.md.age`)).toBe(false);
   });
 });
 

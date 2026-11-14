@@ -146,6 +146,7 @@ vi.mock("obsidian", () => {
   class PluginSettingTab {
     containerEl = { empty() {}, createEl: () => ({}) };
     constructor(public app: unknown, public plugin: unknown) {}
+    hide() {}
   }
   return {
     get Platform() { return { isDesktopApp: h.desktop, isMobile: !h.desktop }; },
@@ -1298,5 +1299,38 @@ describe("journal API wiring (gabbro #107)", () => {
     await vi.waitFor(() => expect(row.desc).toContain("Now: off."));
     expect(p.settings.journalFolder).toBe("");
     await expect(p.journalApi.decrypt("10_journal/a.md.age")).rejects.toMatchObject({ code: "disabled" });
+  });
+
+  it("N4: closing settings (Esc) commits a cleared folder field, turning the API off", async () => {
+    const { p, identity } = await boot(false);
+    const files = new Map([["10_journal/a.md.age", await encrypt([await identityToRecipient(identity)], "dear diary")]]);
+    await withVault(p, files, ["10_journal"]);
+    await p.getKeySource().getIdentity();
+    p.settings.journalFolder = "10_journal";
+    p.settingTab.display();
+    const t = h.settings.find((s) => s.name === "Folder gabbro may open").text;
+    expect(await p.journalApi.decrypt("10_journal/a.md.age")).toBe("dear diary");
+    t.inputEl.value = "";
+    t.change(""); // typed, no blur, no Enter
+    p.settingTab.hide();
+    await vi.waitFor(() => expect(p.settings.journalFolder).toBe(""));
+    await expect(p.journalApi.decrypt("10_journal/a.md.age")).rejects.toMatchObject({ code: "disabled" });
+  });
+
+  it("N1 wiring: the API's remove deletes the vault file through app.vault.delete", async () => {
+    const { p } = await boot(false);
+    const files = new Map([["j/a.md.age", new Uint8Array([1])]]);
+    await withVault(p, files, ["j"]);
+    const deleted: string[] = [];
+    p.app.vault.delete = async (f: { path: string }) => {
+      deleted.push(f.path);
+      files.delete(f.path);
+    };
+    await p.journalVault().remove("j/a.md.age");
+    expect(deleted).toEqual(["j/a.md.age"]);
+    expect(await p.journalVault().kind("j/a.md.age")).toBe("none");
+    // a path that is not an indexed file is never deleted
+    await expect(p.journalVault().remove("j")).rejects.toThrow();
+    expect(deleted).toEqual(["j/a.md.age"]);
   });
 });
