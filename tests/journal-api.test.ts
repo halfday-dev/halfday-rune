@@ -98,6 +98,8 @@ async function setup(
     failWrite: false,
     /** Every write after the first fails (the restore / cleanup). */
     failAfterFirstWrite: false,
+    /** Every write, the restore included, lands damaged without an error. */
+    corruptEveryWrite: false,
     failRemove: false,
     openDirty: new Set<string>(),
     /** When set, create waits for it before writing. */
@@ -134,7 +136,7 @@ async function setup(
   const write = (data: ArrayBuffer): Uint8Array => {
     if (hooks.failAfterFirstWrite && writes++ > 0) throw new Error("disk full");
     const b = new Uint8Array(data.slice(0));
-    if (hooks.corruptWrite) {
+    if (hooks.corruptWrite || hooks.corruptEveryWrite) {
       b[b.length - 1] ^= 0xff;
       hooks.corruptWrite = false; // only the new write; the restore goes through
     }
@@ -774,6 +776,12 @@ describe("fix round 1", () => {
     const t = await setup({ existing: { [DAY]: "old" } });
     t.hooks.corruptWrite = true;
     t.hooks.failAfterFirstWrite = true;
+    expect(await code(t.api.encrypt(DAY, TEXT, { mode: "replace" }))).toBe("restore-failed");
+  });
+
+  it("F7: a restore that reports success but lands different bytes is restore-failed", async () => {
+    const t = await setup({ existing: { [DAY]: "old" } });
+    t.hooks.corruptEveryWrite = true;
     expect(await code(t.api.encrypt(DAY, TEXT, { mode: "replace" }))).toBe("restore-failed");
   });
 });

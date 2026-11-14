@@ -194,8 +194,6 @@ export class AgeFileView extends FileView {
    * wrote it since), and a modify event that doesn't match it is external.
    */
   private diskBytes: Uint8Array | null = null;
-  /** Bytes of a write this view has in flight, so its own modify event is not "external". */
-  private pendingWrite: Uint8Array | null = null;
 
   constructor(leaf: WorkspaceLeaf, deps: AgeFileViewDeps) {
     super(leaf);
@@ -286,7 +284,7 @@ export class AgeFileView extends FileView {
       return;
     }
     if (bytesEqual(onDisk, this.diskBytes)) return;
-    if (this.pendingWrite && bytesEqual(onDisk, this.pendingWrite)) return; // our own save
+    // our own save: still dirty while it writes, then diskBytes is the new bytes
     if (this.dirty || !this.editor || this.file !== file) return;
     // reloading is not owner activity: never prompt, never reset the idle lock
     if (!this.deps.getKeySource().isUnlocked()) return;
@@ -784,12 +782,7 @@ export class AgeFileView extends FileView {
         if (!bytesEqual(onDisk, this.diskBytes)) throw new RecipientListError(CHANGED_ON_DISK_NOTICE);
       }
 
-      this.pendingWrite = ciphertext;
-      try {
-        await this.app.vault.modifyBinary(file, buffer);
-      } finally {
-        this.pendingWrite = null;
-      }
+      await this.app.vault.modifyBinary(file, buffer);
       if (gen === this.lockGen) this.diskBytes = ciphertext;
 
       // Locked (or the editor torn down) while the write was in flight: the
