@@ -29,6 +29,13 @@ export interface KeySource {
   peekIdentity(): Promise<string>;
   /** Like getRecipients() (same pin check), with peekIdentity()'s rules. */
   peekRecipients(): Promise<string[]>;
+  /**
+   * The owner is active somewhere rune cannot see (a plugin view, via the
+   * journal API): reset the idle auto-lock. Only while unlocked; never
+   * prompts, never unlocks, a no-op while locked. Not throttled here (the
+   * journal API throttles). Absent where there is no idle clock (desktop).
+   */
+  noteActivity?(): void;
   /** Drop any held secret. Nothing to drop for a file-backed source. */
   lock(): void;
   /**
@@ -279,6 +286,13 @@ export class PassphraseKeySource implements KeySource {
     this.hiddenAt = null;
     this.touch();
     this.deps.onStateChange?.(true);
+  }
+
+  /** See KeySource.noteActivity: an idle reset while unlocked, nothing while locked. */
+  noteActivity(): void {
+    // locked (or disposed, which locks): not even the clock is read
+    if (this.#identity === null) return;
+    this.touch();
   }
 
   /** Reset the idle clock (called on every successful get and on unlock). */
