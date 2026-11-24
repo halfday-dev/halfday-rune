@@ -21,8 +21,15 @@
  *     ("conflict"); if it does but they don't decrypt back, the previous
  *     ciphertext is put back (replace) or the file removed (create), and a
  *     failed undo is "restore-failed".
- *   - The key is read with peekIdentity()/peekRecipients(): API calls never
- *     reset rune's idle auto-lock.
+ *   - The key is read with peekIdentity()/peekRecipients(): decrypt() and
+ *     encrypt() never reset rune's idle auto-lock.
+ *   - noteActivity() is the one call that does: the caller's view reports
+ *     that the owner is typing or dictating there. It resets the idle clock
+ *     only while rune is unlocked and the folder is set, at most once per
+ *     ACTIVITY_THROTTLE_MS (so it may be called on every keystroke), and is
+ *     a silent no-op otherwise (locked, off, unloaded). It never prompts or
+ *     unlocks, returns nothing and never throws, so it reveals nothing: not
+ *     the lock state, not whether the reset happened.
  *   - replace refuses while the file is open with unsaved edits in a rune
  *     editor, and the folder is re-checked just before the write.
  *   - Nothing plaintext is written to disk, logged or put in an error. The
@@ -30,6 +37,9 @@
  *
  * Exposure (stated, not solved): while rune is unlocked, any plugin in the
  * vault can call this, the same exposure rune's open views already have.
+ * That includes noteActivity(): a caller can keep an unlocked rune from
+ * idle-locking (it can never unlock a locked one, and the background lock
+ * still applies).
  *
  * Pure: no Node or Obsidian imports. The plugin passes in the vault access
  * and (desktop) the symlink check, so tests can drive it directly.
@@ -42,6 +52,9 @@ import { foldPath, isExcludedPath } from "./path-fold";
 import { RecipientPinError } from "./recipient-pin";
 
 export const JOURNAL_API_VERSION = 1;
+
+/** noteActivity(): at most one real idle reset per this many ms. */
+export const ACTIVITY_THROTTLE_MS = 30_000;
 
 export type JournalApiErrorCode =
   /** rune is locked (or was locked during the call, or the plugin unloaded). */
@@ -133,6 +146,12 @@ export interface JournalApi {
   onLockChange(cb: (unlocked: boolean) => void): () => void;
   decrypt(path: string): Promise<string>;
   encrypt(path: string, text: string, opts: JournalEncryptOptions): Promise<void>;
+  /**
+   * The owner is typing or dictating in the caller's view: keep rune's idle
+   * auto-lock from firing. Throttled; a silent no-op while locked, off or
+   * unloaded. Never prompts, returns nothing, never throws.
+   */
+  noteActivity(): void;
 }
 
 /** The slice of the vault the API uses (the plugin wraps app.vault). */
@@ -164,6 +183,8 @@ export interface JournalApiDeps {
   pathHasSymlink: ((path: string) => Promise<boolean>) | null;
   /** True when the file is open in a rune editor with unsaved edits. */
   isOpenDirty: (path: string) => boolean;
+  /** The clock for noteActivity()'s throttle (tests); Date.now by default. */
+  now?: () => number;
 }
 
 /**
@@ -264,6 +285,8 @@ export class JournalApiHost {
   /** Per-path write queue (folded key), so two writes to one file never interleave. */
   private writes = new Map<string, Promise<void>>();
   private published: JournalApi | null = null;
+  /** When noteActivity() last reached the key source; null = the next call goes through. */
+  private lastActivityNote: number | null = null;
 
   constructor(private readonly deps: JournalApiDeps) {}
 
@@ -277,6 +300,9 @@ export class JournalApiHost {
         decrypt: (path: string) => this.decrypt(path),
         encrypt: (path: string, text: string, opts: JournalEncryptOptions) =>
           this.encrypt(path, text, opts),
+        noteActivity: (): void => {
+          this.noteActivity();
+        },
       });
     }
     return this.published;
@@ -285,6 +311,8 @@ export class JournalApiHost {
   /** The plugin calls this from the key source's state change (unlock, lock, auto-lock). */
   notifyLockChange(unlocked: boolean): void {
     if (!unlocked) this.lockGen++;
+    // a fresh unlock starts a fresh throttle window
+    this.lastActivityNote = null;
     for (const cb of [...this.listeners]) {
       try {
         cb(unlocked);
@@ -352,6 +380,30 @@ export class JournalApiHost {
     return this.queued(p, () => this.doEncrypt(keys, gen, p, text, mode));
   }
 
+  /**
+   * Reset the key source's idle clock, throttled. Refuses silently: no error,
+   * no return value, so a caller learns nothing (not the lock state, not
+   * whether this call was the one that reset).
+   */
+  noteActivity(): void {
+    try {
+      if (this.disposed) return;
+      // off means off: with no folder set, no plugin may hold rune open
+      const folder = validateJournalFolder(this.deps.getFolder());
+      if (!folder.ok || folder.folder === "") return;
+      const keys = this.deps.getKeySource();
+      if (!keys.isUnlocked()) return;
+      const t = (this.deps.now ?? Date.now)();
+      const last = this.lastActivityNote;
+      // a clock that went backwards ends the window rather than stretching it
+      if (last !== null && t >= last && t - last < ACTIVITY_THROTTLE_MS) return;
+      this.lastActivityNote = t;
+      keys.noteActivity?.();
+    } catch {
+      /* unloaded key source or anything else: nothing reaches the caller */
+    }
+  }
+
   // ---- internals ----
 
   /** Refuse unless unlocked and enabled; returns the key source and lock generation. */
@@ -377,8 +429,8 @@ export class JournalApiHost {
 
   /**
    * The identity via peekIdentity(): never prompts (throws KeyLockedError
-   * when locked) and does not reset the idle auto-lock, so a caller polling
-   * the API cannot keep rune unlocked.
+   * when locked) and does not reset the idle auto-lock, so polling decrypt()
+   * cannot keep rune unlocked (only noteActivity() resets the clock).
    */
   private async identity(keys: KeySource, gen: number): Promise<string> {
     this.assertStillUnlocked(keys, gen);

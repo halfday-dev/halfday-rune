@@ -610,7 +610,14 @@ describe("no leaks", () => {
   it("the public object exposes only the API, frozen, with no key source", async () => {
     const t = await setup();
     expect(Object.isFrozen(t.api)).toBe(true);
-    expect(Object.keys(t.api).sort()).toEqual(["apiVersion", "decrypt", "encrypt", "isUnlocked", "onLockChange"]);
+    expect(Object.keys(t.api).sort()).toEqual([
+      "apiVersion",
+      "decrypt",
+      "encrypt",
+      "isUnlocked",
+      "noteActivity",
+      "onLockChange",
+    ]);
     expect(t.api.apiVersion).toBe(1);
     expect(JSON.stringify(t.api)).not.toContain("AGE-SECRET-KEY");
     expect(() => {
